@@ -1,0 +1,28 @@
+{
+  "name": "zinesh-2.0",
+  "version": "1.0.0",
+  "description": "Zinesh 2.0 - M1 Independent Escrow Cells Protocol",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "escrow",
+    "protocol",
+    "blockchain",
+    "security"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "@types/pg": "^8.23.1",
+    "pg": "^8.23.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  }
+}
