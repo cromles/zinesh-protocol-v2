@@ -16,6 +16,7 @@ import {
   loadPostgresConfig,
   loadAuthenticationConfig,
   loadPublicIngressConfig,
+  loadRateLimitingConfig,
   loadTransportConfig,
   main,
   performShutdown,
@@ -56,6 +57,13 @@ const VALID_ENV = {
   HTTP_MAX_HEADER_BYTES: '16384',
   HTTP_REQUEST_TIMEOUT_MS: '15000',
   HTTP_HEADERS_TIMEOUT_MS: '5000',
+  HTTP_MAX_CONCURRENT_REQUESTS: '100',
+  RATE_LIMIT_PRE_AUTH_LIMIT: '120',
+  RATE_LIMIT_PRINCIPAL_LIMIT: '60',
+  RATE_LIMIT_PRE_AUTH_WINDOW_MS: '60000',
+  RATE_LIMIT_PRINCIPAL_WINDOW_MS: '60000',
+  RATE_LIMIT_RETENTION_MS: '120000',
+  RATE_LIMIT_STORAGE_TIMEOUT_MS: '1000',
   HTTPS_HOST: '0.0.0.0',
   HTTPS_PORT: '8443',
   TLS_CERTIFICATE_PATH: 'C:\\run\\secrets\\zinesh-cert.pem',
@@ -195,12 +203,30 @@ describe('loadTransportConfig', () => {
     expect(loadTransportConfig(VALID_ENV)).toEqual({
       host: '127.0.0.1', port: 8080, maxBodyBytes: 65536, maxHeaderBytes: 16384,
       requestTimeoutMs: 15000, headersTimeoutMs: 5000,
+      maxConcurrentRequests: 100,
     });
   });
   test('rejects public plaintext binding and unsafe limits', () => {
     expect(() => loadTransportConfig({ ...VALID_ENV, HTTP_HOST: '0.0.0.0' })).toThrow(ConfigurationError);
     expect(() => loadTransportConfig({ ...VALID_ENV, HTTP_MAX_BODY_BYTES: '9999999' })).toThrow(ConfigurationError);
     expect(() => loadTransportConfig({ ...VALID_ENV, HTTP_HEADERS_TIMEOUT_MS: '20000' })).toThrow(ConfigurationError);
+  });
+});
+
+describe('loadRateLimitingConfig', () => {
+  test('loads explicit bounded distributed policies', () => {
+    expect(loadRateLimitingConfig(VALID_ENV)).toEqual({
+      preAuth: { limit: 120, windowMs: 60000, retentionMs: 120000, storageTimeoutMs: 1000 },
+      principal: { limit: 60, windowMs: 60000, retentionMs: 120000, storageTimeoutMs: 1000 },
+    });
+  });
+  test('fails closed for missing, unsafe and shorter-than-window retention', () => {
+    const missing = { ...VALID_ENV } as Record<string, string>;
+    delete missing.RATE_LIMIT_PRE_AUTH_LIMIT;
+    expect(() => loadRateLimitingConfig(missing)).toThrow(ConfigurationError);
+    expect(() => loadRateLimitingConfig({ ...VALID_ENV, RATE_LIMIT_PRINCIPAL_LIMIT: '0' })).toThrow(ConfigurationError);
+    expect(() => loadRateLimitingConfig({ ...VALID_ENV, RATE_LIMIT_RETENTION_MS: '1000' })).toThrow(ConfigurationError);
+    expect(() => loadRateLimitingConfig({ ...VALID_ENV, RATE_LIMIT_STORAGE_TIMEOUT_MS: '30001' })).toThrow(ConfigurationError);
   });
 });
 

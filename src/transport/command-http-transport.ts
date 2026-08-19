@@ -7,6 +7,7 @@ import {
 } from '../core/types';
 import type { HandleCommandResult } from '../application/types';
 import type { ExternalCommandRequest } from '../security/trusted-ingress';
+import type { RateLimiter } from '../security/rate-limiter';
 
 export interface CommandDispatcher {
   handleCommand(request: ExternalCommandRequest): Promise<HandleCommandResult>;
@@ -35,6 +36,7 @@ export interface CommandHttpConfig {
   readonly maxHeaderBytes: number;
   readonly requestTimeoutMs: number;
   readonly headersTimeoutMs: number;
+  readonly maxConcurrentRequests?: number;
 }
 
 export type CommandServerFactory = (
@@ -43,10 +45,12 @@ export type CommandServerFactory = (
 
 export type CommandRequestAdmission = (
   request: IncomingMessage,
-) => { readonly ok: true } | { readonly ok: false; readonly status: number; readonly code: string };
+) => { readonly ok: true; readonly networkSource?: string } |
+  { readonly ok: false; readonly status: number; readonly code: string };
 
 export class CommandHttpTransport {
   private readonly server: Server;
+  private activeRequests = 0;
 
   constructor(
     private readonly dispatcher: CommandDispatcher,
@@ -57,6 +61,7 @@ export class CommandHttpTransport {
       { maxHeaderSize: config.maxHeaderBytes }, handler,
     ),
     private readonly admission: CommandRequestAdmission = () => ({ ok: true }),
+    private readonly preAuthenticationRateLimiter?: RateLimiter,
   ) {
     this.server = serverFactory((request, response) => {
       void this.route(request, response);
@@ -98,6 +103,7 @@ export class CommandHttpTransport {
     let commandId: string | undefined;
     let commandType: string | undefined;
     let outcome = 'INTERNAL_FAILURE';
+    let acquiredRequestSlot = false;
     try {
       const admitted = this.admission(request);
       if (!admitted.ok) {
@@ -107,6 +113,26 @@ export class CommandHttpTransport {
       }
       if (request.method !== 'POST' || request.url !== '/commands') {
         outcome = 'NOT_FOUND'; this.respond(response, 404, { error: { code: 'NOT_FOUND' } }); return;
+      }
+      const maximumConcurrent = this.config.maxConcurrentRequests ?? Number.MAX_SAFE_INTEGER;
+      if (this.activeRequests >= maximumConcurrent) {
+        outcome = 'RATE_LIMITED'; this.retryAfter(response, 1);
+        this.respond(response, 429, { error: { code: 'RATE_LIMITED' } }); return;
+      }
+      this.activeRequests += 1;
+      acquiredRequestSlot = true;
+      if (this.preAuthenticationRateLimiter !== undefined) {
+        const networkSource = admitted.networkSource ?? normalizePeer(request.socket.remoteAddress ?? 'unknown');
+        try {
+          const decision = await this.preAuthenticationRateLimiter.consume(networkSource);
+          if (!decision.allowed) {
+            outcome = 'RATE_LIMITED'; this.retryAfter(response, decision.retryAfterSeconds);
+            this.respond(response, 429, { error: { code: 'RATE_LIMITED' } }); return;
+          }
+        } catch {
+          outcome = 'RATE_LIMIT_UNAVAILABLE';
+          this.respond(response, 503, { error: { code: 'RATE_LIMIT_UNAVAILABLE' } }); return;
+        }
       }
       const contentType = request.headers['content-type']?.split(';')[0]?.trim().toLowerCase();
       if (contentType !== 'application/json') {
@@ -126,6 +152,7 @@ export class CommandHttpTransport {
       const result = await this.dispatcher.handleCommand({ credential, command: decoded.command });
       outcome = result.outcome === 'SUCCESS' ? 'SUCCESS' : result.error.code;
       const mapped = mapResult(result);
+      if (mapped.retryAfterSeconds !== undefined) this.retryAfter(response, mapped.retryAfterSeconds);
       this.respond(response, mapped.status, mapped.body);
     } catch (error) {
       if (error instanceof BodyTooLargeError) {
@@ -134,6 +161,7 @@ export class CommandHttpTransport {
         outcome = 'INTERNAL_FAILURE'; this.respond(response, 500, { error: { code: 'INTERNAL_FAILURE' } });
       }
     } finally {
+      if (acquiredRequestSlot) this.activeRequests -= 1;
       const audit: TransportAuditRecord = {
         correlationId, outcome, durationMs: Math.max(0, Date.now() - started),
         ...(commandId === undefined ? {} : { commandId }),
@@ -141,6 +169,10 @@ export class CommandHttpTransport {
       };
       this.audit.record(audit);
     }
+  }
+
+  private retryAfter(response: ServerResponse, seconds: number): void {
+    response.setHeader('retry-after', String(Math.max(1, Math.ceil(seconds))));
   }
 
   private respond(response: ServerResponse, status: number, body: unknown): void {
@@ -217,7 +249,7 @@ function decodePayload(type: string, payload: Record<string, unknown>): Record<s
   return result;
 }
 
-function mapResult(result: HandleCommandResult): { status: number; body: unknown } {
+function mapResult(result: HandleCommandResult): { status: number; body: unknown; retryAfterSeconds?: number } {
   if (result.outcome === 'SUCCESS') return { status: 200, body: result };
   if (result.outcome === 'KERNEL_REJECTION') {
     const status = result.error.code === 'AUTHORIZATION_DENIED' ? 403 : 422;
@@ -226,9 +258,12 @@ function mapResult(result: HandleCommandResult): { status: number; body: unknown
   const code = result.error.code;
   const status = code === 'UNAUTHENTICATED' ? 401
     : code === 'IDEMPOTENCY_CONFLICT' ? 409
+    : code === 'RATE_LIMITED' ? 429
+    : code === 'RATE_LIMIT_UNAVAILABLE' ? 503
     : code === 'INVALID_INPUT' ? 400
     : result.outcome === 'PERSISTENCE_FAILURE' ? 503 : 403;
-  return { status, body: { outcome: result.outcome, error: { code } } };
+  return { status, body: { outcome: result.outcome, error: { code } },
+    ...(result.error.retryAfterSeconds === undefined ? {} : { retryAfterSeconds: result.error.retryAfterSeconds }) };
 }
 
 function bad(code: string): DecodeResult { return { ok: false, status: 400, code }; }
@@ -263,3 +298,4 @@ function applySecurityHeaders(response: ServerResponse): void {
 function jsonReplacer(_key: string, value: unknown): unknown {
   return typeof value === 'bigint' ? value.toString() : value;
 }
+function normalizePeer(value: string): string { return value.startsWith('::ffff:') ? value.slice(7) : value; }

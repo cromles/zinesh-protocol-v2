@@ -32,6 +32,9 @@ import type { CommandHttpConfig } from '../transport/command-http-transport';
 import { CommandHttpsTransport } from '../transport/command-https-transport';
 import type { CommandHttpsConfig } from '../transport/command-https-transport';
 import { isIP } from 'net';
+import { PostgresFixedWindowRateLimiter } from '../adapters/postgres-rate-limit-store';
+import { JsonLineRateLimitMetricSink, allowAllRateLimiter } from '../security/rate-limiter';
+import type { RateLimiter, RateLimitPolicy } from '../security/rate-limiter';
 
 /** Operational shutdown bound. Not a domain rule. Not configurable. */
 export const SHUTDOWN_TIMEOUT_MS = 10_000;
@@ -94,7 +97,29 @@ export function loadTransportConfig(env: EnvMap): CommandHttpConfig {
   const maxHeaderBytes = requiredSecurityInteger(env, 'HTTP_MAX_HEADER_BYTES', 1_024, 65_536);
   const requestTimeoutMs = requiredSecurityInteger(env, 'HTTP_REQUEST_TIMEOUT_MS', 100, 120_000);
   const headersTimeoutMs = requiredSecurityInteger(env, 'HTTP_HEADERS_TIMEOUT_MS', 100, requestTimeoutMs);
-  return { host, port, maxBodyBytes, maxHeaderBytes, requestTimeoutMs, headersTimeoutMs };
+  const maxConcurrentRequests = requiredSecurityInteger(env, 'HTTP_MAX_CONCURRENT_REQUESTS', 1, 100_000);
+  return { host, port, maxBodyBytes, maxHeaderBytes, requestTimeoutMs, headersTimeoutMs, maxConcurrentRequests };
+}
+
+export interface RateLimitingConfig {
+  readonly preAuth: RateLimitPolicy;
+  readonly principal: RateLimitPolicy;
+}
+
+export function loadRateLimitingConfig(env: EnvMap): RateLimitingConfig {
+  const preAuthLimit = requiredSecurityInteger(env, 'RATE_LIMIT_PRE_AUTH_LIMIT', 1, 1_000_000);
+  const principalLimit = requiredSecurityInteger(env, 'RATE_LIMIT_PRINCIPAL_LIMIT', 1, 1_000_000);
+  const preAuthWindowMs = requiredSecurityInteger(env, 'RATE_LIMIT_PRE_AUTH_WINDOW_MS', 1_000, 86_400_000);
+  const principalWindowMs = requiredSecurityInteger(env, 'RATE_LIMIT_PRINCIPAL_WINDOW_MS', 1_000, 86_400_000);
+  const retentionMs = requiredSecurityInteger(env, 'RATE_LIMIT_RETENTION_MS', 1_000, 604_800_000);
+  if (retentionMs < Math.max(preAuthWindowMs, principalWindowMs)) {
+    throw new ConfigurationError('RATE_LIMIT_RETENTION_MS', 'must cover both active windows');
+  }
+  const storageTimeoutMs = requiredSecurityInteger(env, 'RATE_LIMIT_STORAGE_TIMEOUT_MS', 50, 30_000);
+  return {
+    preAuth: { limit: preAuthLimit, windowMs: preAuthWindowMs, retentionMs, storageTimeoutMs },
+    principal: { limit: principalLimit, windowMs: principalWindowMs, retentionMs, storageTimeoutMs },
+  };
 }
 
 export function loadPublicIngressConfig(env: EnvMap): CommandHttpsConfig {
@@ -105,6 +130,7 @@ export function loadPublicIngressConfig(env: EnvMap): CommandHttpsConfig {
   const maxHeaderBytes = requiredSecurityInteger(env, 'HTTP_MAX_HEADER_BYTES', 1_024, 65_536);
   const requestTimeoutMs = requiredSecurityInteger(env, 'HTTP_REQUEST_TIMEOUT_MS', 100, 120_000);
   const headersTimeoutMs = requiredSecurityInteger(env, 'HTTP_HEADERS_TIMEOUT_MS', 100, requestTimeoutMs);
+  const maxConcurrentRequests = requiredSecurityInteger(env, 'HTTP_MAX_CONCURRENT_REQUESTS', 1, 100_000);
   const certificatePath = requiredSecurityValue(env, 'TLS_CERTIFICATE_PATH');
   const privateKeyPath = requiredSecurityValue(env, 'TLS_PRIVATE_KEY_PATH');
   const minimumTlsVersion = requiredSecurityValue(env, 'TLS_MIN_VERSION');
@@ -115,7 +141,7 @@ export function loadPublicIngressConfig(env: EnvMap): CommandHttpsConfig {
   const proxyValue = requiredSecurityValue(env, 'TLS_TRUSTED_PROXIES');
   const trustedProxies = proxyValue === 'NONE' ? [] : explicitProxyAddresses(proxyValue);
   return {
-    host, port, maxBodyBytes, maxHeaderBytes, requestTimeoutMs, headersTimeoutMs,
+    host, port, maxBodyBytes, maxHeaderBytes, requestTimeoutMs, headersTimeoutMs, maxConcurrentRequests,
     certificatePath, privateKeyPath, minimumTlsVersion, allowedHosts, trustedProxies,
   };
 }
@@ -267,6 +293,7 @@ export function createCommandGate(): CommandGate {
 export interface ComposedRuntime {
   readonly persistence: PostgresPersistenceAdapter;
   readonly gate: CommandGate;
+  readonly preAuthenticationRateLimiter: RateLimiter;
   handleCommand(request: ExternalCommandRequest): Promise<HandleCommandResult>;
 }
 
@@ -274,11 +301,13 @@ export interface SecurityPorts {
   readonly authentication: AuthenticationPort;
   readonly principals: PrincipalAuthority;
   readonly fundingEvidence: FundingEvidencePort;
+  readonly principalRateLimiter: RateLimiter;
 }
 
 export function composeRuntime(
   config: PostgresConfig,
   security?: Partial<SecurityPorts>,
+  rateLimiting?: RateLimitingConfig,
 ): ComposedRuntime {
   const persistence = new PostgresPersistenceAdapter(config);
   const clock = systemClock();
@@ -290,16 +319,25 @@ export function composeRuntime(
     eventIds,
   });
   const gate = createCommandGate();
+  const metricSink = rateLimiting === undefined ? undefined : new JsonLineRateLimitMetricSink();
+  const principalRateLimiter = security?.principalRateLimiter ?? (rateLimiting === undefined
+    ? allowAllRateLimiter
+    : new PostgresFixedWindowRateLimiter(persistence.rateLimitStore, 'PRINCIPAL', rateLimiting.principal, metricSink));
+  const preAuthenticationRateLimiter = rateLimiting === undefined
+    ? allowAllRateLimiter
+    : new PostgresFixedWindowRateLimiter(persistence.rateLimitStore, 'PRE_AUTH', rateLimiting.preAuth, metricSink);
   const ingress = new TrustedCommandIngress(
     application,
     security?.authentication ?? failClosedAuthentication,
     security?.principals ?? persistence.principalAuthority,
     security?.fundingEvidence ?? rejectAllFundingEvidence,
+    principalRateLimiter,
   );
 
   return {
     persistence,
     gate,
+    preAuthenticationRateLimiter,
     handleCommand(request: ExternalCommandRequest): Promise<HandleCommandResult> {
       return gate.run(() => ingress.handle(request));
     },
@@ -381,10 +419,12 @@ export async function main(
   let config: PostgresConfig;
   let authenticationConfig: JwtAuthenticationConfig;
   let transportConfig: CommandHttpsConfig;
+  let rateLimitingConfig: RateLimitingConfig;
   try {
     config = loadPostgresConfig(env);
     authenticationConfig = loadAuthenticationConfig(env);
     transportConfig = loadPublicIngressConfig(env);
+    rateLimitingConfig = loadRateLimitingConfig(env);
   } catch (error) {
     if (error instanceof ConfigurationError) {
       reportConfigurationError(error);
@@ -403,11 +443,13 @@ export async function main(
       authenticationConfig.jwksTimeoutMs,
     ),
   );
-  const runtime = composeRuntime(config, { authentication });
+  const runtime = composeRuntime(config, { authentication }, rateLimitingConfig);
   let transport: CommandHttpsTransport | undefined;
 
   try {
-    transport = await CommandHttpsTransport.create(runtime, transportConfig, new JsonLineTransportAuditSink());
+    transport = await CommandHttpsTransport.create(
+      runtime, transportConfig, new JsonLineTransportAuditSink(), undefined, runtime.preAuthenticationRateLimiter,
+    );
     await runtime.persistence.connect();
     await runtime.persistence.migrator.verifyExpectedVersion();
     await transport.listen();

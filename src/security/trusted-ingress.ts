@@ -1,7 +1,9 @@
 import type { ActorId, Amount, CellId, Command, Currency } from '../core/types';
 import type { CellApplication } from '../application/cell-application';
 import type { HandleCommandResult, TrustedHandleCommandRequest } from '../application/types';
-import { securityRejection } from '../application/errors';
+import { rateLimitRejection, rateLimitUnavailable, securityRejection } from '../application/errors';
+import { allowAllRateLimiter } from './rate-limiter';
+import type { RateLimiter } from './rate-limiter';
 
 export type PrincipalType = 'ACTOR' | 'GATEWAY' | 'SYSTEM';
 export type Capability = 'ACT_AS_SELF' | 'CONFIRM_FUNDING';
@@ -80,6 +82,7 @@ export class TrustedCommandIngress {
     private readonly authentication: AuthenticationPort,
     private readonly principals: PrincipalAuthority,
     private readonly fundingEvidence: FundingEvidencePort,
+    private readonly principalRateLimiter: RateLimiter = allowAllRateLimiter,
   ) {}
 
   async handle(request: ExternalCommandRequest): Promise<HandleCommandResult> {
@@ -92,6 +95,11 @@ export class TrustedCommandIngress {
     if (record.type === 'ACTOR' && record.actorId === undefined) {
       return securityRejection('PRINCIPAL_NOT_MAPPED');
     }
+
+    try {
+      const decision = await this.principalRateLimiter.consume(record.principalId);
+      if (!decision.allowed) return rateLimitRejection(decision.retryAfterSeconds);
+    } catch { return rateLimitUnavailable(); }
 
     const principal = verifyPrincipal(record);
     let fundingContext: VerifiedFundingContext | undefined;

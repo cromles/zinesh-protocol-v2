@@ -21,6 +21,8 @@ export type ApplicationErrorCode =
   | 'PRINCIPAL_DISABLED'
   | 'COMMAND_NOT_PERMITTED'
   | 'FUNDING_EVIDENCE_INVALID'
+  | 'RATE_LIMITED'
+  | 'RATE_LIMIT_UNAVAILABLE'
   | 'PERSISTENCE_FAILURE';
 
 export interface ApplicationError {
@@ -32,6 +34,7 @@ export interface ApplicationError {
    * Opaque: never SQL, never driver internals.
    */
   readonly persistenceKind?: EventStoreError['kind'];
+  readonly retryAfterSeconds?: number;
 }
 
 export function invalidInput(message: string): ApplicationError {
@@ -98,4 +101,16 @@ export function securityRejection(code: Extract<ApplicationErrorCode,
   'UNAUTHENTICATED' | 'PRINCIPAL_NOT_MAPPED' | 'PRINCIPAL_DISABLED' |
   'COMMAND_NOT_PERMITTED' | 'FUNDING_EVIDENCE_INVALID'>): import('./types').HandleCommandResult {
   return { outcome: 'APPLICATION_REJECTION', error: { type: 'ApplicationError', code, message: 'Security policy rejected the command' } };
+}
+
+export function rateLimitRejection(retryAfterSeconds: number): import('./types').HandleCommandResult {
+  return { outcome: 'APPLICATION_REJECTION', error: {
+    type: 'ApplicationError', code: 'RATE_LIMITED', message: 'Request rate exceeded', retryAfterSeconds,
+  } };
+}
+
+export function rateLimitUnavailable(): import('./types').HandleCommandResult {
+  return { outcome: 'APPLICATION_REJECTION', error: {
+    type: 'ApplicationError', code: 'RATE_LIMIT_UNAVAILABLE', message: 'Request cannot be admitted',
+  } };
 }

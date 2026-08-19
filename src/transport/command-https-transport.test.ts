@@ -17,6 +17,7 @@ import { createEventIdFactory } from '../application/event-id-factory';
 import { cellKernel } from '../kernel';
 import { makeActorId, makeTimestamp } from '../core/types';
 import { selfSignedTestCertificate } from './tls-test-certificate';
+import type { RateLimitDecision, RateLimiter } from '../security/rate-limiter';
 
 const ISSUER = 'https://phase7f-issuer.test';
 const AUDIENCE = 'zinesh-phase7f';
@@ -50,7 +51,11 @@ function jwt(privateKey: KeyObject): string {
   return `${header}.${claims}.${signature}`;
 }
 
-async function harness(trustedProxies: readonly string[] = []): Promise<Harness> {
+async function harness(
+  trustedProxies: readonly string[] = [],
+  principalRateLimiter?: RateLimiter,
+  preAuthenticationRateLimiter?: RateLimiter,
+): Promise<Harness> {
   const directory = await mkdtemp(path.join(tmpdir(), 'zinesh-7f-'));
   const tls = selfSignedTestCertificate(new Date(Date.now() - 60_000), new Date(Date.now() + 86_400_000), HOST);
   const certificatePath = path.join(directory, 'certificate.pem');
@@ -75,11 +80,11 @@ async function harness(trustedProxies: readonly string[] = []): Promise<Harness>
           actorId: PAYER, capabilities: ['ACT_AS_SELF' as const], mappingVersion: 1 }
         : null;
     },
-  }, rejectAllFundingEvidence);
+  }, rejectAllFundingEvidence, principalRateLimiter);
   const audit = new Audit();
   const transport = await CommandHttpsTransport.create(
     { handleCommand: (request) => ingress.handle(request) },
-    config(certificatePath, privateKeyPath, trustedProxies), audit,
+    config(certificatePath, privateKeyPath, trustedProxies), audit, undefined, preAuthenticationRateLimiter,
   );
   await transport.listen();
   const result = { transport, port: transport.address()!.port, token: jwt(authPair.privateKey),
@@ -107,7 +112,7 @@ function command(commandId = 'https-command') {
 }
 
 async function post(h: Harness, body: unknown = command(), extraHeaders: Record<string, string> = {}) {
-  return new Promise<{ readonly status: number; readonly json: Record<string, unknown> }>((resolve, reject) => {
+  return new Promise<{ readonly status: number; readonly json: Record<string, unknown>; readonly headers: http.IncomingHttpHeaders }>((resolve, reject) => {
     const request = https.request({
       host: '127.0.0.1', port: h.port, path: '/commands', method: 'POST',
       rejectUnauthorized: false, agent: false,
@@ -115,7 +120,7 @@ async function post(h: Harness, body: unknown = command(), extraHeaders: Record<
     }, (response) => {
       const chunks: Buffer[] = [];
       response.on('data', (chunk: Buffer) => chunks.push(chunk));
-      response.on('end', () => resolve({ status: response.statusCode ?? 0,
+      response.on('end', () => resolve({ status: response.statusCode ?? 0, headers: response.headers,
         json: JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown> }));
     });
     request.once('error', reject);
@@ -179,6 +184,9 @@ describe('Phase 7F real TLS public ingress', () => {
     expect((await post(h, command('bad-chain'), { 'x-forwarded-for': '203.0.113.5, 10.0.0.1' })).status).toBe(403);
     expect((await post(h, command('bad-proto'), { 'x-forwarded-proto': 'http' })).status).toBe(403);
     expect((await post(h, command('bad-forward-host'), { 'x-forwarded-host': 'evil.example' })).status).toBe(403);
+    expect((await post(h, command('conflicting-source'), {
+      forwarded: 'for=203.0.113.5;proto=https', 'x-forwarded-for': '203.0.113.6',
+    })).status).toBe(403);
   });
 
   test('proxy trust configuration change is effective and unknown proxy fails closed', async () => {
@@ -224,4 +232,69 @@ describe('Phase 7F real TLS public ingress', () => {
     const privateMaterial = await import('fs/promises').then((fs) => fs.readFile(path.join(h.directory, 'private-key.pem'), 'utf8'));
     expect(dump).not.toContain(privateMaterial);
   });
+
+  test('Phase 7G pre-auth limit returns safe 429 before command dispatch', async () => {
+    const limiter = scriptedLimiter([{ allowed: true, retryAfterSeconds: 0 }, { allowed: false, retryAfterSeconds: 7 }]);
+    const h = await harness([], undefined, limiter);
+    expect((await post(h, command('pre-allowed'))).status).toBe(200);
+    const rejected = await post(h, command('pre-rejected'));
+    expect(rejected.status).toBe(429);
+    expect(rejected.json).toEqual({ error: { code: 'RATE_LIMITED' } });
+    expect(rejected.headers['retry-after']).toBe('7');
+    expect(limiter.keys).toEqual(['127.0.0.1', '127.0.0.1']);
+  });
+
+  test('Phase 7G invalid credential flood is limited before repeated authentication', async () => {
+    const limiter = scriptedLimiter([{ allowed: true, retryAfterSeconds: 0 }, { allowed: false, retryAfterSeconds: 2 }]);
+    const h = await harness([], undefined, limiter);
+    expect((await post(h, command('invalid-first'), { authorization: 'Bearer malformed' })).status).toBe(401);
+    expect((await post(h, command('invalid-second'), { authorization: 'Bearer malformed' })).status).toBe(429);
+  });
+
+  test('Phase 7G principal limit is independent of trusted client IP', async () => {
+    const principal = scriptedLimiter([{ allowed: true, retryAfterSeconds: 0 }, { allowed: false, retryAfterSeconds: 3 }]);
+    const h = await harness(['127.0.0.1'], principal);
+    expect((await post(h, command('principal-ip-a'), { 'x-forwarded-for': '203.0.113.10' })).status).toBe(200);
+    const rejected = await post(h, command('principal-ip-b'), { 'x-forwarded-for': '203.0.113.11' });
+    expect(rejected.status).toBe(429);
+    expect(principal.keys).toEqual(['https-principal', 'https-principal']);
+  });
+
+  test('Phase 7G limiter storage failure is fail-closed without secret leakage', async () => {
+    const unavailable: RateLimiter = { async consume() { throw new Error('storage password=never-leak'); } };
+    const pre = await harness([], undefined, unavailable);
+    expect(await post(pre, command('pre-storage-failure'))).toMatchObject({ status: 503,
+      json: { error: { code: 'RATE_LIMIT_UNAVAILABLE' } } });
+    const postAuth = await harness([], unavailable);
+    expect(await post(postAuth, command('post-storage-failure'))).toMatchObject({ status: 503,
+      json: { outcome: 'APPLICATION_REJECTION', error: { code: 'RATE_LIMIT_UNAVAILABLE' } } });
+  });
+
+  test('Phase 7G trusted IPv6 forms normalize to one pre-auth identity', async () => {
+    const limiter = scriptedLimiter([
+      { allowed: true, retryAfterSeconds: 0 }, { allowed: true, retryAfterSeconds: 0 },
+    ]);
+    const h = await harness(['127.0.0.1'], undefined, limiter);
+    expect((await post(h, command('ipv6-short'), { 'x-forwarded-for': '2001:db8::1' })).status).toBe(200);
+    expect((await post(h, command('ipv6-long'), { 'x-forwarded-for': '2001:0db8:0:0:0:0:0:1' })).status).toBe(200);
+    expect(limiter.keys).toEqual([
+      '2001:db8:0:0:0:0:0:1', '2001:db8:0:0:0:0:0:1',
+    ]);
+  });
+
+  test('Phase 7G admitted idempotent retry preserves the original result', async () => {
+    const principal = scriptedLimiter([
+      { allowed: true, retryAfterSeconds: 0 }, { allowed: true, retryAfterSeconds: 0 },
+    ]);
+    const h = await harness([], principal);
+    const first = await post(h, command('limited-idempotent-retry'));
+    const replay = await post(h, command('limited-idempotent-retry'));
+    expect(first.status).toBe(200);
+    expect(replay).toMatchObject({ status: 200, json: first.json });
+  });
 });
+
+function scriptedLimiter(decisions: RateLimitDecision[]): RateLimiter & { readonly keys: string[] } {
+  const keys: string[] = [];
+  return { keys, async consume(key) { keys.push(key); return decisions.shift() ?? { allowed: false, retryAfterSeconds: 1 }; } };
+}

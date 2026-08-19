@@ -11,6 +11,7 @@ import {
 import type {
   CommandDispatcher, CommandHttpConfig, TransportAuditSink,
 } from './command-http-transport';
+import type { RateLimiter } from '../security/rate-limiter';
 
 export interface CommandHttpsConfig extends CommandHttpConfig {
   readonly certificatePath: string;
@@ -35,6 +36,7 @@ export class CommandHttpsTransport {
     config: CommandHttpsConfig,
     audit?: TransportAuditSink,
     now: Date = new Date(),
+    preAuthenticationRateLimiter?: RateLimiter,
   ): Promise<CommandHttpsTransport> {
     const material = await loadAndValidateTlsMaterial(config, now);
     const admission = createPublicIngressAdmission(config);
@@ -50,6 +52,7 @@ export class CommandHttpsTransport {
         maxHeaderSize: config.maxHeaderBytes,
       }, handler),
       admission,
+      preAuthenticationRateLimiter,
     );
     return new CommandHttpsTransport(transport);
   }
@@ -96,7 +99,8 @@ function createPublicIngressAdmission(config: CommandHttpsConfig) {
   const trustedProxies = new Set(config.trustedProxies.map(normalizeAddress));
   const allowedHosts = new Set(config.allowedHosts.map((host) => host.toLowerCase()));
   return (request: IncomingMessage):
-    { readonly ok: true } | { readonly ok: false; readonly status: number; readonly code: string } => {
+    { readonly ok: true; readonly networkSource: string } |
+    { readonly ok: false; readonly status: number; readonly code: string } => {
     if (!('encrypted' in request.socket) || request.socket.encrypted !== true) {
       return { ok: false, status: 400, code: 'HTTPS_REQUIRED' };
     }
@@ -105,12 +109,12 @@ function createPublicIngressAdmission(config: CommandHttpsConfig) {
       return { ok: false, status: 421, code: 'UNTRUSTED_HOST' };
     }
     const forwarding = forwardingHeaders(request);
-    if (forwarding.length === 0) return { ok: true };
     const remoteAddress = normalizeAddress(request.socket.remoteAddress ?? '');
+    if (forwarding.length === 0) return { ok: true, networkSource: remoteAddress };
     if (!trustedProxies.has(remoteAddress) || !validForwarding(request, allowedHosts)) {
       return { ok: false, status: 403, code: 'UNTRUSTED_FORWARDING' };
     }
-    return { ok: true };
+    return { ok: true, networkSource: forwardedClientSource(request) ?? remoteAddress };
   };
 }
 
@@ -141,7 +145,11 @@ function validForwarding(request: IncomingMessage, allowedHosts: ReadonlySet<str
     const host = normalizedHost(forwardedHost);
     if (host === null || !allowedHosts.has(host)) return false;
   }
-  return forwarded === null || validStandardForwarded(forwarded, allowedHosts);
+  if (forwarded !== null && !validStandardForwarded(forwarded, allowedHosts)) return false;
+  const sources = [forwardedFor, realIp, forwarded === null ? null : standardForwardedSource(forwarded)]
+    .filter((value): value is string => value !== null)
+    .map((value) => normalizeAddress(unquoteAddress(value)));
+  return new Set(sources).size <= 1;
 }
 
 function validStandardForwarded(value: string, allowedHosts: ReadonlySet<string>): boolean {
@@ -167,6 +175,24 @@ function validStandardForwarded(value: string, allowedHosts: ReadonlySet<string>
   return true;
 }
 
+function forwardedClientSource(request: IncomingMessage): string | null {
+  const forwardedFor = singleHeader(request.headers['x-forwarded-for']);
+  if (forwardedFor !== null) return normalizeAddress(unquoteAddress(forwardedFor));
+  const forwarded = singleHeader(request.headers.forwarded);
+  if (forwarded !== null) return normalizeAddress(unquoteAddress(standardForwardedSource(forwarded) ?? ''));
+  const realIp = singleHeader(request.headers['x-real-ip']);
+  return realIp === null ? null : normalizeAddress(unquoteAddress(realIp));
+}
+
+function standardForwardedSource(value: string): string | null {
+  for (const entry of value.split(';')) {
+    const separator = entry.indexOf('=');
+    if (separator > 0 && entry.slice(0, separator).trim().toLowerCase() === 'for')
+      return entry.slice(separator + 1).trim();
+  }
+  return null;
+}
+
 function singleHeader(value: string | string[] | undefined): string | null {
   return typeof value === 'string' && value.length > 0 ? value : null;
 }
@@ -180,7 +206,16 @@ function unquoteAddress(value: string): string {
 }
 
 function normalizeAddress(value: string): string {
-  return value.startsWith('::ffff:') ? value.slice(7) : value;
+  const unwrapped = unquoteAddress(value).toLowerCase();
+  if (unwrapped.startsWith('::ffff:') && isIP(unwrapped.slice(7)) === 4) return unwrapped.slice(7);
+  if (isIP(unwrapped) !== 6) return unwrapped;
+  const halves = unwrapped.split('::');
+  const left = halves[0] === '' ? [] : halves[0]!.split(':');
+  const right = halves.length < 2 || halves[1] === '' ? [] : halves[1]!.split(':');
+  const groups = halves.length === 2
+    ? [...left, ...Array(8 - left.length - right.length).fill('0'), ...right]
+    : left;
+  return groups.map((group) => Number.parseInt(group, 16).toString(16)).join(':');
 }
 
 function normalizedHost(value: string | undefined): string | null {
