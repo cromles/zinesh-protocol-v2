@@ -6,8 +6,8 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "tsc",
-    "test": "node --experimental-vm-modules node_modules/.bin/jest --runInBand",
-    "test:coverage": "node --experimental-vm-modules node_modules/.bin/jest --runInBand --coverage"
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js --runInBand",
+    "test:coverage": "node --experimental-vm-modules node_modules/jest/bin/jest.js --runInBand --coverage"
   },
   "devDependencies": {
     "@types/jest": "^29.5.14",

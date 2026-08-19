@@ -113,7 +113,7 @@ async function applySchema(pool: Pool): Promise<void> {
 async function truncateTables(pool: Pool): Promise<void> {
   // Only allowed in tests — not in production code.
   // events is append-only in production; we truncate here only to reset test state.
-  await pool.query('TRUNCATE TABLE events, snapshots RESTART IDENTITY CASCADE');
+  await pool.query('TRUNCATE TABLE events, snapshots, command_executions RESTART IDENTITY CASCADE');
 }
 
 // ---------------------------------------------------------------------------
@@ -656,6 +656,62 @@ maybeDescribe('PostgreSQL Persistence', () => {
     const newEvents = await adapter.eventStore.getEventsSince(CELL, V1);
     expect(newEvents).toHaveLength(1);
     expect(newEvents[0]!.version).toBe(V2);
+  });
+
+  test('31. command result is replayed across adapter recreation without duplicate events', async () => {
+    const CELL = freshCellId();
+    const commandId = makeCommandId(`cmd-pg-replay-${cellCounter}`);
+    const event = makeEvent(CELL, V1);
+    const first = await adapter.commandExecutionStore.execute(commandId, 'same-fingerprint', async (store) => {
+      expect((await store.append(CELL, [event])).ok).toBe(true);
+      return { encodedResult: '{"outcome":"SUCCESS"}' };
+    });
+    const anotherAdapter = new PostgresPersistenceAdapter(pgConfig);
+    await anotherAdapter.connect();
+    try {
+      const replay = await anotherAdapter.commandExecutionStore.execute(commandId, 'same-fingerprint', async () => {
+        throw new Error('duplicate work must not execute');
+      });
+      expect(first.kind).toBe('EXECUTED');
+      expect(replay.kind).toBe('REPLAYED');
+      expect(await anotherAdapter.eventStore.getEvents(CELL)).toHaveLength(1);
+    } finally {
+      await anotherAdapter.disconnect();
+    }
+  });
+
+  test('32. concurrent duplicate command executes work once', async () => {
+    const CELL = freshCellId();
+    const commandId = makeCommandId(`cmd-pg-race-${cellCounter}`);
+    let executions = 0;
+    const work = async (store: import('./event-store').EventStore) => {
+      executions += 1;
+      expect((await store.append(CELL, [makeEvent(CELL, V1)])).ok).toBe(true);
+      return { encodedResult: '{"outcome":"SUCCESS"}' };
+    };
+    const results = await Promise.all([
+      adapter.commandExecutionStore.execute(commandId, 'race-fingerprint', work),
+      adapter.commandExecutionStore.execute(commandId, 'race-fingerprint', work),
+    ]);
+    expect(results.map((result) => result.kind).sort()).toEqual(['EXECUTED', 'REPLAYED']);
+    expect(executions).toBe(1);
+    expect(await adapter.eventStore.getEvents(CELL)).toHaveLength(1);
+  });
+
+  test('33. failed transaction rolls back events and permits retry', async () => {
+    const CELL = freshCellId();
+    const commandId = makeCommandId(`cmd-pg-rollback-${cellCounter}`);
+    await expect(adapter.commandExecutionStore.execute(commandId, 'rollback-fingerprint', async (store) => {
+      expect((await store.append(CELL, [makeEvent(CELL, V1)])).ok).toBe(true);
+      throw new Error('injected failure');
+    })).rejects.toThrow('injected failure');
+    expect(await adapter.eventStore.getEvents(CELL)).toHaveLength(0);
+    const retry = await adapter.commandExecutionStore.execute(commandId, 'rollback-fingerprint', async (store) => {
+      expect((await store.append(CELL, [makeEvent(CELL, V1)])).ok).toBe(true);
+      return { encodedResult: '{"outcome":"SUCCESS"}' };
+    });
+    expect(retry.kind).toBe('EXECUTED');
+    expect(await adapter.eventStore.getEvents(CELL)).toHaveLength(1);
   });
 });
 

@@ -17,7 +17,7 @@
  *   - No Date.now(), no Math.random()
  */
 
-import type { Pool, PoolClient } from 'pg';
+import type { Pool, PoolClient, QueryResult, QueryResultRow } from 'pg';
 import type { CellId, Event, Version } from '../core/types';
 import { makeEventId, makeCellId, makeTimestamp } from '../core/types';
 import type { AppendResult, EventStore } from './event-store';
@@ -79,8 +79,12 @@ function isUniqueViolation(err: unknown): boolean {
   );
 }
 
+interface Queryable {
+  query<R extends QueryResultRow = any>(text: string, values?: ReadonlyArray<unknown>): Promise<QueryResult<R>>;
+}
+
 export class PostgresEventStore implements EventStore {
-  constructor(private readonly pool: Pool) {}
+  constructor(private readonly pool: Pool, private readonly transactionClient?: PoolClient) {}
 
   async append(cellId: CellId, events: ReadonlyArray<Event>): Promise<AppendResult> {
     if (events.length === 0) {
@@ -103,6 +107,9 @@ export class PostgresEventStore implements EventStore {
     // All events are inserted inside a single transaction for atomicity.
     // If any INSERT fails the entire batch is rolled back.
     // DO NOT use SELECT FOR UPDATE.
+    if (this.transactionClient !== undefined) {
+      return this.insertBatch(this.transactionClient, events);
+    }
     const client: PoolClient = await this.pool.connect();
     try {
       await client.query('BEGIN');
@@ -148,8 +155,28 @@ export class PostgresEventStore implements EventStore {
     }
   }
 
+  private async insertBatch(client: Queryable, events: ReadonlyArray<Event>): Promise<AppendResult> {
+    try {
+      for (const event of events) {
+        await client.query(
+          `INSERT INTO events (event_id, cell_id, version, timestamp, type, payload)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [event.eventId, event.cellId, event.version, event.timestamp, event.type,
+            JSON.stringify(event.payload, jsonReplacer)],
+        );
+      }
+      return { ok: true };
+    } catch (err: unknown) {
+      if (isUniqueViolation(err)) {
+        return { ok: false, error: { kind: 'APPEND_VERSION_CONFLICT', message: 'A duplicate (cell_id, version) or event_id was detected' } };
+      }
+      throw err;
+    }
+  }
+
   async getEvents(cellId: CellId): Promise<ReadonlyArray<Event>> {
-    const result = await this.pool.query<EventRow>(
+    const queryable: Queryable = this.transactionClient ?? this.pool;
+    const result = await queryable.query<EventRow>(
       `SELECT event_id, cell_id, version, timestamp, type, payload
        FROM events
        WHERE cell_id = $1
@@ -160,7 +187,8 @@ export class PostgresEventStore implements EventStore {
   }
 
   async getEventsSince(cellId: CellId, afterVersion: Version): Promise<ReadonlyArray<Event>> {
-    const result = await this.pool.query<EventRow>(
+    const queryable: Queryable = this.transactionClient ?? this.pool;
+    const result = await queryable.query<EventRow>(
       `SELECT event_id, cell_id, version, timestamp, type, payload
        FROM events
        WHERE cell_id = $1

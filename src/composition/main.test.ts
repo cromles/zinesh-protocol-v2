@@ -14,11 +14,15 @@ import {
   createCommandGate,
   createProcessEventIdPrefix,
   loadPostgresConfig,
+  loadAuthenticationConfig,
+  loadPublicIngressConfig,
+  loadTransportConfig,
   main,
   performShutdown,
 } from './main';
 import { CellApplication } from '../application/cell-application';
 import { PostgresPersistenceAdapter } from '../adapters/postgres-persistence-adapter';
+import { PostgresMigrator, SchemaVersionError } from '../adapters/postgres-migrator';
 import { InMemoryPersistenceAdapter } from '../adapters/in-memory-persistence-adapter';
 import { createEventIdFactory } from '../application/event-id-factory';
 import { fixedClock } from '../application/clock';
@@ -30,7 +34,8 @@ import {
   makeCommandId,
   makeTimestamp,
 } from '../core/types';
-import type { HandleCommandRequest } from '../application/types';
+import { actorIdentity, createTestIngress } from '../security/testing';
+import { CommandHttpsTransport } from '../transport/command-https-transport';
 
 const VALID_ENV = {
   PGHOST: 'db.example.internal',
@@ -38,6 +43,26 @@ const VALID_ENV = {
   PGDATABASE: 'zinesh',
   PGUSER: 'zinesh',
   PGPASSWORD: 'secret-must-never-appear',
+  AUTH_TRUSTED_ISSUER: 'https://identity.example.test',
+  AUTH_TRUSTED_AUDIENCE: 'zinesh-production',
+  AUTH_JWKS_URL: 'https://identity.example.test/.well-known/jwks.json',
+  AUTH_ALLOWED_ALGORITHM: 'RS256',
+  AUTH_CLOCK_SKEW_SECONDS: '30',
+  AUTH_JWKS_CACHE_TTL_MS: '300000',
+  AUTH_JWKS_TIMEOUT_MS: '3000',
+  HTTP_HOST: '127.0.0.1',
+  HTTP_PORT: '8080',
+  HTTP_MAX_BODY_BYTES: '65536',
+  HTTP_MAX_HEADER_BYTES: '16384',
+  HTTP_REQUEST_TIMEOUT_MS: '15000',
+  HTTP_HEADERS_TIMEOUT_MS: '5000',
+  HTTPS_HOST: '0.0.0.0',
+  HTTPS_PORT: '8443',
+  TLS_CERTIFICATE_PATH: 'C:\\run\\secrets\\zinesh-cert.pem',
+  TLS_PRIVATE_KEY_PATH: 'C:\\run\\secrets\\zinesh-key.pem',
+  TLS_MIN_VERSION: 'TLSv1.2',
+  TLS_ALLOWED_HOSTS: 'api.zinesh.example',
+  TLS_TRUSTED_PROXIES: 'NONE',
 };
 
 function compositionSource(): string {
@@ -132,6 +157,72 @@ describe('loadPostgresConfig', () => {
 
   test('does not apply production defaults', () => {
     expect(() => loadPostgresConfig({})).toThrow(ConfigurationError);
+  });
+});
+
+describe('loadAuthenticationConfig', () => {
+  test('loads a strict RS256 issuer/audience/JWKS policy', () => {
+    expect(loadAuthenticationConfig(VALID_ENV)).toEqual({
+      issuers: [{
+        issuer: 'https://identity.example.test', audiences: ['zinesh-production'],
+        algorithms: ['RS256'], jwksUrl: 'https://identity.example.test/.well-known/jwks.json',
+      }],
+      clockSkewSeconds: 30, jwksCacheTtlMs: 300000, jwksTimeoutMs: 3000,
+    });
+  });
+
+  test.each([
+    'AUTH_TRUSTED_ISSUER', 'AUTH_TRUSTED_AUDIENCE', 'AUTH_JWKS_URL',
+    'AUTH_ALLOWED_ALGORITHM', 'AUTH_CLOCK_SKEW_SECONDS',
+    'AUTH_JWKS_CACHE_TTL_MS', 'AUTH_JWKS_TIMEOUT_MS',
+  ])('fails closed when %s is missing', (name) => {
+    const env = { ...VALID_ENV } as Record<string, string>;
+    delete env[name];
+    expect(() => loadAuthenticationConfig(env)).toThrow(ConfigurationError);
+  });
+
+  test('rejects insecure issuer/JWKS, algorithm downgrade and unsafe cache policy', () => {
+    expect(() => loadAuthenticationConfig({ ...VALID_ENV, AUTH_TRUSTED_ISSUER: 'http://issuer' })).toThrow(ConfigurationError);
+    expect(() => loadAuthenticationConfig({ ...VALID_ENV, AUTH_JWKS_URL: 'http://issuer/jwks' })).toThrow(ConfigurationError);
+    expect(() => loadAuthenticationConfig({ ...VALID_ENV, AUTH_ALLOWED_ALGORITHM: 'HS256' })).toThrow(ConfigurationError);
+    expect(() => loadAuthenticationConfig({ ...VALID_ENV, AUTH_JWKS_CACHE_TTL_MS: '0' })).toThrow(ConfigurationError);
+    expect(() => loadAuthenticationConfig({ ...VALID_ENV, AUTH_CLOCK_SKEW_SECONDS: '301' })).toThrow(ConfigurationError);
+  });
+});
+
+describe('loadTransportConfig', () => {
+  test('loads bounded loopback-only transport configuration', () => {
+    expect(loadTransportConfig(VALID_ENV)).toEqual({
+      host: '127.0.0.1', port: 8080, maxBodyBytes: 65536, maxHeaderBytes: 16384,
+      requestTimeoutMs: 15000, headersTimeoutMs: 5000,
+    });
+  });
+  test('rejects public plaintext binding and unsafe limits', () => {
+    expect(() => loadTransportConfig({ ...VALID_ENV, HTTP_HOST: '0.0.0.0' })).toThrow(ConfigurationError);
+    expect(() => loadTransportConfig({ ...VALID_ENV, HTTP_MAX_BODY_BYTES: '9999999' })).toThrow(ConfigurationError);
+    expect(() => loadTransportConfig({ ...VALID_ENV, HTTP_HEADERS_TIMEOUT_MS: '20000' })).toThrow(ConfigurationError);
+  });
+});
+
+describe('loadPublicIngressConfig', () => {
+  test('loads explicit HTTPS, host, certificate and no-proxy policy', () => {
+    expect(loadPublicIngressConfig(VALID_ENV)).toMatchObject({
+      host: '0.0.0.0', port: 8443, minimumTlsVersion: 'TLSv1.2',
+      allowedHosts: ['api.zinesh.example'], trustedProxies: [],
+    });
+  });
+  test('fails closed for ambiguous TLS, host and proxy configuration', () => {
+    expect(() => loadPublicIngressConfig({ ...VALID_ENV, TLS_MIN_VERSION: 'TLSv1.1' })).toThrow(ConfigurationError);
+    expect(() => loadPublicIngressConfig({ ...VALID_ENV, TLS_ALLOWED_HOSTS: '*' })).toThrow(ConfigurationError);
+    expect(() => loadPublicIngressConfig({ ...VALID_ENV, TLS_TRUSTED_PROXIES: '*' })).toThrow(ConfigurationError);
+    expect(() => loadPublicIngressConfig({ ...VALID_ENV, TLS_TRUSTED_PROXIES: '0.0.0.0' })).toThrow(ConfigurationError);
+    const missing = { ...VALID_ENV } as Record<string, string>;
+    delete missing.TLS_CERTIFICATE_PATH;
+    expect(() => loadPublicIngressConfig(missing)).toThrow(ConfigurationError);
+  });
+  test('accepts only explicitly enumerated proxy addresses', () => {
+    expect(loadPublicIngressConfig({ ...VALID_ENV, TLS_TRUSTED_PROXIES: '10.0.0.5,2001:db8::5' }).trustedProxies)
+      .toEqual(['10.0.0.5', '2001:db8::5']);
   });
 });
 
@@ -245,6 +336,25 @@ describe('main configuration path', () => {
     });
     expect(codes).toEqual([1]);
   });
+
+  test('wrong schema version fails closed before runtime accepts commands', async () => {
+    const tls = jest.spyOn(CommandHttpsTransport, 'create').mockResolvedValue({
+      listen: async () => undefined, close: async () => undefined, address: () => null,
+    } as never);
+    const connect = jest.spyOn(PostgresPersistenceAdapter.prototype, 'connect').mockResolvedValue();
+    const disconnect = jest.spyOn(PostgresPersistenceAdapter.prototype, 'disconnect').mockResolvedValue();
+    const verify = jest.spyOn(PostgresMigrator.prototype, 'verifyExpectedVersion')
+      .mockRejectedValue(new SchemaVersionError('wrong version'));
+    const codes: number[] = [];
+    try {
+      await main(VALID_ENV, (code) => { codes.push(code); });
+      expect(codes).toEqual([1]);
+      expect(verify).toHaveBeenCalledTimes(1);
+      expect(disconnect).toHaveBeenCalledTimes(1);
+    } finally {
+      tls.mockRestore(); connect.mockRestore(); disconnect.mockRestore(); verify.mockRestore();
+    }
+  });
 });
 
 describe('composeRuntime wiring', () => {
@@ -258,7 +368,7 @@ describe('composeRuntime wiring', () => {
     });
     try {
       expect(runtime.persistence).toBeInstanceOf(PostgresPersistenceAdapter);
-      expect(runtime.application).toBeInstanceOf(CellApplication);
+      expect('application' in runtime).toBe(false);
     } finally {
       await runtime.persistence.disconnect();
     }
@@ -276,13 +386,17 @@ describe('in-flight gate with real CellApplication', () => {
     });
     const gate = createCommandGate();
 
-    const request: HandleCommandRequest = {
+    const payer = makeActorId('payer-1');
+    const identity = actorIdentity(payer, 'composition-payer');
+    const ingress = createTestIngress(application, [identity]);
+    const request: import('../security/trusted-ingress').ExternalCommandRequest = {
+      credential: identity.credential,
       command: {
         commandId: makeCommandId('cmd-comp-1'),
         cellId: makeCellId('cell-comp-1'),
         type: 'CreateCell',
         payload: {
-          payer: makeActorId('payer-1'),
+          payer,
           payee: makeActorId('payee-1'),
           amount: makeAmount(10000n),
           currency: 'TRY',
@@ -290,14 +404,13 @@ describe('in-flight gate with real CellApplication', () => {
           completionDeadline: makeTimestamp(5_000_000),
         },
       },
-      caller: { authenticated: true, actorId: makeActorId('payer-1') },
     };
 
-    const result = await gate.run(() => application.handleCommand(request));
+    const result = await gate.run(() => ingress.handle(request));
     expect(result.outcome).toBe('SUCCESS');
 
     gate.beginShutdown();
-    await expect(gate.run(() => application.handleCommand(request))).rejects.toBeInstanceOf(
+    await expect(gate.run(() => ingress.handle(request))).rejects.toBeInstanceOf(
       RuntimeUnavailableError,
     );
   });

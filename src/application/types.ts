@@ -5,25 +5,13 @@
  */
 
 import type { ApplicationError } from './errors';
-import type { ActorId, CellState, Command, Event, KernelError, Version } from '../core/types';
+import type { CellState, Command, Event, KernelError, Version } from '../core/types';
+import type { VerifiedFundingContext, VerifiedPrincipal } from '../security/trusted-ingress';
 
-export interface CallerIdentity {
-  readonly authenticated: boolean;
-  readonly actorId: ActorId;
-}
-
-/**
- * Infrastructure-level gateway check. Kernel still verifies funderId === payer.
- * Do not add gatewayId / providerType / issuedBy to Kernel types.
- */
-export interface GatewayAuthorization {
-  readonly authorizedGateway: boolean;
-}
-
-export interface HandleCommandRequest {
+export interface TrustedHandleCommandRequest {
   readonly command: Command;
-  readonly caller: CallerIdentity;
-  readonly gateway?: GatewayAuthorization;
+  readonly principal: VerifiedPrincipal;
+  readonly fundingContext?: VerifiedFundingContext;
 }
 
 export type HandleCommandSuccess = {

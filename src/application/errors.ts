@@ -15,6 +15,12 @@ export type ApplicationErrorCode =
   | 'INVALID_INPUT'
   | 'UNAUTHENTICATED'
   | 'GATEWAY_DENIED'
+  | 'ACTOR_MISMATCH'
+  | 'IDEMPOTENCY_CONFLICT'
+  | 'PRINCIPAL_NOT_MAPPED'
+  | 'PRINCIPAL_DISABLED'
+  | 'COMMAND_NOT_PERMITTED'
+  | 'FUNDING_EVIDENCE_INVALID'
   | 'PERSISTENCE_FAILURE';
 
 export interface ApplicationError {
@@ -54,6 +60,14 @@ export function gatewayDenied(
   };
 }
 
+export function actorMismatch(): ApplicationError {
+  return { type: 'ApplicationError', code: 'ACTOR_MISMATCH', message: 'Command actor does not match authenticated caller' };
+}
+
+export function idempotencyConflict(): ApplicationError {
+  return { type: 'ApplicationError', code: 'IDEMPOTENCY_CONFLICT', message: 'commandId was already used for a different command' };
+}
+
 export function persistenceFailure(
   message: string,
   persistenceKind?: EventStoreError['kind'],
@@ -78,4 +92,10 @@ export function mapEventStoreError(error: EventStoreError): ApplicationError {
 
 export function opaquePersistenceFailure(): ApplicationError {
   return persistenceFailure('Persistence operation failed');
+}
+
+export function securityRejection(code: Extract<ApplicationErrorCode,
+  'UNAUTHENTICATED' | 'PRINCIPAL_NOT_MAPPED' | 'PRINCIPAL_DISABLED' |
+  'COMMAND_NOT_PERMITTED' | 'FUNDING_EVIDENCE_INVALID'>): import('./types').HandleCommandResult {
+  return { outcome: 'APPLICATION_REJECTION', error: { type: 'ApplicationError', code, message: 'Security policy rejected the command' } };
 }

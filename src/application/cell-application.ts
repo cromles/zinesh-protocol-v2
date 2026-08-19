@@ -16,6 +16,7 @@
  */
 
 import type { PersistenceAdapter } from '../adapters/persistence-adapter';
+import type { EventStore } from '../adapters/event-store';
 import type { EventStoreError } from '../adapters/event-store';
 import type {
   ActorId,
@@ -44,14 +45,15 @@ import type { Kernel } from '../kernel/kernel';
 import type { Clock } from './clock';
 import type { EventIdFactory } from './event-id-factory';
 import {
-  gatewayDenied,
+  actorMismatch,
+  idempotencyConflict,
   invalidInput,
   mapEventStoreError,
   opaquePersistenceFailure,
-  unauthenticated,
   type ApplicationError,
 } from './errors';
-import type { HandleCommandRequest, HandleCommandResult } from './types';
+import type { TrustedHandleCommandRequest, HandleCommandResult } from './types';
+import { isVerifiedFundingContext, isVerifiedPrincipal } from '../security/trusted-ingress';
 
 const RECOGNIZED_COMMAND_TYPES: ReadonlySet<DomainCommandType> = new Set([
   'CreateCell',
@@ -92,10 +94,12 @@ export class CellApplication {
     this.eventIds = deps.eventIds;
   }
 
-  async handleCommand(request: HandleCommandRequest): Promise<HandleCommandResult> {
-    const auth = authenticateCaller(request);
-    if (auth !== undefined) {
-      return applicationRejection(auth);
+  async handleCommand(request: TrustedHandleCommandRequest): Promise<HandleCommandResult> {
+    if (!isVerifiedPrincipal(request.principal)) {
+      return applicationRejection({ type: 'ApplicationError', code: 'UNAUTHENTICATED', message: 'Verified principal required' });
+    }
+    if (!request.principal.enabled) {
+      return applicationRejection({ type: 'ApplicationError', code: 'PRINCIPAL_DISABLED', message: 'Principal is disabled' });
     }
 
     const shaped = validateCommandShape(request.command);
@@ -105,20 +109,65 @@ export class CellApplication {
 
     let command = shaped.command;
 
-    if (command.type === 'FundCell') {
-      if (request.gateway?.authorizedGateway !== true) {
-        return applicationRejection(gatewayDenied());
-      }
+    const authorization = authorizePrincipal(request, command);
+    if (authorization !== undefined) {
+      return applicationRejection(authorization);
     }
 
     const now = this.clock.now();
     command = alignDeadlineCommandTime(command, now);
 
+    const fingerprint = canonicalEncode({
+      principalId: request.principal.principalId,
+      principalType: request.principal.type,
+      actorId: request.principal.actorId,
+      fundingTransaction: request.fundingContext?.providerTransactionId,
+      command,
+    });
+
+    let execution;
+    try {
+      execution = await this.persistence.commandExecutionStore.execute(
+        command.commandId,
+        fingerprint,
+        async (eventStore) => ({
+          encodedResult: canonicalEncode(await this.executeOnce(command, now, eventStore)),
+        }),
+      );
+    } catch (err) {
+      return persistenceFailureResult(toPersistenceFailure(err));
+    }
+
+    if (execution.kind === 'CONFLICT') {
+      return applicationRejection(idempotencyConflict());
+    }
+
+    const result = canonicalDecode(execution.encodedResult) as HandleCommandResult;
+    if (execution.kind === 'EXECUTED' && result.outcome === 'SUCCESS') {
+      try {
+        await this.persistence.snapshotStore.save(command.cellId, {
+          cellId: command.cellId,
+          version: result.version,
+          state: result.nextState,
+        });
+      } catch {
+        // Snapshot remains a non-authoritative cache.
+      }
+    }
+    return result;
+  }
+
+  private async executeOnce(
+    command: Command,
+    now: Timestamp,
+    eventStore: EventStore,
+  ): Promise<HandleCommandResult> {
+
     const cellId = command.cellId;
 
     let loaded: ReadonlyArray<Event>;
     try {
-      loaded = await this.persistence.eventStore.getEvents(cellId);
+      loaded = await eventStore.getEvents(cellId);
     } catch (err) {
       return persistenceFailureResult(toPersistenceFailure(err));
     }
@@ -149,7 +198,7 @@ export class CellApplication {
     if (kernelResult.events.length > 0) {
       let appendResult;
       try {
-        appendResult = await this.persistence.eventStore.append(
+        appendResult = await eventStore.append(
           cellId,
           kernelResult.events,
         );
@@ -161,20 +210,6 @@ export class CellApplication {
         return persistenceFailureResult(mapEventStoreError(appendResult.error));
       }
 
-      const last = kernelResult.events[kernelResult.events.length - 1];
-      if (last !== undefined) {
-        try {
-          await this.persistence.snapshotStore.save(cellId, {
-            cellId,
-            version: last.version,
-            state: kernelResult.nextState,
-          });
-        } catch {
-          // Snapshot is a write-only cache. Events remain authoritative.
-          // HandleCommandResult has no non-domain warning channel, so SUCCESS
-          // is returned. Do not roll back the append. Do not retry.
-        }
-      }
     }
 
     const version = resultingVersion(loaded, kernelResult.events);
@@ -188,23 +223,94 @@ export class CellApplication {
   }
 }
 
+function callerMatchesCommand(actorId: ActorId, command: Command): boolean {
+  const payload = command.payload as unknown as Record<string, unknown>;
+  const actorField: Record<DomainCommandType, string> = {
+    CreateCell: 'payer',
+    FundCell: 'funderId',
+    RequestRelease: 'requestedBy',
+    ApproveRelease: 'approvedBy',
+    RequestRefund: 'requestedBy',
+    ApproveRefund: 'approvedBy',
+    ForceRefund: 'requestedBy',
+    ExpireCell: 'triggeredBy',
+    OpenDispute: 'openedBy',
+    ResolveDispute: 'resolvedBy',
+  };
+  return payload[actorField[command.type]] === actorId;
+}
+
+function authorizePrincipal(
+  request: TrustedHandleCommandRequest,
+  command: Command,
+): ApplicationError | undefined {
+  const principal = request.principal;
+  if (principal.type === 'ACTOR') {
+    if (command.type === 'FundCell' || !principal.capabilities.includes('ACT_AS_SELF')) {
+      return { type: 'ApplicationError', code: 'COMMAND_NOT_PERMITTED', message: 'Principal cannot send this command' };
+    }
+    if (principal.actorId === undefined || !callerMatchesCommand(principal.actorId, command)) {
+      return actorMismatch();
+    }
+    return undefined;
+  }
+
+  if (principal.type === 'GATEWAY') {
+    if (command.type !== 'FundCell' || !principal.capabilities.includes('CONFIRM_FUNDING')) {
+      return { type: 'ApplicationError', code: 'COMMAND_NOT_PERMITTED', message: 'Principal cannot send this command' };
+    }
+    const context = request.fundingContext;
+    if (!isVerifiedFundingContext(context)) {
+      return { type: 'ApplicationError', code: 'FUNDING_EVIDENCE_INVALID', message: 'Verified funding evidence required' };
+    }
+    const payload = command.payload as { funderId: ActorId; amount: Amount };
+    if (
+      context.gatewayPrincipalId !== principal.principalId ||
+      context.cellId !== command.cellId || context.payer !== payload.funderId ||
+      context.amount !== payload.amount || context.currency !== 'TRY'
+    ) {
+      return { type: 'ApplicationError', code: 'FUNDING_EVIDENCE_INVALID', message: 'Funding evidence does not match command' };
+    }
+    return undefined;
+  }
+
+  return { type: 'ApplicationError', code: 'COMMAND_NOT_PERMITTED', message: 'Principal cannot send actor commands' };
+}
+
+function canonicalEncode(value: unknown): string {
+  const normalize = (input: unknown): unknown => {
+    if (typeof input === 'bigint') return { __zinesh_bigint__: input.toString() };
+    if (Array.isArray(input)) return input.map(normalize);
+    if (typeof input === 'object' && input !== null) {
+      return Object.fromEntries(
+        Object.entries(input as Record<string, unknown>)
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([key, child]) => [key, normalize(child)]),
+      );
+    }
+    return input;
+  };
+  return JSON.stringify(normalize(value));
+}
+
+function canonicalDecode(encoded: string): unknown {
+  return JSON.parse(encoded, (_key, value: unknown) => {
+    if (
+      typeof value === 'object' && value !== null &&
+      Object.keys(value).length === 1 && '__zinesh_bigint__' in value
+    ) {
+      return BigInt((value as { __zinesh_bigint__: string }).__zinesh_bigint__);
+    }
+    return value;
+  });
+}
+
 function applicationRejection(error: ApplicationError): HandleCommandResult {
   return { outcome: 'APPLICATION_REJECTION', error };
 }
 
 function persistenceFailureResult(error: ApplicationError): HandleCommandResult {
   return { outcome: 'PERSISTENCE_FAILURE', error };
-}
-
-function authenticateCaller(request: HandleCommandRequest): ApplicationError | undefined {
-  if (request.caller === undefined || request.caller.authenticated !== true) {
-    return unauthenticated();
-  }
-  const actor = parseActorId(request.caller.actorId, 'caller.actorId');
-  if (!actor.ok) {
-    return actor.error;
-  }
-  return undefined;
 }
 
 function expectedVersionFromStream(events: ReadonlyArray<Event>): Version {
