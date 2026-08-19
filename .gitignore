@@ -1,34 +1,40 @@
 ```
 # Dependencies
 node_modules/
+.pnpm-store/
+.npm/
+.yarn/
 
 # Build outputs
 dist/
 build/
-target/
-
-# TypeScript
-*.tsbuildinfo
-*.js.map
-*.d.ts
+coverage/
+.nyc_output/
+.eslintcache
 
 # Logs
 *.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
 # Environment variables
 .env
 .env.local
-*.env.*
+.env.*
+!.env.example
 
-# IDE
+# IDE specific
 .vscode/
 .idea/
-
-# OS
+*.swp
+*.swo
 .DS_Store
 Thumbs.db
 
-# Coverage
-coverage/
-.nyc_output/
+# TypeScript/JavaScript specific
+*.tsbuildinfo
+.next/
+.nuxt/
+.vuepress/dist
 ```
