@@ -23,6 +23,7 @@ import { PostgresSnapshotStore } from './postgres-snapshot-store';
 import { PostgresCommandExecutionStore } from './postgres-command-execution-store';
 import { PostgresPrincipalAuthority } from './postgres-principal-authority';
 import { PostgresMigrator } from './postgres-migrator';
+import { PostgresRateLimitStore } from './postgres-rate-limit-store';
 
 export interface PostgresConfig {
   readonly host: string;
@@ -39,6 +40,7 @@ export class PostgresPersistenceAdapter implements PersistenceAdapter {
   readonly commandExecutionStore: PostgresCommandExecutionStore;
   readonly principalAuthority: PostgresPrincipalAuthority;
   readonly migrator: PostgresMigrator;
+  readonly rateLimitStore: PostgresRateLimitStore;
 
   constructor(config: PostgresConfig) {
     this.pool = new Pool({
@@ -53,6 +55,7 @@ export class PostgresPersistenceAdapter implements PersistenceAdapter {
     this.commandExecutionStore = new PostgresCommandExecutionStore(this.pool);
     this.principalAuthority = new PostgresPrincipalAuthority(this.pool);
     this.migrator = new PostgresMigrator(this.pool);
+    this.rateLimitStore = new PostgresRateLimitStore(this.pool);
   }
 
   async connect(): Promise<void> {

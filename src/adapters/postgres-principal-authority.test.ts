@@ -48,7 +48,7 @@ maybeDescribe('Phase 7C PostgreSQL Principal Authority', () => {
     authority = new PostgresPrincipalAuthority(pool);
   });
   beforeEach(async () => {
-    await pool.query('TRUNCATE principal_audit,principal_capabilities,external_identities,principals,events,snapshots,command_executions CASCADE');
+    await pool.query('TRUNCATE principal_audit,principal_capabilities,external_identities,principals,events,snapshots,command_executions,rate_limit_windows CASCADE');
   });
   afterAll(async () => { await pool.end(); });
 
@@ -250,7 +250,10 @@ maybeDescribe('Phase 7C PostgreSQL Principal Authority', () => {
         clockSkewSeconds: 30, jwksCacheTtlMs: 60_000, jwksTimeoutMs: 1_000 },
       new CachedJwksProvider({ async fetch() { return { keys: [jwk] }; } }, 60_000, 1_000),
     );
-    const runtime = composeRuntime(config, { authentication });
+    const runtime = composeRuntime(config, { authentication }, {
+      preAuth: { limit: 10, windowMs: 60_000, retentionMs: 120_000, storageTimeoutMs: 2_000 },
+      principal: { limit: 10, windowMs: 60_000, retentionMs: 120_000, storageTimeoutMs: 2_000 },
+    });
     const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'zinesh-7f-pg-'));
     const tls = selfSignedTestCertificate(new Date(Date.now() - 60_000), new Date(Date.now() + 60_000), 'api.zinesh.test');
     const certificatePath = path.join(directory, 'certificate.pem');
@@ -264,7 +267,8 @@ maybeDescribe('Phase 7C PostgreSQL Principal Authority', () => {
       { host: '127.0.0.1', port: 0, maxBodyBytes: 4096, maxHeaderBytes: 8192,
         requestTimeoutMs: 2_000, headersTimeoutMs: 1_000, certificatePath, privateKeyPath,
         minimumTlsVersion: 'TLSv1.2', allowedHosts: ['api.zinesh.test'], trustedProxies: [] },
-      { record() { /* Assertions use durable state; no test output. */ } },
+      { record() { /* Assertions use durable state; no test output. */ } }, undefined,
+      runtime.preAuthenticationRateLimiter,
     );
     await runtime.persistence.connect();
     await transport.listen();
@@ -306,6 +310,12 @@ maybeDescribe('Phase 7C PostgreSQL Principal Authority', () => {
       expect((await pool.query(
         `SELECT count(*)::int AS count FROM command_executions WHERE command_id='http-postgres-command'`,
       )).rows[0]).toEqual({ count: 1 });
+      expect((await pool.query(
+        `SELECT category,request_count FROM rate_limit_windows ORDER BY category`,
+      )).rows).toEqual([
+        { category: 'PRE_AUTH', request_count: 2 },
+        { category: 'PRINCIPAL', request_count: 2 },
+      ]);
     } finally {
       await transport.close();
       await runtime.persistence.disconnect();
@@ -353,7 +363,8 @@ maybeDescribe('Phase 7C migrations', () => {
     await migrator.migrate();
     await migrator.migrate();
     await expect(migrator.verifyExpectedVersion()).resolves.toBeUndefined();
-    expect((await db.pool.query('SELECT version FROM schema_migrations ORDER BY version')).rows).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }]);
+    expect((await db.pool.query('SELECT version FROM schema_migrations ORDER BY version')).rows)
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }]);
     await db.pool.end();
   });
 

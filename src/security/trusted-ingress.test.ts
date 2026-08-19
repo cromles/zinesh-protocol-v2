@@ -205,3 +205,33 @@ describe('Phase 7B trusted principal boundary', () => {
     expect(encoded).not.toContain(identity.subject);
   });
 });
+
+describe('Phase 7G principal abuse boundary', () => {
+  test('token rotation uses stable principalId and storage denial precedes application', async () => {
+    const stable = actorIdentity(PAYER, 'rotating-a');
+    const rotated = { ...actorIdentity(PAYER, 'rotating-b'), principal: stable.principal };
+    const keys: string[] = [];
+    const decisions = [true, false];
+    const limiter = { async consume(key: string) {
+      keys.push(key); return { allowed: decisions.shift() ?? false, retryAfterSeconds: 4 };
+    } };
+    const ingress = createTestIngress(application(), [stable, rotated], undefined, limiter);
+    expect((await ingress.handle({ credential: stable.credential, command: createCommand('rotation-first') })).outcome).toBe('SUCCESS');
+    const rejected = await ingress.handle({ credential: rotated.credential, command: createCommand('rotation-second') });
+    expect(rejected).toMatchObject({ outcome: 'APPLICATION_REJECTION', error: { code: 'RATE_LIMITED', retryAfterSeconds: 4 } });
+    expect(keys).toEqual([stable.principal.principalId, stable.principal.principalId]);
+  });
+
+  test('disabled principal is rejected without using principal limiter as a bypass', async () => {
+    const disabled = { ...actorIdentity(PAYER, 'disabled-limited'), principal: {
+      ...actorIdentity(PAYER, 'disabled-limited').principal, enabled: false,
+    } };
+    let calls = 0;
+    const ingress = createTestIngress(application(), [disabled], undefined, {
+      async consume() { calls += 1; return { allowed: true, retryAfterSeconds: 0 }; },
+    });
+    expect(await ingress.handle({ credential: disabled.credential, command: createCommand('disabled-limited') }))
+      .toMatchObject({ outcome: 'APPLICATION_REJECTION', error: { code: 'PRINCIPAL_DISABLED' } });
+    expect(calls).toBe(0);
+  });
+});

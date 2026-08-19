@@ -1,6 +1,6 @@
 import type { Pool, PoolClient } from 'pg';
 
-export const EXPECTED_SCHEMA_VERSION = 3;
+export const EXPECTED_SCHEMA_VERSION = 4;
 
 const CORE_SCHEMA = `
 CREATE TABLE IF NOT EXISTS events (
@@ -90,6 +90,17 @@ END; $$ LANGUAGE plpgsql;
 CREATE TRIGGER external_identity_immutable BEFORE UPDATE OR DELETE ON external_identities
 FOR EACH ROW EXECUTE FUNCTION prevent_identity_rebinding();`;
 
+const RATE_LIMIT_SCHEMA = `
+CREATE TABLE rate_limit_windows (
+  category TEXT NOT NULL CHECK (category IN ('PRE_AUTH','PRINCIPAL')),
+  key_hash CHAR(64) NOT NULL CHECK (key_hash ~ '^[0-9a-f]{64}$'),
+  window_start BIGINT NOT NULL CHECK (window_start >= 0),
+  request_count INTEGER NOT NULL CHECK (request_count > 0),
+  expires_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY(category,key_hash,window_start)
+);
+CREATE INDEX rate_limit_windows_expiry ON rate_limit_windows(expires_at);`;
+
 export class SchemaVersionError extends Error {
   constructor(message: string) { super(message); this.name = 'SchemaVersionError'; }
 }
@@ -119,6 +130,10 @@ export class PostgresMigrator {
       if (!applied.has(3)) {
         await client.query(PRINCIPAL_IMMUTABILITY);
         await client.query('INSERT INTO schema_migrations(version,name) VALUES (3,$1)', ['principal-identity-immutability']);
+      }
+      if (!applied.has(4)) {
+        await client.query(RATE_LIMIT_SCHEMA);
+        await client.query('INSERT INTO schema_migrations(version,name) VALUES (4,$1)', ['distributed-rate-limits']);
       }
       await client.query('COMMIT');
     } catch (error) {
