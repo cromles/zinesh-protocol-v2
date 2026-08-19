@@ -8,6 +8,8 @@ import {
 import type { HandleCommandResult } from '../application/types';
 import type { ExternalCommandRequest } from '../security/trusted-ingress';
 import type { RateLimiter } from '../security/rate-limiter';
+import { noOpSecurityTelemetry, serverCorrelationId } from '../security/security-observability';
+import type { SecurityTelemetry } from '../security/security-observability';
 
 export interface CommandDispatcher {
   handleCommand(request: ExternalCommandRequest): Promise<HandleCommandResult>;
@@ -62,6 +64,7 @@ export class CommandHttpTransport {
     ),
     private readonly admission: CommandRequestAdmission = () => ({ ok: true }),
     private readonly preAuthenticationRateLimiter?: RateLimiter,
+    private readonly telemetry: SecurityTelemetry = noOpSecurityTelemetry,
   ) {
     this.server = serverFactory((request, response) => {
       void this.route(request, response);
@@ -97,7 +100,8 @@ export class CommandHttpTransport {
 
   private async route(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const started = Date.now();
-    const correlationId = validCorrelationId(request.headers['x-correlation-id']) ?? this.correlationId();
+    // Client correlation values are deliberately not trusted as operational identity.
+    const correlationId = serverCorrelationId(this.correlationId());
     response.setHeader('x-correlation-id', correlationId);
     applySecurityHeaders(response);
     let commandId: string | undefined;
@@ -125,11 +129,19 @@ export class CommandHttpTransport {
         const networkSource = admitted.networkSource ?? normalizePeer(request.socket.remoteAddress ?? 'unknown');
         try {
           const decision = await this.preAuthenticationRateLimiter.consume(networkSource);
+          this.telemetry.record({
+            category: 'RATE_LIMIT', action: 'PRE_AUTH', outcome: decision.allowed ? 'ALLOWED' : 'REJECTED',
+            correlationId,
+          });
           if (!decision.allowed) {
             outcome = 'RATE_LIMITED'; this.retryAfter(response, decision.retryAfterSeconds);
             this.respond(response, 429, { error: { code: 'RATE_LIMITED' } }); return;
           }
         } catch {
+          this.telemetry.record({
+            category: 'RATE_LIMIT', action: 'PRE_AUTH', outcome: 'DEPENDENCY_FAILURE',
+            reason: 'FAIL_CLOSED', correlationId,
+          });
           outcome = 'RATE_LIMIT_UNAVAILABLE';
           this.respond(response, 503, { error: { code: 'RATE_LIMIT_UNAVAILABLE' } }); return;
         }
@@ -140,6 +152,10 @@ export class CommandHttpTransport {
       }
       const credential = bearerCredential(request.headers.authorization);
       if (credential === null) {
+        this.telemetry.record({
+          category: 'AUTHENTICATION', action: 'CREDENTIAL', outcome: 'REJECTED',
+          reason: 'MALFORMED_CREDENTIAL', correlationId,
+        });
         outcome = 'UNAUTHENTICATED'; this.respond(response, 401, { error: { code: 'UNAUTHENTICATED' } }); return;
       }
       const raw = await readBody(request, this.config.maxBodyBytes);
@@ -149,7 +165,7 @@ export class CommandHttpTransport {
       }
       commandId = decoded.command.commandId;
       commandType = decoded.command.type;
-      const result = await this.dispatcher.handleCommand({ credential, command: decoded.command });
+      const result = await this.dispatcher.handleCommand({ credential, command: decoded.command, correlationId });
       outcome = result.outcome === 'SUCCESS' ? 'SUCCESS' : result.error.code;
       const mapped = mapResult(result);
       if (mapped.retryAfterSeconds !== undefined) this.retryAfter(response, mapped.retryAfterSeconds);
@@ -167,8 +183,27 @@ export class CommandHttpTransport {
         ...(commandId === undefined ? {} : { commandId }),
         ...(commandType === undefined ? {} : { commandType }),
       };
-      this.audit.record(audit);
+      try { this.audit.record(audit); } catch {
+        this.telemetry.record({
+          category: 'TELEMETRY', action: 'LEGACY_AUDIT', outcome: 'DEPENDENCY_FAILURE',
+          reason: 'TELEMETRY_FAILURE', correlationId,
+        });
+      }
+      this.recordRequestTelemetry(audit);
     }
+  }
+
+  private recordRequestTelemetry(audit: TransportAuditRecord): void {
+    const tlsReasons = new Set(['HTTPS_REQUIRED', 'UNTRUSTED_HOST', 'UNTRUSTED_FORWARDING']);
+    const accepted = audit.outcome === 'SUCCESS';
+    this.telemetry.record({
+      category: tlsReasons.has(audit.outcome) ? 'TLS' : 'INGRESS',
+      action: 'REQUEST', outcome: accepted ? 'SUCCESS' : 'REJECTED',
+      correlationId: audit.correlationId, durationMs: audit.durationMs,
+      ...(accepted ? {} : { reason: boundedReason(audit.outcome) }),
+      ...(audit.commandId === undefined ? {} : { commandId: audit.commandId }),
+      ...(audit.commandType === undefined ? {} : { commandType: audit.commandType }),
+    });
   }
 
   private retryAfter(response: ServerResponse, seconds: number): void {
@@ -286,9 +321,6 @@ function bearerCredential(value: string | undefined): string | null {
   const match = /^Bearer ([A-Za-z0-9._~-]+)$/.exec(value);
   return match?.[1] ?? null;
 }
-function validCorrelationId(value: string | string[] | undefined): string | null {
-  return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value) ? value : null;
-}
 function applySecurityHeaders(response: ServerResponse): void {
   response.setHeader('content-type', 'application/json; charset=utf-8');
   response.setHeader('cache-control', 'no-store');
@@ -299,3 +331,6 @@ function jsonReplacer(_key: string, value: unknown): unknown {
   return typeof value === 'bigint' ? value.toString() : value;
 }
 function normalizePeer(value: string): string { return value.startsWith('::ffff:') ? value.slice(7) : value; }
+function boundedReason(value: string): string {
+  return /^[A-Z][A-Z0-9_]{0,63}$/.test(value) ? value : 'INTERNAL_FAILURE';
+}

@@ -33,8 +33,15 @@ import { CommandHttpsTransport } from '../transport/command-https-transport';
 import type { CommandHttpsConfig } from '../transport/command-https-transport';
 import { isIP } from 'net';
 import { PostgresFixedWindowRateLimiter } from '../adapters/postgres-rate-limit-store';
-import { JsonLineRateLimitMetricSink, allowAllRateLimiter } from '../security/rate-limiter';
+import { allowAllRateLimiter } from '../security/rate-limiter';
 import type { RateLimiter, RateLimitPolicy } from '../security/rate-limiter';
+import {
+  JsonLineSecurityAlertSink, JsonLineSecurityLogSink, JsonLineSecurityMetricSink,
+  SecurityTelemetry, noOpSecurityTelemetry,
+} from '../security/security-observability';
+import type {
+  SecurityAlertThresholds, TelemetryRetentionPolicy,
+} from '../security/security-observability';
 
 /** Operational shutdown bound. Not a domain rule. Not configurable. */
 export const SHUTDOWN_TIMEOUT_MS = 10_000;
@@ -104,6 +111,45 @@ export function loadTransportConfig(env: EnvMap): CommandHttpConfig {
 export interface RateLimitingConfig {
   readonly preAuth: RateLimitPolicy;
   readonly principal: RateLimitPolicy;
+}
+
+export interface SecurityObservabilityConfig {
+  readonly instanceId: string;
+  readonly retention: TelemetryRetentionPolicy;
+  readonly thresholds: SecurityAlertThresholds;
+}
+
+export function loadSecurityObservabilityConfig(env: EnvMap): SecurityObservabilityConfig {
+  return {
+    instanceId: requiredBoundedIdentity(env, 'OBSERVABILITY_INSTANCE_ID'),
+    retention: {
+      securityLogDays: requiredSecurityInteger(env, 'SECURITY_LOG_RETENTION_DAYS', 1, 3_650),
+      metricDays: requiredSecurityInteger(env, 'SECURITY_METRIC_RETENTION_DAYS', 1, 3_650),
+      securityAuditDays: requiredSecurityInteger(env, 'SECURITY_AUDIT_RETENTION_DAYS', 1, 3_650),
+    },
+    thresholds: {
+      windowMs: requiredSecurityInteger(env, 'SECURITY_ALERT_WINDOW_MS', 1_000, 86_400_000),
+      authenticationFailures: requiredSecurityInteger(env, 'SECURITY_ALERT_AUTH_FAILURES', 1, 1_000_000),
+      rateLimitRejections: requiredSecurityInteger(env, 'SECURITY_ALERT_RATE_LIMIT_REJECTIONS', 1, 1_000_000),
+      authenticationDependencyFailures: requiredSecurityInteger(env, 'SECURITY_ALERT_AUTH_DEPENDENCY_FAILURES', 1, 1_000_000),
+      authorizationRejections: requiredSecurityInteger(env, 'SECURITY_ALERT_AUTHORIZATION_REJECTIONS', 1, 1_000_000),
+      disabledPrincipalAttempts: requiredSecurityInteger(env, 'SECURITY_ALERT_DISABLED_PRINCIPAL_ATTEMPTS', 1, 1_000_000),
+      postgresFailures: requiredSecurityInteger(env, 'SECURITY_ALERT_POSTGRES_FAILURES', 1, 1_000_000),
+      failClosedDecisions: requiredSecurityInteger(env, 'SECURITY_ALERT_FAIL_CLOSED', 1, 1_000_000),
+      telemetryFailures: requiredSecurityInteger(env, 'SECURITY_ALERT_TELEMETRY_FAILURES', 1, 1_000_000),
+    },
+  };
+}
+
+export function createProductionSecurityTelemetry(config: SecurityObservabilityConfig): SecurityTelemetry {
+  return new SecurityTelemetry({
+    instanceId: config.instanceId,
+    log: new JsonLineSecurityLogSink(),
+    metrics: new JsonLineSecurityMetricSink(),
+    alerts: new JsonLineSecurityAlertSink(),
+    thresholds: config.thresholds,
+    retention: config.retention,
+  });
 }
 
 export function loadRateLimitingConfig(env: EnvMap): RateLimitingConfig {
@@ -178,6 +224,14 @@ function requiredSecurityInteger(env: EnvMap, name: string, minimum: number, max
     throw new ConfigurationError(name, `must be an integer ${minimum}-${maximum}`);
   }
   return parsed;
+}
+
+function requiredBoundedIdentity(env: EnvMap, name: string): string {
+  const value = requiredSecurityValue(env, name);
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value)) {
+    throw new ConfigurationError(name, 'must be a bounded operational identity');
+  }
+  return value;
 }
 
 function readRaw(env: EnvMap, name: (typeof REQUIRED_VARS)[number]): string | undefined {
@@ -294,6 +348,7 @@ export interface ComposedRuntime {
   readonly persistence: PostgresPersistenceAdapter;
   readonly gate: CommandGate;
   readonly preAuthenticationRateLimiter: RateLimiter;
+  readonly telemetry: SecurityTelemetry;
   handleCommand(request: ExternalCommandRequest): Promise<HandleCommandResult>;
 }
 
@@ -308,8 +363,9 @@ export function composeRuntime(
   config: PostgresConfig,
   security?: Partial<SecurityPorts>,
   rateLimiting?: RateLimitingConfig,
+  telemetry: SecurityTelemetry = noOpSecurityTelemetry,
 ): ComposedRuntime {
-  const persistence = new PostgresPersistenceAdapter(config);
+  const persistence = new PostgresPersistenceAdapter(config, telemetry);
   const clock = systemClock();
   const eventIds = createEventIdFactory(createProcessEventIdPrefix());
   const application = new CellApplication({
@@ -319,25 +375,26 @@ export function composeRuntime(
     eventIds,
   });
   const gate = createCommandGate();
-  const metricSink = rateLimiting === undefined ? undefined : new JsonLineRateLimitMetricSink();
   const principalRateLimiter = security?.principalRateLimiter ?? (rateLimiting === undefined
     ? allowAllRateLimiter
-    : new PostgresFixedWindowRateLimiter(persistence.rateLimitStore, 'PRINCIPAL', rateLimiting.principal, metricSink));
+    : new PostgresFixedWindowRateLimiter(persistence.rateLimitStore, 'PRINCIPAL', rateLimiting.principal));
   const preAuthenticationRateLimiter = rateLimiting === undefined
     ? allowAllRateLimiter
-    : new PostgresFixedWindowRateLimiter(persistence.rateLimitStore, 'PRE_AUTH', rateLimiting.preAuth, metricSink);
+    : new PostgresFixedWindowRateLimiter(persistence.rateLimitStore, 'PRE_AUTH', rateLimiting.preAuth);
   const ingress = new TrustedCommandIngress(
     application,
     security?.authentication ?? failClosedAuthentication,
     security?.principals ?? persistence.principalAuthority,
     security?.fundingEvidence ?? rejectAllFundingEvidence,
     principalRateLimiter,
+    telemetry,
   );
 
   return {
     persistence,
     gate,
     preAuthenticationRateLimiter,
+    telemetry,
     handleCommand(request: ExternalCommandRequest): Promise<HandleCommandResult> {
       return gate.run(() => ingress.handle(request));
     },
@@ -420,11 +477,13 @@ export async function main(
   let authenticationConfig: JwtAuthenticationConfig;
   let transportConfig: CommandHttpsConfig;
   let rateLimitingConfig: RateLimitingConfig;
+  let observabilityConfig: SecurityObservabilityConfig;
   try {
     config = loadPostgresConfig(env);
     authenticationConfig = loadAuthenticationConfig(env);
     transportConfig = loadPublicIngressConfig(env);
     rateLimitingConfig = loadRateLimitingConfig(env);
+    observabilityConfig = loadSecurityObservabilityConfig(env);
   } catch (error) {
     if (error instanceof ConfigurationError) {
       reportConfigurationError(error);
@@ -436,6 +495,7 @@ export async function main(
     return;
   }
 
+  const telemetry = createProductionSecurityTelemetry(observabilityConfig);
   const authentication = new JwtAuthenticationAdapter(
     authenticationConfig,
     new CachedJwksProvider(
@@ -443,12 +503,13 @@ export async function main(
       authenticationConfig.jwksTimeoutMs,
     ),
   );
-  const runtime = composeRuntime(config, { authentication }, rateLimitingConfig);
+  const runtime = composeRuntime(config, { authentication }, rateLimitingConfig, telemetry);
   let transport: CommandHttpsTransport | undefined;
 
   try {
     transport = await CommandHttpsTransport.create(
-      runtime, transportConfig, new JsonLineTransportAuditSink(), undefined, runtime.preAuthenticationRateLimiter,
+      runtime, transportConfig, new JsonLineTransportAuditSink(), undefined,
+      runtime.preAuthenticationRateLimiter, runtime.telemetry,
     );
     await runtime.persistence.connect();
     await runtime.persistence.migrator.verifyExpectedVersion();

@@ -70,4 +70,17 @@ maybeDescribe('Phase 7G PostgreSQL distributed fixed-window limiter', () => {
     await isolated.end();
     await expect(unavailable.consume('203.0.113.1')).rejects.toBeInstanceOf(RateLimitStorageError);
   });
+
+  test('metric sink failure cannot change a real PostgreSQL limiter decision', async () => {
+    const limiter = new PostgresFixedWindowRateLimiter(
+      new PostgresRateLimitStore(poolA), 'PRE_AUTH', policy(1),
+      { record() { throw new Error('metrics backend unavailable token=secret'); } },
+    );
+    await expect(limiter.consume('203.0.113.25')).resolves.toEqual({
+      allowed: true, retryAfterSeconds: expect.any(Number),
+    });
+    await expect(limiter.consume('203.0.113.25')).resolves.toEqual({
+      allowed: false, retryAfterSeconds: expect.any(Number),
+    });
+  });
 });

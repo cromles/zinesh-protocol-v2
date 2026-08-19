@@ -76,33 +76,41 @@ describe('Phase 7D production JWT authentication trust anchor', () => {
   test('rejects fake issuer and audience before authentication succeeds', async () => {
     const key = keys('key-1');
     const authentication = adapter(new ControlledFetcher({ keys: [key.jwk] })).authentication;
-    expect(await authentication.authenticate(token(key.privateKey, { iss: 'https://evil.test' }))).toEqual({ ok: false });
-    expect(await authentication.authenticate(token(key.privateKey, { aud: 'different-app' }))).toEqual({ ok: false });
+    expect(await authentication.authenticate(token(key.privateKey, { iss: 'https://evil.test' })))
+      .toEqual({ ok: false, reason: 'INVALID_ISSUER' });
+    expect(await authentication.authenticate(token(key.privateKey, { aud: 'different-app' })))
+      .toEqual({ ok: false, reason: 'INVALID_AUDIENCE' });
   });
 
   test('rejects invalid signature and manipulated payload', async () => {
     const trusted = keys('key-1');
     const attacker = keys('attacker');
     const authentication = adapter(new ControlledFetcher({ keys: [trusted.jwk] })).authentication;
-    expect(await authentication.authenticate(token(attacker.privateKey))).toEqual({ ok: false });
+    expect(await authentication.authenticate(token(attacker.privateKey)))
+      .toEqual({ ok: false, reason: 'INVALID_SIGNATURE' });
     const valid = token(trusted.privateKey).split('.');
     valid[1] = encode({ iss: ISSUER, sub: 'attacker', aud: AUDIENCE, exp: NOW + 100 });
-    expect(await authentication.authenticate(valid.join('.'))).toEqual({ ok: false });
+    expect(await authentication.authenticate(valid.join('.')))
+      .toEqual({ ok: false, reason: 'INVALID_SIGNATURE' });
   });
 
   test('rejects unsupported algorithm and algorithm confusion/downgrade', async () => {
     const key = keys('key-1');
     const authentication = adapter(new ControlledFetcher({ keys: [key.jwk] })).authentication;
-    expect(await authentication.authenticate(token(key.privateKey, {}, { alg: 'none' }))).toEqual({ ok: false });
-    expect(await authentication.authenticate(token(key.privateKey, {}, { alg: 'HS256' }))).toEqual({ ok: false });
+    expect(await authentication.authenticate(token(key.privateKey, {}, { alg: 'none' })))
+      .toEqual({ ok: false, reason: 'UNSUPPORTED_ALGORITHM' });
+    expect(await authentication.authenticate(token(key.privateKey, {}, { alg: 'HS256' })))
+      .toEqual({ ok: false, reason: 'UNSUPPORTED_ALGORITHM' });
   });
 
   test('enforces expiry, not-before and exact clock-skew boundaries', async () => {
     const key = keys('key-1');
     const authentication = adapter(new ControlledFetcher({ keys: [key.jwk] })).authentication;
-    expect(await authentication.authenticate(token(key.privateKey, { exp: NOW - 31 }))).toEqual({ ok: false });
+    expect(await authentication.authenticate(token(key.privateKey, { exp: NOW - 31 })))
+      .toEqual({ ok: false, reason: 'EXPIRED_CREDENTIAL' });
     expect((await authentication.authenticate(token(key.privateKey, { exp: NOW - 29 }))).ok).toBe(true);
-    expect(await authentication.authenticate(token(key.privateKey, { nbf: NOW + 31 }))).toEqual({ ok: false });
+    expect(await authentication.authenticate(token(key.privateKey, { nbf: NOW + 31 })))
+      .toEqual({ ok: false, reason: 'CREDENTIAL_NOT_ACTIVE' });
     expect((await authentication.authenticate(token(key.privateKey, { nbf: NOW + 30 }))).ok).toBe(true);
   });
 
@@ -110,12 +118,14 @@ describe('Phase 7D production JWT authentication trust anchor', () => {
     const key = keys('key-1');
     const fetcher = new ControlledFetcher({ keys: [key.jwk] });
     const authentication = adapter(fetcher).authentication;
-    expect(await authentication.authenticate('not-a-jwt')).toEqual({ ok: false });
-    expect(await authentication.authenticate('x'.repeat(20_000))).toEqual({ ok: false });
-    expect(await authentication.authenticate(token(key.privateKey, {}, { kid: 'unknown' }))).toEqual({ ok: false });
+    expect(await authentication.authenticate('not-a-jwt')).toEqual({ ok: false, reason: 'MALFORMED_CREDENTIAL' });
+    expect(await authentication.authenticate('x'.repeat(20_000))).toEqual({ ok: false, reason: 'MALFORMED_CREDENTIAL' });
+    expect(await authentication.authenticate(token(key.privateKey, {}, { kid: 'unknown' })))
+      .toEqual({ ok: false, reason: 'UNKNOWN_KEY' });
     fetcher.document = { keys: [{ kid: 'key-1', kty: 'oct', k: 'c2VjcmV0', alg: 'RS256' }] };
     const wrongType = adapter(fetcher).authentication;
-    expect(await wrongType.authenticate(token(key.privateKey))).toEqual({ ok: false });
+    expect(await wrongType.authenticate(token(key.privateKey)))
+      .toEqual({ ok: false, reason: 'INVALID_SIGNATURE' });
   });
 
   test('supports real key rotation and bounds unknown-kid refresh storms', async () => {
@@ -128,8 +138,10 @@ describe('Phase 7D production JWT authentication trust anchor', () => {
     fetcher.document = { keys: [first.jwk, second.jwk] };
     expect((await authentication.authenticate(token(second.privateKey, {}, { kid: 'key-2' }))).ok).toBe(true);
     const callsAfterRotation = fetcher.calls;
-    expect(await authentication.authenticate(token(second.privateKey, {}, { kid: 'unknown-a' }))).toEqual({ ok: false });
-    expect(await authentication.authenticate(token(second.privateKey, {}, { kid: 'unknown-b' }))).toEqual({ ok: false });
+    expect(await authentication.authenticate(token(second.privateKey, {}, { kid: 'unknown-a' })))
+      .toEqual({ ok: false, reason: 'UNKNOWN_KEY' });
+    expect(await authentication.authenticate(token(second.privateKey, {}, { kid: 'unknown-b' })))
+      .toEqual({ ok: false, reason: 'UNKNOWN_KEY' });
     expect(fetcher.calls - callsAfterRotation).toBeLessThanOrEqual(1);
     nowMs += 5_001;
   });
@@ -142,7 +154,8 @@ describe('Phase 7D production JWT authentication trust anchor', () => {
     expect((await authentication.authenticate(token(key.privateKey))).ok).toBe(true);
     nowMs += 1_001;
     fetcher.failure = true;
-    expect(await authentication.authenticate(token(key.privateKey))).toEqual({ ok: false });
+    expect(await authentication.authenticate(token(key.privateKey)))
+      .toEqual({ ok: false, reason: 'AUTHENTICATION_DEPENDENCY_FAILURE' });
   });
 
   test('credential replay and rotation preserve the stable principal and idempotent result', async () => {

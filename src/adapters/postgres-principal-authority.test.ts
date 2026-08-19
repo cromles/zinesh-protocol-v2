@@ -19,6 +19,8 @@ import { CachedJwksProvider, JwtAuthenticationAdapter } from '../security/jwt-au
 import { composeRuntime } from '../composition/main';
 import { CommandHttpsTransport } from '../transport/command-https-transport';
 import { selfSignedTestCertificate } from '../transport/tls-test-certificate';
+import { SecurityTelemetry } from '../security/security-observability';
+import type { SecurityEvent } from '../security/security-observability';
 
 const enabled = process.env['ZINESH_POSTGRES_TESTS'] === 'true';
 const maybeDescribe = enabled ? describe : describe.skip;
@@ -337,6 +339,54 @@ maybeDescribe('Phase 7C PostgreSQL Principal Authority', () => {
        WHERE table_name IN ('principals','external_identities','principal_capabilities','principal_audit')`,
     )).rows.map((row) => row.column_name).join(' ');
     expect(columns).not.toMatch(/token|password|secret|private_key|authorization/i);
+  });
+
+  test('real PostgreSQL principal lifecycle audit and operational telemetry stay distinct and correlated', async () => {
+    const events: SecurityEvent[] = [];
+    const telemetry = new SecurityTelemetry({
+      instanceId: 'postgres-instance', log: { write(event) { events.push(event); } },
+      metrics: { record() {} }, retention: { securityLogDays: 30, metricDays: 14, securityAuditDays: 365 },
+    });
+    const observed = new PostgresPrincipalAuthority(pool, telemetry);
+    expect((await observed.create(actorInput('observed-lifecycle'))).ok).toBe(true);
+    expect((await observed.setEnabled('observed-lifecycle', false, 1, context('observed-disable'))).ok).toBe(true);
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ category: 'PRINCIPAL', action: 'CREATE', outcome: 'SUCCESS',
+        correlationId: 'corr-observed-lifecycle', principalId: 'observed-lifecycle' }),
+      expect.objectContaining({ category: 'PRINCIPAL', action: 'DISABLE', outcome: 'SUCCESS',
+        correlationId: 'observed-disable', principalId: 'observed-lifecycle' }),
+    ]));
+    expect((await pool.query(
+      `SELECT operation,correlation_id FROM principal_audit
+       WHERE principal_id='observed-lifecycle' ORDER BY audit_id`,
+    )).rows).toEqual([
+      { operation: 'CREATE', correlation_id: 'corr-observed-lifecycle' },
+      { operation: 'DISABLE', correlation_id: 'observed-disable' },
+    ]);
+  });
+
+  test('real PostgreSQL security-audit persistence failure rolls back lifecycle mutation and is observable', async () => {
+    await authority.create(actorInput('audit-failure-rollback'));
+    const events: SecurityEvent[] = [];
+    const observed = new PostgresPrincipalAuthority(pool, new SecurityTelemetry({
+      instanceId: 'postgres-instance', log: { write(event) { events.push(event); } },
+      metrics: { record() {} }, retention: { securityLogDays: 30, metricDays: 14, securityAuditDays: 365 },
+    }));
+    try {
+      await pool.query(`CREATE FUNCTION phase7h_reject_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'principal audit unavailable'; END $$;
+        CREATE TRIGGER phase7h_reject_audit BEFORE INSERT ON principal_audit
+        FOR EACH ROW EXECUTE FUNCTION phase7h_reject_audit()`);
+      await expect(observed.setEnabled('audit-failure-rollback', false, 1, context('audit-failed'))).rejects.toBeDefined();
+      expect((await authority.get('audit-failure-rollback'))?.enabled).toBe(true);
+      expect(events).toContainEqual(expect.objectContaining({
+        category: 'PRINCIPAL', action: 'DISABLE', outcome: 'DEPENDENCY_FAILURE',
+        reason: 'POSTGRES_FAILURE', correlationId: 'audit-failed',
+      }));
+      expect(JSON.stringify(events)).not.toContain('principal audit unavailable');
+    } finally {
+      await pool.query('DROP TRIGGER IF EXISTS phase7h_reject_audit ON principal_audit; DROP FUNCTION IF EXISTS phase7h_reject_audit()');
+    }
   });
 });
 

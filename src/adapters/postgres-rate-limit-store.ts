@@ -56,13 +56,17 @@ export class PostgresFixedWindowRateLimiter implements RateLimiter {
     const started = Date.now();
     try {
       const decision = await this.store.consume(this.category, key, this.policy);
-      this.metrics?.record({ category: this.category, outcome: decision.allowed ? 'ALLOWED' : 'REJECTED',
+      this.recordMetric({ category: this.category, outcome: decision.allowed ? 'ALLOWED' : 'REJECTED',
         latencyMs: Math.max(0, Date.now() - started) });
       return decision;
     } catch {
-      this.metrics?.record({ category: this.category, outcome: 'STORAGE_FAILURE',
+      this.recordMetric({ category: this.category, outcome: 'STORAGE_FAILURE',
         latencyMs: Math.max(0, Date.now() - started) });
       throw new RateLimitStorageError();
     }
+  }
+
+  private recordMetric(metric: Parameters<RateLimitMetricSink['record']>[0]): void {
+    try { this.metrics?.record(metric); } catch { /* Telemetry must not alter limiter decisions. */ }
   }
 }
