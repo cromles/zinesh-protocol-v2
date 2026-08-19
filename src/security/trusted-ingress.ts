@@ -4,6 +4,8 @@ import type { HandleCommandResult, TrustedHandleCommandRequest } from '../applic
 import { rateLimitRejection, rateLimitUnavailable, securityRejection } from '../application/errors';
 import { allowAllRateLimiter } from './rate-limiter';
 import type { RateLimiter } from './rate-limiter';
+import { noOpSecurityTelemetry, serverCorrelationId } from './security-observability';
+import type { SecurityTelemetry } from './security-observability';
 
 export type PrincipalType = 'ACTOR' | 'GATEWAY' | 'SYSTEM';
 export type Capability = 'ACT_AS_SELF' | 'CONFIRM_FUNDING';
@@ -21,9 +23,21 @@ export interface VerifiedPrincipal extends PrincipalRecord {}
 
 export interface AuthenticationPort {
   authenticate(credential: unknown): Promise<
-    { readonly ok: true; readonly identity: ExternalIdentity } | { readonly ok: false }
+    { readonly ok: true; readonly identity: ExternalIdentity } |
+    { readonly ok: false; readonly reason?: AuthenticationFailureReason }
   >;
 }
+
+export type AuthenticationFailureReason =
+  | 'MALFORMED_CREDENTIAL'
+  | 'INVALID_SIGNATURE'
+  | 'INVALID_ISSUER'
+  | 'INVALID_AUDIENCE'
+  | 'UNSUPPORTED_ALGORITHM'
+  | 'EXPIRED_CREDENTIAL'
+  | 'CREDENTIAL_NOT_ACTIVE'
+  | 'UNKNOWN_KEY'
+  | 'AUTHENTICATION_DEPENDENCY_FAILURE';
 
 export interface ExternalIdentity {
   readonly issuer: string;
@@ -51,6 +65,7 @@ export interface ExternalCommandRequest {
   readonly credential: unknown;
   readonly command: Command;
   readonly fundingEvidence?: unknown;
+  readonly correlationId?: string;
 }
 
 const verifiedPrincipals = new WeakSet<object>();
@@ -83,39 +98,165 @@ export class TrustedCommandIngress {
     private readonly principals: PrincipalAuthority,
     private readonly fundingEvidence: FundingEvidencePort,
     private readonly principalRateLimiter: RateLimiter = allowAllRateLimiter,
+    private readonly telemetry: SecurityTelemetry = noOpSecurityTelemetry,
   ) {}
 
   async handle(request: ExternalCommandRequest): Promise<HandleCommandResult> {
-    const authenticated = await this.authentication.authenticate(request.credential);
-    if (!authenticated.ok) return securityRejection('UNAUTHENTICATED');
+    const requestedCorrelationId = serverCorrelationId(request.correlationId);
+    const correlationId = requestedCorrelationId === String(request.command.commandId)
+      ? serverCorrelationId() : requestedCorrelationId;
+    const commandContext = {
+      correlationId, commandId: String(request.command.commandId), commandType: request.command.type,
+    } as const;
+    const authenticationStarted = Date.now();
+    let authenticated: Awaited<ReturnType<AuthenticationPort['authenticate']>>;
+    try {
+      authenticated = await this.authentication.authenticate(request.credential);
+    } catch {
+      this.telemetry.record({
+        category: 'AUTHENTICATION', action: 'VERIFY', outcome: 'DEPENDENCY_FAILURE',
+        reason: 'AUTHENTICATION_DEPENDENCY_FAILURE', durationMs: elapsed(authenticationStarted), ...commandContext,
+      });
+      return securityRejection('UNAUTHENTICATED');
+    }
+    if (!authenticated.ok) {
+      this.telemetry.record({
+        category: 'AUTHENTICATION', action: 'VERIFY',
+        outcome: authenticated.reason === 'AUTHENTICATION_DEPENDENCY_FAILURE' ? 'DEPENDENCY_FAILURE' : 'REJECTED',
+        reason: authenticated.reason ?? 'MALFORMED_CREDENTIAL', durationMs: elapsed(authenticationStarted),
+        ...commandContext,
+      });
+      return securityRejection('UNAUTHENTICATED');
+    }
+    this.telemetry.record({
+      category: 'AUTHENTICATION', action: 'VERIFY', outcome: 'SUCCESS',
+      durationMs: elapsed(authenticationStarted), ...commandContext,
+    });
 
-    const record = await this.principals.resolve(authenticated.identity);
-    if (record === null) return securityRejection('PRINCIPAL_NOT_MAPPED');
-    if (!record.enabled) return securityRejection('PRINCIPAL_DISABLED');
-    if (record.type === 'ACTOR' && record.actorId === undefined) {
+    const principalStarted = Date.now();
+    let record: PrincipalRecord | null;
+    try {
+      record = await this.principals.resolve(authenticated.identity);
+    } catch {
+      this.telemetry.record({
+        category: 'PRINCIPAL', action: 'RESOLVE', outcome: 'DEPENDENCY_FAILURE',
+        reason: 'PRINCIPAL_AUTHORITY_FAILURE', durationMs: elapsed(principalStarted), ...commandContext,
+      });
+      this.telemetry.record({
+        category: 'PERSISTENCE', action: 'PRINCIPAL_QUERY', outcome: 'DEPENDENCY_FAILURE',
+        reason: 'POSTGRES_FAILURE', ...commandContext,
+      });
+      throw new Error('Principal authority unavailable');
+    }
+    if (record === null) {
+      this.telemetry.record({
+        category: 'PRINCIPAL', action: 'RESOLVE', outcome: 'REJECTED', reason: 'PRINCIPAL_NOT_MAPPED',
+        durationMs: elapsed(principalStarted), ...commandContext,
+      });
       return securityRejection('PRINCIPAL_NOT_MAPPED');
     }
+    const principalContext = { ...commandContext, principalId: record.principalId } as const;
+    if (!record.enabled) {
+      this.telemetry.record({
+        category: 'PRINCIPAL', action: 'RESOLVE', outcome: 'REJECTED', reason: 'PRINCIPAL_DISABLED',
+        durationMs: elapsed(principalStarted), ...principalContext,
+      });
+      return securityRejection('PRINCIPAL_DISABLED');
+    }
+    if (record.type === 'ACTOR' && record.actorId === undefined) {
+      this.telemetry.record({
+        category: 'PRINCIPAL', action: 'RESOLVE', outcome: 'REJECTED', reason: 'PRINCIPAL_NOT_MAPPED',
+        durationMs: elapsed(principalStarted), ...principalContext,
+      });
+      return securityRejection('PRINCIPAL_NOT_MAPPED');
+    }
+    this.telemetry.record({
+      category: 'PRINCIPAL', action: 'RESOLVE', outcome: 'SUCCESS',
+      durationMs: elapsed(principalStarted), ...principalContext,
+    });
 
+    const limiterStarted = Date.now();
     try {
       const decision = await this.principalRateLimiter.consume(record.principalId);
+      this.telemetry.record({
+        category: 'RATE_LIMIT', action: 'POST_AUTH', outcome: decision.allowed ? 'ALLOWED' : 'REJECTED',
+        durationMs: elapsed(limiterStarted), ...principalContext,
+      });
       if (!decision.allowed) return rateLimitRejection(decision.retryAfterSeconds);
-    } catch { return rateLimitUnavailable(); }
+    } catch {
+      this.telemetry.record({
+        category: 'RATE_LIMIT', action: 'POST_AUTH', outcome: 'DEPENDENCY_FAILURE',
+        reason: 'FAIL_CLOSED', durationMs: elapsed(limiterStarted), ...principalContext,
+      });
+      return rateLimitUnavailable();
+    }
 
     const principal = verifyPrincipal(record);
     let fundingContext: VerifiedFundingContext | undefined;
     if (request.command.type === 'FundCell') {
       if (principal.type !== 'GATEWAY' || !principal.capabilities.includes('CONFIRM_FUNDING')) {
+        this.telemetry.record({
+          category: 'AUTHORIZATION', action: 'COMMAND', outcome: 'REJECTED',
+          reason: principal.type === 'GATEWAY' ? 'GATEWAY_AUTHORIZATION_FAILURE' : 'COMMAND_NOT_PERMITTED',
+          ...principalContext,
+        });
         return securityRejection('COMMAND_NOT_PERMITTED');
       }
       const evidence = await this.fundingEvidence.verify(request.fundingEvidence);
-      if (evidence === null) return securityRejection('FUNDING_EVIDENCE_INVALID');
+      if (evidence === null) {
+        this.telemetry.record({
+          category: 'AUTHORIZATION', action: 'COMMAND', outcome: 'REJECTED',
+          reason: 'FUNDING_EVIDENCE_INVALID', ...principalContext,
+        });
+        return securityRejection('FUNDING_EVIDENCE_INVALID');
+      }
       fundingContext = verifyFundingContext(evidence);
     }
+
+    this.telemetry.record({
+      category: 'AUTHORIZATION', action: 'COMMAND', outcome: 'ALLOWED', ...principalContext,
+    });
 
     const trusted: TrustedHandleCommandRequest = fundingContext === undefined
       ? { command: request.command, principal }
       : { command: request.command, principal, fundingContext };
-    return this.application.handleCommand(trusted);
+    const commandStarted = Date.now();
+    const result = await this.application.handleCommand(trusted);
+    this.recordCommandResult(result, commandStarted, principalContext);
+    return result;
+  }
+
+  private recordCommandResult(
+    result: HandleCommandResult,
+    started: number,
+    context: { readonly correlationId: string; readonly commandId: string;
+      readonly commandType: Command['type']; readonly principalId: string },
+  ): void {
+    if (result.outcome === 'SUCCESS') {
+      this.telemetry.record({
+        category: 'INGRESS', action: 'COMMAND', outcome: 'SUCCESS', durationMs: elapsed(started), ...context,
+      });
+      return;
+    }
+    const reason = result.error.code;
+    if (reason === 'IDEMPOTENCY_CONFLICT') {
+      this.telemetry.record({ category: 'PERSISTENCE', action: 'IDEMPOTENCY', outcome: 'REJECTED', reason, ...context });
+    } else if (result.outcome === 'PERSISTENCE_FAILURE') {
+      this.telemetry.record({
+        category: 'PERSISTENCE', action: 'TRANSACTION', outcome: 'DEPENDENCY_FAILURE',
+        reason: 'POSTGRES_FAILURE', ...context,
+      });
+    }
+    if (reason === 'ACTOR_MISMATCH' || reason === 'GATEWAY_DENIED' || reason === 'AUTHORIZATION_DENIED'
+      || reason === 'COMMAND_NOT_PERMITTED' || reason === 'FUNDING_EVIDENCE_INVALID') {
+      this.telemetry.record({
+        category: 'AUTHORIZATION', action: 'COMMAND', outcome: 'REJECTED', reason, ...context,
+      });
+    }
+    this.telemetry.record({
+      category: 'INGRESS', action: 'COMMAND', outcome: 'FAILURE', reason,
+      durationMs: elapsed(started), ...context,
+    });
   }
 }
 
@@ -131,3 +272,5 @@ export const emptyPrincipalAuthority: PrincipalAuthority = {
 export const rejectAllFundingEvidence: FundingEvidencePort = {
   async verify() { return null; },
 };
+
+function elapsed(started: number): number { return Math.max(0, Date.now() - started); }

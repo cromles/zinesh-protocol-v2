@@ -11,6 +11,8 @@ import { fixedClock } from '../application/clock';
 import { createEventIdFactory } from '../application/event-id-factory';
 import { cellKernel } from '../kernel';
 import { makeActorId, makeTimestamp } from '../core/types';
+import { SecurityTelemetry } from '../security/security-observability';
+import type { SecurityEvent } from '../security/security-observability';
 
 const ISSUER = 'https://transport-issuer.test';
 const AUDIENCE = 'zinesh-transport';
@@ -55,6 +57,7 @@ interface Harness {
   readonly persistence: InMemoryPersistenceAdapter;
   readonly records: Map<string, PrincipalRecord>;
   readonly audit: Audit;
+  readonly securityEvents: SecurityEvent[];
 }
 
 async function harness(options: { providerFailure?: boolean } = {}): Promise<Harness> {
@@ -78,19 +81,24 @@ async function harness(options: { providerFailure?: boolean } = {}): Promise<Har
     ['other-subject', { principalId: 'principal-other', type: 'ACTOR', enabled: true,
       actorId: PAYER, capabilities: ['ACT_AS_SELF'], mappingVersion: 1 }],
   ]);
+  const securityEvents: SecurityEvent[] = [];
+  const telemetry = new SecurityTelemetry({
+    instanceId: 'http-instance', log: { write(event) { securityEvents.push(event); } },
+    metrics: { record() {} }, retention: { securityLogDays: 30, metricDays: 14, securityAuditDays: 365 },
+  });
   const ingress = new TrustedCommandIngress(app, authentication, {
     async resolve(identity) { return identity.issuer === ISSUER ? records.get(identity.subject) ?? null : null; },
-  }, rejectAllFundingEvidence);
+  }, rejectAllFundingEvidence, undefined, telemetry);
   const audit = new Audit();
   const transport = new CommandHttpTransport(
     { handleCommand: (request) => ingress.handle(request) },
     { host: '127.0.0.1', port: 0, maxBodyBytes: 2048, maxHeaderBytes: 4096,
       requestTimeoutMs: 2_000, headersTimeoutMs: 1_000 },
-    audit, () => 'generated-correlation',
+    audit, () => 'generated-correlation', undefined, undefined, undefined, telemetry,
   );
   await transport.listen();
   return { transport, url: `http://127.0.0.1:${transport.address()!.port}/commands`,
-    token: jwt(key.privateKey), key, persistence, records, audit };
+    token: jwt(key.privateKey), key, persistence, records, audit, securityEvents };
 }
 
 async function post(h: Harness, body: unknown, tokenValue = h.token, correlation?: string) {
@@ -111,10 +119,13 @@ describe('Phase 7E real HTTP trusted command transport', () => {
     const { response, json } = await post(h, { command: command() }, h.token, 'client-correlation-1');
     expect(response.status).toBe(200);
     expect(response.headers.get('cache-control')).toBe('no-store');
-    expect(response.headers.get('x-correlation-id')).toBe('client-correlation-1');
+    expect(response.headers.get('x-correlation-id')).toBe('generated-correlation');
+    expect(response.headers.get('x-correlation-id')).not.toBe('client-correlation-1');
     expect(json.outcome).toBe('SUCCESS');
     expect(json.nextState.amount).toBe('900719925474099312345');
     expect((await h.persistence.eventStore.getEvents('cell-transport-command' as never))[0]?.payload).toMatchObject({ amount: 900719925474099312345n });
+    expect(new Set(h.securityEvents.map((event) => event.correlationId))).toEqual(new Set(['generated-correlation']));
+    expect(JSON.stringify(h.securityEvents)).not.toContain('client-correlation-1');
   });
 
   test('invalid credential, issuer, audience, unmapped and disabled principal fail closed', async () => {
@@ -125,6 +136,13 @@ describe('Phase 7E real HTTP trusted command transport', () => {
     expect((await post(h, { command: command('unmapped') }, jwt(h.key.privateKey, { sub: 'missing' }))).response.status).toBe(403);
     h.records.set('payer-subject', { ...h.records.get('payer-subject')!, enabled: false });
     expect((await post(h, { command: command('disabled') })).response.status).toBe(403);
+    expect(h.securityEvents).toEqual(expect.arrayContaining([
+      expect.objectContaining({ category: 'AUTHENTICATION', reason: 'INVALID_SIGNATURE' }),
+      expect.objectContaining({ category: 'AUTHENTICATION', reason: 'INVALID_ISSUER' }),
+      expect.objectContaining({ category: 'AUTHENTICATION', reason: 'INVALID_AUDIENCE' }),
+      expect.objectContaining({ category: 'PRINCIPAL', reason: 'PRINCIPAL_NOT_MAPPED' }),
+      expect.objectContaining({ category: 'PRINCIPAL', reason: 'PRINCIPAL_DISABLED' }),
+    ]));
   });
 
   test('payload security claims are rejected and actor impersonation cannot use correlation identity', async () => {
@@ -159,6 +177,14 @@ describe('Phase 7E real HTTP trusted command transport', () => {
     expect((await post(h, { padding: 'x'.repeat(3_000), command: command() })).response.status).toBe(413);
     const wrongType = await fetch(h.url, { method: 'POST', headers: { authorization: `Bearer ${h.token}`, 'content-type': 'text/plain' }, body: '{}' });
     expect(wrongType.status).toBe(415);
+    expect(h.securityEvents).toEqual(expect.arrayContaining([
+      expect.objectContaining({ category: 'INGRESS', reason: 'MALFORMED_JSON' }),
+      expect.objectContaining({ category: 'INGRESS', reason: 'MISSING_COMMAND_ID' }),
+      expect.objectContaining({ category: 'INGRESS', reason: 'UNSUPPORTED_COMMAND' }),
+      expect.objectContaining({ category: 'INGRESS', reason: 'REQUEST_TOO_LARGE' }),
+      expect.objectContaining({ category: 'INGRESS', reason: 'UNSUPPORTED_MEDIA_TYPE' }),
+    ]));
+    expect(JSON.stringify(h.securityEvents)).not.toContain('xxx');
   });
 
   test('provider timeout and internal failure return opaque errors without credential leakage', async () => {
@@ -169,6 +195,8 @@ describe('Phase 7E real HTTP trusted command transport', () => {
     const auditDump = JSON.stringify(timedOut.audit.entries);
     expect(auditDump).not.toContain(timedOut.token);
     expect(auditDump).not.toContain('must-not-leak');
+    expect(JSON.stringify(timedOut.securityEvents)).not.toContain(timedOut.token);
+    expect(JSON.stringify(timedOut.securityEvents)).not.toContain('must-not-leak');
 
     const audit = new Audit();
     const broken = new CommandHttpTransport(

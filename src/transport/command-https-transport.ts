@@ -12,6 +12,8 @@ import type {
   CommandDispatcher, CommandHttpConfig, TransportAuditSink,
 } from './command-http-transport';
 import type { RateLimiter } from '../security/rate-limiter';
+import { noOpSecurityTelemetry, serverCorrelationId } from '../security/security-observability';
+import type { SecurityTelemetry } from '../security/security-observability';
 
 export interface CommandHttpsConfig extends CommandHttpConfig {
   readonly certificatePath: string;
@@ -37,22 +39,40 @@ export class CommandHttpsTransport {
     audit?: TransportAuditSink,
     now: Date = new Date(),
     preAuthenticationRateLimiter?: RateLimiter,
+    telemetry: SecurityTelemetry = noOpSecurityTelemetry,
   ): Promise<CommandHttpsTransport> {
-    const material = await loadAndValidateTlsMaterial(config, now);
+    let material: Awaited<ReturnType<typeof loadAndValidateTlsMaterial>>;
+    try {
+      material = await loadAndValidateTlsMaterial(config, now);
+    } catch (error) {
+      telemetry.record({
+        category: 'TLS', action: 'CONFIGURATION', outcome: 'REJECTED',
+        reason: 'TLS_CONFIGURATION_REJECTED', correlationId: serverCorrelationId(),
+      });
+      throw error;
+    }
     const admission = createPublicIngressAdmission(config);
     const transport = new CommandHttpTransport(
       dispatcher,
       config,
       audit,
       undefined,
-      (handler) => createHttpsServer({
-        cert: material.certificate,
-        key: material.privateKey,
-        minVersion: config.minimumTlsVersion as SecureVersion,
-        maxHeaderSize: config.maxHeaderBytes,
-      }, handler),
+      (handler) => {
+        const server = createHttpsServer({
+          cert: material.certificate,
+          key: material.privateKey,
+          minVersion: config.minimumTlsVersion as SecureVersion,
+          maxHeaderSize: config.maxHeaderBytes,
+        }, handler);
+        server.on('tlsClientError', () => telemetry.record({
+          category: 'TLS', action: 'HANDSHAKE', outcome: 'REJECTED',
+          reason: 'TLS_REJECTION', correlationId: serverCorrelationId(),
+        }));
+        return server;
+      },
       admission,
       preAuthenticationRateLimiter,
+      telemetry,
     );
     return new CommandHttpsTransport(transport);
   }

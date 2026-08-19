@@ -18,6 +18,8 @@ import { cellKernel } from '../kernel';
 import { makeActorId, makeTimestamp } from '../core/types';
 import { selfSignedTestCertificate } from './tls-test-certificate';
 import type { RateLimitDecision, RateLimiter } from '../security/rate-limiter';
+import { SecurityTelemetry } from '../security/security-observability';
+import type { SecurityEvent } from '../security/security-observability';
 
 const ISSUER = 'https://phase7f-issuer.test';
 const AUDIENCE = 'zinesh-phase7f';
@@ -37,6 +39,7 @@ interface Harness {
   readonly audit: Audit;
   readonly directory: string;
   readonly persistence: InMemoryPersistenceAdapter;
+  readonly securityEvents: SecurityEvent[];
 }
 
 const open: Harness[] = [];
@@ -69,6 +72,11 @@ async function harness(
     new CachedJwksProvider({ async fetch() { return { keys: [jwk] }; } }, 60_000, 1_000),
   );
   const persistence = new InMemoryPersistenceAdapter();
+  const securityEvents: SecurityEvent[] = [];
+  const telemetry = new SecurityTelemetry({
+    instanceId: 'https-instance', log: { write(event) { securityEvents.push(event); } },
+    metrics: { record() {} }, retention: { securityLogDays: 30, metricDays: 14, securityAuditDays: 365 },
+  });
   const application = new CellApplication({
     persistence, kernel: cellKernel, clock: fixedClock(makeTimestamp(1_000_000)),
     eventIds: createEventIdFactory('https'),
@@ -80,15 +88,16 @@ async function harness(
           actorId: PAYER, capabilities: ['ACT_AS_SELF' as const], mappingVersion: 1 }
         : null;
     },
-  }, rejectAllFundingEvidence, principalRateLimiter);
+  }, rejectAllFundingEvidence, principalRateLimiter, telemetry);
   const audit = new Audit();
   const transport = await CommandHttpsTransport.create(
     { handleCommand: (request) => ingress.handle(request) },
-    config(certificatePath, privateKeyPath, trustedProxies), audit, undefined, preAuthenticationRateLimiter,
+    config(certificatePath, privateKeyPath, trustedProxies), audit, undefined,
+    preAuthenticationRateLimiter, telemetry,
   );
   await transport.listen();
   const result = { transport, port: transport.address()!.port, token: jwt(authPair.privateKey),
-    audit, directory, persistence };
+    audit, directory, persistence, securityEvents };
   open.push(result);
   return result;
 }
@@ -160,6 +169,10 @@ describe('Phase 7F real TLS public ingress', () => {
     const h = await harness(['127.0.0.1']);
     await expect(plaintextRejected(h)).resolves.toBe(true);
     await expect(plaintextRejected(h, { 'x-forwarded-proto': 'https' })).resolves.toBe(true);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(h.securityEvents).toContainEqual(expect.objectContaining({
+      category: 'TLS', action: 'HANDSHAKE', outcome: 'REJECTED', reason: 'TLS_REJECTION',
+    }));
   });
 
   test.each([
@@ -199,11 +212,19 @@ describe('Phase 7F real TLS public ingress', () => {
   test('arbitrary Host cannot influence command routing', async () => {
     const h = await harness();
     expect((await post(h, command('host-abuse'), { host: 'evil.example' })).status).toBe(421);
+    expect(h.securityEvents).toContainEqual(expect.objectContaining({
+      category: 'TLS', outcome: 'REJECTED', reason: 'UNTRUSTED_HOST',
+    }));
   });
 
   test('missing, expired, malformed and mismatched certificate material fail closed', async () => {
     const directory = await mkdtemp(path.join(tmpdir(), 'zinesh-7f-invalid-'));
     try {
+      const tlsEvents: SecurityEvent[] = [];
+      const telemetry = new SecurityTelemetry({
+        instanceId: 'tls-config-instance', log: { write(event) { tlsEvents.push(event); } },
+        metrics: { record() {} }, retention: { securityLogDays: 30, metricDays: 14, securityAuditDays: 365 },
+      });
       const valid = selfSignedTestCertificate(new Date(Date.now() - 60_000), new Date(Date.now() + 60_000), HOST);
       const other = selfSignedTestCertificate(new Date(Date.now() - 60_000), new Date(Date.now() + 60_000), HOST);
       const expired = selfSignedTestCertificate(new Date(Date.now() - 120_000), new Date(Date.now() - 60_000), HOST);
@@ -211,7 +232,12 @@ describe('Phase 7F real TLS public ingress', () => {
       const key = path.join(directory, 'key.pem');
       await writeFile(cert, valid.certificate); await writeFile(key, valid.privateKey, { mode: 0o600 });
       await expect(CommandHttpsTransport.create({ handleCommand: async () => { throw new Error(); } },
-        config(path.join(directory, 'missing.pem'), key))).rejects.toBeInstanceOf(TlsConfigurationError);
+        config(path.join(directory, 'missing.pem'), key), undefined, new Date(), undefined, telemetry))
+        .rejects.toBeInstanceOf(TlsConfigurationError);
+      expect(tlsEvents).toContainEqual(expect.objectContaining({
+        category: 'TLS', action: 'CONFIGURATION', outcome: 'REJECTED',
+        reason: 'TLS_CONFIGURATION_REJECTED',
+      }));
       await writeFile(cert, expired.certificate); await writeFile(key, expired.privateKey);
       await expect(CommandHttpsTransport.create({ handleCommand: async () => { throw new Error(); } },
         config(cert, key), undefined, new Date())).rejects.toBeInstanceOf(TlsConfigurationError);
@@ -227,7 +253,7 @@ describe('Phase 7F real TLS public ingress', () => {
   test('credential and private material never enter audit or error responses', async () => {
     const h = await harness();
     const rejected = await post(h, command('credential-safe'), { host: 'evil.example' });
-    const dump = JSON.stringify({ response: rejected.json, audit: h.audit.entries });
+    const dump = JSON.stringify({ response: rejected.json, audit: h.audit.entries, telemetry: h.securityEvents });
     expect(dump).not.toContain(h.token);
     const privateMaterial = await import('fs/promises').then((fs) => fs.readFile(path.join(h.directory, 'private-key.pem'), 'utf8'));
     expect(dump).not.toContain(privateMaterial);

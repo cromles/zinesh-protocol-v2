@@ -17,6 +17,7 @@ import {
   loadAuthenticationConfig,
   loadPublicIngressConfig,
   loadRateLimitingConfig,
+  loadSecurityObservabilityConfig,
   loadTransportConfig,
   main,
   performShutdown,
@@ -71,6 +72,19 @@ const VALID_ENV = {
   TLS_MIN_VERSION: 'TLSv1.2',
   TLS_ALLOWED_HOSTS: 'api.zinesh.example',
   TLS_TRUSTED_PROXIES: 'NONE',
+  OBSERVABILITY_INSTANCE_ID: 'zinesh-test-1',
+  SECURITY_LOG_RETENTION_DAYS: '30',
+  SECURITY_METRIC_RETENTION_DAYS: '14',
+  SECURITY_AUDIT_RETENTION_DAYS: '365',
+  SECURITY_ALERT_WINDOW_MS: '60000',
+  SECURITY_ALERT_AUTH_FAILURES: '20',
+  SECURITY_ALERT_RATE_LIMIT_REJECTIONS: '50',
+  SECURITY_ALERT_AUTH_DEPENDENCY_FAILURES: '2',
+  SECURITY_ALERT_AUTHORIZATION_REJECTIONS: '20',
+  SECURITY_ALERT_DISABLED_PRINCIPAL_ATTEMPTS: '5',
+  SECURITY_ALERT_POSTGRES_FAILURES: '2',
+  SECURITY_ALERT_FAIL_CLOSED: '5',
+  SECURITY_ALERT_TELEMETRY_FAILURES: '1',
 };
 
 function compositionSource(): string {
@@ -227,6 +241,33 @@ describe('loadRateLimitingConfig', () => {
     expect(() => loadRateLimitingConfig({ ...VALID_ENV, RATE_LIMIT_PRINCIPAL_LIMIT: '0' })).toThrow(ConfigurationError);
     expect(() => loadRateLimitingConfig({ ...VALID_ENV, RATE_LIMIT_RETENTION_MS: '1000' })).toThrow(ConfigurationError);
     expect(() => loadRateLimitingConfig({ ...VALID_ENV, RATE_LIMIT_STORAGE_TIMEOUT_MS: '30001' })).toThrow(ConfigurationError);
+  });
+});
+
+describe('loadSecurityObservabilityConfig', () => {
+  test('loads bounded instance, retention and configurable alert conditions', () => {
+    expect(loadSecurityObservabilityConfig(VALID_ENV)).toEqual({
+      instanceId: 'zinesh-test-1',
+      retention: { securityLogDays: 30, metricDays: 14, securityAuditDays: 365 },
+      thresholds: {
+        windowMs: 60_000, authenticationFailures: 20, rateLimitRejections: 50,
+        authenticationDependencyFailures: 2, authorizationRejections: 20,
+        disabledPrincipalAttempts: 5, postgresFailures: 2,
+        failClosedDecisions: 5, telemetryFailures: 1,
+      },
+    });
+  });
+
+  test('rejects missing, unbounded and invalid observability policy', () => {
+    const missing = { ...VALID_ENV } as Record<string, string>;
+    delete missing.SECURITY_ALERT_WINDOW_MS;
+    expect(() => loadSecurityObservabilityConfig(missing)).toThrow(ConfigurationError);
+    expect(() => loadSecurityObservabilityConfig({ ...VALID_ENV, OBSERVABILITY_INSTANCE_ID: 'bad identity' }))
+      .toThrow(ConfigurationError);
+    expect(() => loadSecurityObservabilityConfig({ ...VALID_ENV, SECURITY_LOG_RETENTION_DAYS: '0' }))
+      .toThrow(ConfigurationError);
+    expect(() => loadSecurityObservabilityConfig({ ...VALID_ENV, SECURITY_ALERT_TELEMETRY_FAILURES: '0' }))
+      .toThrow(ConfigurationError);
   });
 });
 

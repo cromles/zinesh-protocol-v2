@@ -7,6 +7,8 @@ import type {
 import type {
   CreatePrincipalInput, LifecycleContext, LifecycleResult, PrincipalLifecycleAuthority,
 } from '../security/principal-lifecycle';
+import { noOpSecurityTelemetry, serverCorrelationId } from '../security/security-observability';
+import type { SecurityTelemetry } from '../security/security-observability';
 
 interface PrincipalRow {
   principal_id: string; principal_type: PrincipalType; actor_id: string | null;
@@ -19,7 +21,10 @@ function persistenceConflict(error: unknown): boolean {
 }
 
 export class PostgresPrincipalAuthority implements PrincipalAuthority, PrincipalLifecycleAuthority {
-  constructor(private readonly pool: Pool) {}
+  constructor(
+    private readonly pool: Pool,
+    private readonly telemetry: SecurityTelemetry = noOpSecurityTelemetry,
+  ) {}
 
   async resolve(identity: ExternalIdentity): Promise<PrincipalRecord | null> {
     const result = await this.pool.query<PrincipalRow>(
@@ -39,7 +44,10 @@ export class PostgresPrincipalAuthority implements PrincipalAuthority, Principal
   }
 
   async create(input: CreatePrincipalInput): Promise<LifecycleResult> {
-    if (!this.validCreate(input)) return { ok: false, kind: 'INVALID' };
+    if (!this.validCreate(input)) {
+      this.lifecycleTelemetry('CREATE', 'REJECTED', input.context, input.principalId, 'INVALID');
+      return { ok: false, kind: 'INVALID' };
+    }
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
@@ -60,10 +68,15 @@ export class PostgresPrincipalAuthority implements PrincipalAuthority, Principal
       await this.audit(client, input.principalId, input.type, input.actorId ?? null,
         'CREATE', 1, null, input.context);
       await client.query('COMMIT');
+      this.lifecycleTelemetry('CREATE', 'SUCCESS', input.context, input.principalId);
       return { ok: true, principal: (await this.get(input.principalId))! };
     } catch (error) {
       await client.query('ROLLBACK');
-      if (persistenceConflict(error)) return { ok: false, kind: 'CONFLICT' };
+      if (persistenceConflict(error)) {
+        this.lifecycleTelemetry('CREATE', 'REJECTED', input.context, input.principalId, 'CONFLICT');
+        return { ok: false, kind: 'CONFLICT' };
+      }
+      this.lifecycleTelemetry('CREATE', 'DEPENDENCY_FAILURE', input.context, input.principalId, 'POSTGRES_FAILURE');
       throw error;
     } finally { client.release(); }
   }
@@ -144,7 +157,9 @@ export class PostgresPrincipalAuthority implements PrincipalAuthority, Principal
       if (changed.rowCount !== 1) {
         await client.query('ROLLBACK');
         const exists = await this.get(principalId);
-        return { ok: false, kind: exists === null ? 'NOT_FOUND' : 'CONFLICT' };
+        const kind = exists === null ? 'NOT_FOUND' : 'CONFLICT';
+        this.lifecycleTelemetry(operation, 'REJECTED', context, principalId, kind);
+        return { ok: false, kind };
       }
       const row = (await client.query<PrincipalRow>(
         `SELECT principal_id,principal_type,actor_id,enabled,mapping_version
@@ -153,10 +168,15 @@ export class PostgresPrincipalAuthority implements PrincipalAuthority, Principal
       await this.audit(client, row.principal_id, row.principal_type, row.actor_id,
         operation, Number(row.mapping_version), capability, context);
       await client.query('COMMIT');
+      this.lifecycleTelemetry(operation, 'SUCCESS', context, principalId);
       return { ok: true, principal: (await this.get(principalId))! };
     } catch (error) {
       await client.query('ROLLBACK');
-      if (persistenceConflict(error)) return { ok: false, kind: 'CONFLICT' };
+      if (persistenceConflict(error)) {
+        this.lifecycleTelemetry(operation, 'REJECTED', context, principalId, 'CONFLICT');
+        return { ok: false, kind: 'CONFLICT' };
+      }
+      this.lifecycleTelemetry(operation, 'DEPENDENCY_FAILURE', context, principalId, 'POSTGRES_FAILURE');
       throw error;
     } finally { client.release(); }
   }
@@ -194,5 +214,27 @@ export class PostgresPrincipalAuthority implements PrincipalAuthority, Principal
       [principalId, type, actorId, operation, version, capability,
         context.occurredAt, context.correlationId],
     );
+  }
+
+  private lifecycleTelemetry(
+    operation: string,
+    outcome: 'SUCCESS' | 'REJECTED' | 'DEPENDENCY_FAILURE',
+    context: LifecycleContext,
+    principalId: string,
+    reason?: string,
+  ): void {
+    this.telemetry.record({
+      category: 'PRINCIPAL', action: /^[A-Z][A-Z0-9_]{0,63}$/.test(operation) ? operation : 'LIFECYCLE', outcome,
+      correlationId: serverCorrelationId(context.correlationId),
+      ...(principalId.length === 0 ? {} : { principalId }),
+      ...(reason === undefined ? {} : { reason }),
+    });
+    if (outcome === 'DEPENDENCY_FAILURE') {
+      this.telemetry.record({
+        category: 'PERSISTENCE', action: 'SECURITY_AUDIT', outcome,
+        correlationId: serverCorrelationId(context.correlationId), reason: 'POSTGRES_FAILURE',
+        ...(principalId.length === 0 ? {} : { principalId }),
+      });
+    }
   }
 }

@@ -1,6 +1,6 @@
 import { createPublicKey, verify as verifySignature } from 'crypto';
 import type { JsonWebKey } from 'crypto';
-import type { AuthenticationPort, ExternalIdentity } from './trusted-ingress';
+import type { AuthenticationFailureReason, AuthenticationPort, ExternalIdentity } from './trusted-ingress';
 
 export type SupportedJwtAlgorithm = 'RS256';
 
@@ -54,6 +54,10 @@ export class HttpJwksFetcher implements JwksFetcher {
 }
 
 interface CachedSet { readonly expiresAt: number; readonly keys: ReadonlyMap<string, Jwk> }
+type KeyResolution =
+  | { readonly outcome: 'FOUND'; readonly key: Jwk }
+  | { readonly outcome: 'UNKNOWN' }
+  | { readonly outcome: 'DEPENDENCY_FAILURE' };
 
 export class CachedJwksProvider {
   private readonly cache = new Map<string, CachedSet>();
@@ -68,20 +72,26 @@ export class CachedJwksProvider {
   ) {}
 
   async key(config: TrustedIssuerConfig, kid: string): Promise<Jwk | null> {
+    const result = await this.resolve(config, kid);
+    return result.outcome === 'FOUND' ? result.key : null;
+  }
+
+  async resolve(config: TrustedIssuerConfig, kid: string): Promise<KeyResolution> {
     const current = this.cache.get(config.issuer);
     if (current !== undefined && current.expiresAt > this.nowMs()) {
       const known = current.keys.get(kid);
-      if (known !== undefined) return known;
+      if (known !== undefined) return { outcome: 'FOUND', key: known };
       const last = this.lastUnknownRefresh.get(config.issuer) ?? Number.NEGATIVE_INFINITY;
-      if (this.nowMs() - last < Math.min(this.ttlMs, 5_000)) return null;
+      if (this.nowMs() - last < Math.min(this.ttlMs, 5_000)) return { outcome: 'UNKNOWN' };
       this.lastUnknownRefresh.set(config.issuer, this.nowMs());
     }
     try {
       const refreshed = await this.refresh(config);
-      return refreshed.keys.get(kid) ?? null;
+      const key = refreshed.keys.get(kid);
+      return key === undefined ? { outcome: 'UNKNOWN' } : { outcome: 'FOUND', key };
     } catch {
       // Never use an expired set and never authenticate an unknown key.
-      return null;
+      return { outcome: 'DEPENDENCY_FAILURE' };
     }
   }
 
@@ -132,46 +142,61 @@ export class JwtAuthenticationAdapter implements AuthenticationPort {
   }
 
   async authenticate(credential: unknown): Promise<
-    { readonly ok: true; readonly identity: ExternalIdentity } | { readonly ok: false }
+    { readonly ok: true; readonly identity: ExternalIdentity } |
+    { readonly ok: false; readonly reason: AuthenticationFailureReason }
   > {
     if (typeof credential !== 'string' || credential.length === 0 || credential.length > this.maxLength) {
-      return { ok: false };
+      return failure('MALFORMED_CREDENTIAL');
     }
     const parts = credential.split('.');
-    if (parts.length !== 3 || parts.some((part) => part.length === 0)) return { ok: false };
+    if (parts.length !== 3 || parts.some((part) => part.length === 0)) return failure('MALFORMED_CREDENTIAL');
     const encodedHeader = parts[0];
     const encodedClaims = parts[1];
     const encodedSignature = parts[2];
-    if (encodedHeader === undefined || encodedClaims === undefined || encodedSignature === undefined) return { ok: false };
+    if (encodedHeader === undefined || encodedClaims === undefined || encodedSignature === undefined) {
+      return failure('MALFORMED_CREDENTIAL');
+    }
     const header = decodeObject(encodedHeader) as JwtHeader | null;
     const claims = decodeObject(encodedClaims) as JwtClaims | null;
-    if (!validHeader(header) || !validClaims(claims)) return { ok: false };
+    if (!validHeader(header) || !validClaims(claims)) return failure('MALFORMED_CREDENTIAL');
 
     const issuer = this.issuers.get(claims.iss);
-    if (issuer === undefined || !issuer.algorithms.includes(header.alg as SupportedJwtAlgorithm)) {
-      return { ok: false };
-    }
-    if (!audienceMatches(claims.aud, issuer.audiences)) return { ok: false };
+    if (issuer === undefined) return failure('INVALID_ISSUER');
+    if (!issuer.algorithms.includes(header.alg as SupportedJwtAlgorithm)) return failure('UNSUPPORTED_ALGORITHM');
+    if (!audienceMatches(claims.aud, issuer.audiences)) return failure('INVALID_AUDIENCE');
     const now = this.nowSeconds();
-    if (now - this.config.clockSkewSeconds >= claims.exp) return { ok: false };
-    if (claims.nbf !== undefined && now + this.config.clockSkewSeconds < claims.nbf) return { ok: false };
+    if (now - this.config.clockSkewSeconds >= claims.exp) return failure('EXPIRED_CREDENTIAL');
+    if (claims.nbf !== undefined && now + this.config.clockSkewSeconds < claims.nbf) {
+      return failure('CREDENTIAL_NOT_ACTIVE');
+    }
 
-    const key = await this.keys.key(issuer, header.kid);
+    const resolution = await this.keys.resolve(issuer, header.kid);
+    if (resolution.outcome === 'DEPENDENCY_FAILURE') return failure('AUTHENTICATION_DEPENDENCY_FAILURE');
+    if (resolution.outcome === 'UNKNOWN') return failure('UNKNOWN_KEY');
+    const key = resolution.key;
     const operations = key?.key_ops;
-    if (key === null || key.kty !== 'RSA' || (key.alg !== undefined && key.alg !== header.alg) ||
+    if (key.kty !== 'RSA' || (key.alg !== undefined && key.alg !== header.alg) ||
         (key.use !== undefined && key.use !== 'sig') ||
-        (operations != null && (!Array.isArray(operations) || !operations.includes('verify')))) return { ok: false };
+        (operations != null && (!Array.isArray(operations) || !operations.includes('verify')))) {
+      return failure('INVALID_SIGNATURE');
+    }
     try {
       const publicKey = createPublicKey({ key, format: 'jwk' });
       if (publicKey.asymmetricKeyType !== 'rsa' ||
-          (publicKey.asymmetricKeyDetails?.modulusLength ?? 0) < 2048) return { ok: false };
+          (publicKey.asymmetricKeyDetails?.modulusLength ?? 0) < 2048) return failure('INVALID_SIGNATURE');
       const valid = verifySignature(
         'RSA-SHA256', Buffer.from(`${encodedHeader}.${encodedClaims}`),
         publicKey, base64UrlBuffer(encodedSignature),
       );
-      return valid ? { ok: true, identity: { issuer: claims.iss, subject: claims.sub } } : { ok: false };
-    } catch { return { ok: false }; }
+      return valid
+        ? { ok: true, identity: { issuer: claims.iss, subject: claims.sub } }
+        : failure('INVALID_SIGNATURE');
+    } catch { return failure('INVALID_SIGNATURE'); }
   }
+}
+
+function failure(reason: AuthenticationFailureReason): { readonly ok: false; readonly reason: AuthenticationFailureReason } {
+  return { ok: false, reason };
 }
 
 function validateConfig(config: JwtAuthenticationConfig): void {

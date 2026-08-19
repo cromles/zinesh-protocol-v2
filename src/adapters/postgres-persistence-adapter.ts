@@ -24,6 +24,8 @@ import { PostgresCommandExecutionStore } from './postgres-command-execution-stor
 import { PostgresPrincipalAuthority } from './postgres-principal-authority';
 import { PostgresMigrator } from './postgres-migrator';
 import { PostgresRateLimitStore } from './postgres-rate-limit-store';
+import { noOpSecurityTelemetry } from '../security/security-observability';
+import type { SecurityTelemetry } from '../security/security-observability';
 
 export interface PostgresConfig {
   readonly host: string;
@@ -42,7 +44,7 @@ export class PostgresPersistenceAdapter implements PersistenceAdapter {
   readonly migrator: PostgresMigrator;
   readonly rateLimitStore: PostgresRateLimitStore;
 
-  constructor(config: PostgresConfig) {
+  constructor(config: PostgresConfig, telemetry: SecurityTelemetry = noOpSecurityTelemetry) {
     this.pool = new Pool({
       host:     config.host,
       port:     config.port,
@@ -53,7 +55,7 @@ export class PostgresPersistenceAdapter implements PersistenceAdapter {
     this.eventStore    = new PostgresEventStore(this.pool);
     this.snapshotStore = new PostgresSnapshotStore(this.pool);
     this.commandExecutionStore = new PostgresCommandExecutionStore(this.pool);
-    this.principalAuthority = new PostgresPrincipalAuthority(this.pool);
+    this.principalAuthority = new PostgresPrincipalAuthority(this.pool, telemetry);
     this.migrator = new PostgresMigrator(this.pool);
     this.rateLimitStore = new PostgresRateLimitStore(this.pool);
   }
