@@ -1,0 +1,187 @@
+import { generateKeyPairSync, sign } from 'crypto';
+import type { KeyObject } from 'crypto';
+import { CommandHttpTransport } from './command-http-transport';
+import type { TransportAuditRecord, TransportAuditSink } from './command-http-transport';
+import { CachedJwksProvider, JwtAuthenticationAdapter } from '../security/jwt-authentication';
+import { TrustedCommandIngress, rejectAllFundingEvidence } from '../security/trusted-ingress';
+import type { PrincipalRecord } from '../security/trusted-ingress';
+import { CellApplication } from '../application/cell-application';
+import { InMemoryPersistenceAdapter } from '../adapters/in-memory-persistence-adapter';
+import { fixedClock } from '../application/clock';
+import { createEventIdFactory } from '../application/event-id-factory';
+import { cellKernel } from '../kernel';
+import { makeActorId, makeTimestamp } from '../core/types';
+
+const ISSUER = 'https://transport-issuer.test';
+const AUDIENCE = 'zinesh-transport';
+const PAYER = makeActorId('transport-payer');
+const PAYEE = makeActorId('transport-payee');
+
+function pair(kid = 'transport-key') {
+  const generated = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  return {
+    privateKey: generated.privateKey,
+    jwk: { ...generated.publicKey.export({ format: 'jwk' }), kid, kty: 'RSA', alg: 'RS256', use: 'sig' },
+  };
+}
+
+function jwt(privateKey: KeyObject, claims: Record<string, unknown> = {}, header: Record<string, unknown> = {}): string {
+  const encodedHeader = Buffer.from(JSON.stringify({ alg: 'RS256', kid: 'transport-key', ...header })).toString('base64url');
+  const encodedClaims = Buffer.from(JSON.stringify({
+    iss: ISSUER, sub: 'payer-subject', aud: AUDIENCE,
+    exp: Math.floor(Date.now() / 1000) + 300, ...claims,
+  })).toString('base64url');
+  const signature = sign('RSA-SHA256', Buffer.from(`${encodedHeader}.${encodedClaims}`), privateKey).toString('base64url');
+  return `${encodedHeader}.${encodedClaims}.${signature}`;
+}
+
+function command(commandId = 'transport-command', amount = '900719925474099312345') {
+  return { commandId, cellId: `cell-${commandId}`, type: 'CreateCell', payload: {
+    payer: PAYER, payee: PAYEE, amount, currency: 'TRY',
+    fundingDeadline: 2_000_000, completionDeadline: 5_000_000,
+  } };
+}
+
+class Audit implements TransportAuditSink {
+  readonly entries: TransportAuditRecord[] = [];
+  record(entry: TransportAuditRecord): void { this.entries.push(entry); }
+}
+
+interface Harness {
+  readonly transport: CommandHttpTransport;
+  readonly url: string;
+  readonly token: string;
+  readonly key: ReturnType<typeof pair>;
+  readonly persistence: InMemoryPersistenceAdapter;
+  readonly records: Map<string, PrincipalRecord>;
+  readonly audit: Audit;
+}
+
+async function harness(options: { providerFailure?: boolean } = {}): Promise<Harness> {
+  const key = pair();
+  const authentication = new JwtAuthenticationAdapter(
+    { issuers: [{ issuer: ISSUER, audiences: [AUDIENCE], algorithms: ['RS256'], jwksUrl: `${ISSUER}/jwks` }],
+      clockSkewSeconds: 30, jwksCacheTtlMs: 60_000, jwksTimeoutMs: 20 },
+    new CachedJwksProvider({ async fetch(_url, timeoutMs) {
+      if (options.providerFailure) {
+        await new Promise((resolve) => setTimeout(resolve, timeoutMs));
+        throw new Error('provider timeout token=must-not-leak');
+      }
+      return { keys: [key.jwk] };
+    } }, 60_000, 20),
+  );
+  const persistence = new InMemoryPersistenceAdapter();
+  const app = new CellApplication({ persistence, kernel: cellKernel, clock: fixedClock(makeTimestamp(1_000_000)), eventIds: createEventIdFactory('http') });
+  const records = new Map<string, PrincipalRecord>([
+    ['payer-subject', { principalId: 'principal-payer', type: 'ACTOR', enabled: true,
+      actorId: PAYER, capabilities: ['ACT_AS_SELF'], mappingVersion: 1 }],
+    ['other-subject', { principalId: 'principal-other', type: 'ACTOR', enabled: true,
+      actorId: PAYER, capabilities: ['ACT_AS_SELF'], mappingVersion: 1 }],
+  ]);
+  const ingress = new TrustedCommandIngress(app, authentication, {
+    async resolve(identity) { return identity.issuer === ISSUER ? records.get(identity.subject) ?? null : null; },
+  }, rejectAllFundingEvidence);
+  const audit = new Audit();
+  const transport = new CommandHttpTransport(
+    { handleCommand: (request) => ingress.handle(request) },
+    { host: '127.0.0.1', port: 0, maxBodyBytes: 2048, maxHeaderBytes: 4096,
+      requestTimeoutMs: 2_000, headersTimeoutMs: 1_000 },
+    audit, () => 'generated-correlation',
+  );
+  await transport.listen();
+  return { transport, url: `http://127.0.0.1:${transport.address()!.port}/commands`,
+    token: jwt(key.privateKey), key, persistence, records, audit };
+}
+
+async function post(h: Harness, body: unknown, tokenValue = h.token, correlation?: string) {
+  const response = await fetch(h.url, { method: 'POST', headers: {
+    authorization: `Bearer ${tokenValue}`, 'content-type': 'application/json',
+    ...(correlation === undefined ? {} : { 'x-correlation-id': correlation }),
+  }, body: typeof body === 'string' ? body : JSON.stringify(body) });
+  return { response, json: await response.json() as Record<string, any> };
+}
+
+describe('Phase 7E real HTTP trusted command transport', () => {
+  let open: CommandHttpTransport[] = [];
+  afterEach(async () => { await Promise.all(open.map((transport) => transport.close())); open = []; });
+  async function setup(options: { providerFailure?: boolean } = {}) { const h = await harness(options); open.push(h.transport); return h; }
+
+  test('valid real credential executes command and preserves bigint precision', async () => {
+    const h = await setup();
+    const { response, json } = await post(h, { command: command() }, h.token, 'client-correlation-1');
+    expect(response.status).toBe(200);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    expect(response.headers.get('x-correlation-id')).toBe('client-correlation-1');
+    expect(json.outcome).toBe('SUCCESS');
+    expect(json.nextState.amount).toBe('900719925474099312345');
+    expect((await h.persistence.eventStore.getEvents('cell-transport-command' as never))[0]?.payload).toMatchObject({ amount: 900719925474099312345n });
+  });
+
+  test('invalid credential, issuer, audience, unmapped and disabled principal fail closed', async () => {
+    const h = await setup();
+    expect((await post(h, { command: command('bad-signature') }, `${h.token.slice(0, -2)}xx`)).response.status).toBe(401);
+    expect((await post(h, { command: command('issuer') }, jwt(h.key.privateKey, { iss: 'https://evil.test' }))).response.status).toBe(401);
+    expect((await post(h, { command: command('aud') }, jwt(h.key.privateKey, { aud: 'other' }))).response.status).toBe(401);
+    expect((await post(h, { command: command('unmapped') }, jwt(h.key.privateKey, { sub: 'missing' }))).response.status).toBe(403);
+    h.records.set('payer-subject', { ...h.records.get('payer-subject')!, enabled: false });
+    expect((await post(h, { command: command('disabled') })).response.status).toBe(403);
+  });
+
+  test('payload security claims are rejected and actor impersonation cannot use correlation identity', async () => {
+    const h = await setup();
+    const securityFields = await post(h, { command: command('security-fields'), principalId: 'principal-payer', capability: 'ACT_AS_SELF' });
+    expect(securityFields.response.status).toBe(400);
+    const impersonation = command('impersonation');
+    impersonation.payload.payer = 'different-actor' as never;
+    expect((await post(h, { command: impersonation }, h.token, 'principal-payer')).response.status).toBe(403);
+  });
+
+  test('duplicate, changed payload, cross-principal and concurrent requests preserve Phase 7A semantics', async () => {
+    const h = await setup();
+    const original = { command: command('idem') };
+    const first = await post(h, original);
+    const replay = await post(h, original);
+    expect(replay.json).toEqual(first.json);
+    const changed = { command: command('idem', '10001') };
+    expect((await post(h, changed)).response.status).toBe(409);
+    expect((await post(h, original, jwt(h.key.privateKey, { sub: 'other-subject' }))).response.status).toBe(409);
+    const concurrentBody = { command: command('concurrent') };
+    const concurrent = await Promise.all([post(h, concurrentBody), post(h, concurrentBody)]);
+    expect(concurrent.map((item) => item.response.status)).toEqual([200, 200]);
+    expect(await h.persistence.eventStore.getEvents('cell-concurrent' as never)).toHaveLength(1);
+  });
+
+  test('malformed, oversized, missing commandId, unsupported command and media type are safely rejected', async () => {
+    const h = await setup();
+    expect((await post(h, '{')).response.status).toBe(400);
+    expect((await post(h, { command: { ...command(), commandId: undefined } })).response.status).toBe(400);
+    expect((await post(h, { command: { ...command(), type: 'DeleteEverything' } })).response.status).toBe(400);
+    expect((await post(h, { padding: 'x'.repeat(3_000), command: command() })).response.status).toBe(413);
+    const wrongType = await fetch(h.url, { method: 'POST', headers: { authorization: `Bearer ${h.token}`, 'content-type': 'text/plain' }, body: '{}' });
+    expect(wrongType.status).toBe(415);
+  });
+
+  test('provider timeout and internal failure return opaque errors without credential leakage', async () => {
+    const timedOut = await setup({ providerFailure: true });
+    const timeout = await post(timedOut, { command: command('timeout') });
+    expect(timeout.response.status).toBe(401);
+    expect(JSON.stringify(timeout.json)).not.toContain(timedOut.token);
+    const auditDump = JSON.stringify(timedOut.audit.entries);
+    expect(auditDump).not.toContain(timedOut.token);
+    expect(auditDump).not.toContain('must-not-leak');
+
+    const audit = new Audit();
+    const broken = new CommandHttpTransport(
+      { async handleCommand() { throw new Error('password=secret SQL SELECT /private/path'); } },
+      { host: '127.0.0.1', port: 0, maxBodyBytes: 2048, maxHeaderBytes: 4096,
+        requestTimeoutMs: 2_000, headersTimeoutMs: 1_000 }, audit,
+    );
+    await broken.listen(); open.push(broken);
+    const response = await fetch(`http://127.0.0.1:${broken.address()!.port}/commands`, {
+      method: 'POST', headers: { authorization: `Bearer ${timedOut.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ command: command('internal') }),
+    });
+    expect(response.status).toBe(500);
+    expect(await response.text()).toBe('{"error":{"code":"INTERNAL_FAILURE"}}');
+  });
+});

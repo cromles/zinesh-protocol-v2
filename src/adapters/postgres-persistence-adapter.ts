@@ -20,6 +20,9 @@ import { Pool } from 'pg';
 import type { PersistenceAdapter } from './persistence-adapter';
 import { PostgresEventStore } from './postgres-event-store';
 import { PostgresSnapshotStore } from './postgres-snapshot-store';
+import { PostgresCommandExecutionStore } from './postgres-command-execution-store';
+import { PostgresPrincipalAuthority } from './postgres-principal-authority';
+import { PostgresMigrator } from './postgres-migrator';
 
 export interface PostgresConfig {
   readonly host: string;
@@ -33,6 +36,9 @@ export class PostgresPersistenceAdapter implements PersistenceAdapter {
   private readonly pool: Pool;
   readonly eventStore: PostgresEventStore;
   readonly snapshotStore: PostgresSnapshotStore;
+  readonly commandExecutionStore: PostgresCommandExecutionStore;
+  readonly principalAuthority: PostgresPrincipalAuthority;
+  readonly migrator: PostgresMigrator;
 
   constructor(config: PostgresConfig) {
     this.pool = new Pool({
@@ -44,6 +50,9 @@ export class PostgresPersistenceAdapter implements PersistenceAdapter {
     });
     this.eventStore    = new PostgresEventStore(this.pool);
     this.snapshotStore = new PostgresSnapshotStore(this.pool);
+    this.commandExecutionStore = new PostgresCommandExecutionStore(this.pool);
+    this.principalAuthority = new PostgresPrincipalAuthority(this.pool);
+    this.migrator = new PostgresMigrator(this.pool);
   }
 
   async connect(): Promise<void> {

@@ -57,3 +57,11 @@ CREATE TABLE IF NOT EXISTS snapshots (
 
     CONSTRAINT snapshots_version_positive CHECK (version > 0)
 );
+
+-- Durable command idempotency ledger. The row and its domain events are
+-- committed by PostgresCommandExecutionStore in the same transaction.
+CREATE TABLE IF NOT EXISTS command_executions (
+    command_id  TEXT  NOT NULL PRIMARY KEY,
+    fingerprint TEXT  NOT NULL,
+    result      TEXT
+);

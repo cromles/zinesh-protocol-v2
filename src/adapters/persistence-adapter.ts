@@ -16,10 +16,12 @@
 
 import type { EventStore } from './event-store';
 import type { SnapshotStore } from './snapshot-store';
+import type { CommandExecutionStore } from './command-execution-store';
 
 export interface PersistenceAdapter {
   readonly eventStore: EventStore;
   readonly snapshotStore: SnapshotStore;
+  readonly commandExecutionStore: CommandExecutionStore;
 
   /**
    * Open / initialise the underlying storage.

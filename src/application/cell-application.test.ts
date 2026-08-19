@@ -31,7 +31,10 @@ import type {
   EventId,
   Timestamp,
 } from '../core/types';
-import type { HandleCommandRequest, HandleCommandResult } from './types';
+import type { HandleCommandResult } from './types';
+import { actorIdentity, createTestIngress } from '../security/testing';
+import type { TestIdentity } from '../security/testing';
+import type { ExternalCommandRequest } from '../security/trusted-ingress';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -84,7 +87,13 @@ function createCellPayload(opts: { arbiter?: ActorId } = {}) {
   };
 }
 
-function caller(actorId: ActorId = PAYER): HandleCommandRequest['caller'] {
+interface LegacyTestRequest {
+  readonly command: Command;
+  readonly caller: { readonly authenticated: boolean; readonly actorId: ActorId };
+  readonly gateway?: { readonly authorizedGateway: boolean };
+}
+
+function caller(actorId: ActorId = PAYER): LegacyTestRequest['caller'] {
   return { authenticated: true, actorId };
 }
 
@@ -99,9 +108,9 @@ function request(
     gateway?: { readonly authorizedGateway: boolean };
     authenticated?: boolean;
   } = {},
-): HandleCommandRequest {
+): LegacyTestRequest {
   const authenticated = opts.authenticated ?? true;
-  const req: HandleCommandRequest = {
+  const req: LegacyTestRequest = {
     command,
     caller: { authenticated, actorId: opts.actor ?? PAYER },
   };
@@ -115,7 +124,7 @@ function request(
 }
 
 interface AppHarness {
-  app: CellApplication;
+  app: { handleCommand(request: LegacyTestRequest): Promise<HandleCommandResult> };
   persistence: InMemoryPersistenceAdapter;
   clock: { now(): Timestamp };
   eventIds: EventIdFactory;
@@ -140,12 +149,47 @@ function makeApp(now: Timestamp = T0): AppHarness {
       return current;
     },
   };
-  const app = new CellApplication({
+  const application = new CellApplication({
     persistence,
     kernel: cellKernel,
     clock,
     eventIds,
   });
+  const identities = [PAYER, PAYEE, ARBITER, STRANGER].map((actor) => actorIdentity(actor));
+  const gatewayIdentity: TestIdentity = {
+    credential: 'test-gateway-credential', subject: 'test-gateway-subject',
+    principal: {
+      principalId: 'gateway-1', type: 'GATEWAY', enabled: true,
+      capabilities: ['CONFIRM_FUNDING'], mappingVersion: 1,
+    },
+  };
+  const ingress = createTestIngress(application, [...identities, gatewayIdentity], {
+    async verify(evidence) {
+      if (typeof evidence !== 'object' || evidence === null) return null;
+      return evidence as import('../security/trusted-ingress').VerifiedFundingContext;
+    },
+  });
+  const app = {
+    handleCommand(input: LegacyTestRequest): Promise<HandleCommandResult> {
+      const external: ExternalCommandRequest = input.command.type === 'FundCell'
+        ? {
+            credential: input.gateway?.authorizedGateway === true ? 'test-gateway-credential' : 'invalid',
+            command: input.command,
+            fundingEvidence: {
+              providerTransactionId: `provider-${input.command.commandId}`,
+              gatewayPrincipalId: 'gateway-1', cellId: input.command.cellId,
+              payer: (input.command.payload as { funderId: ActorId }).funderId,
+              amount: (input.command.payload as { amount: Amount }).amount,
+              currency: 'TRY',
+            },
+          }
+        : {
+            credential: input.caller.authenticated ? `test-credential-${input.caller.actorId}` : 'invalid',
+            command: input.command,
+          };
+      return ingress.handle(external);
+    },
+  };
   return {
     app,
     persistence,
@@ -234,6 +278,60 @@ describe('1. CreateCell through Application succeeds', () => {
   });
 });
 
+describe('Phase 7A command execution boundary', () => {
+  test('same commandId and content replays without duplicate events', async () => {
+    const harness = makeApp();
+    const cellId = nextCellId();
+    const command = cmd('CreateCell', createCellPayload(), cellId);
+    const first = await harness.app.handleCommand(request(command));
+    const replay = await harness.app.handleCommand(request(command));
+    expect(replay).toEqual(first);
+    expect(await harness.persistence.eventStore.getEvents(cellId)).toHaveLength(1);
+  });
+
+  test('same commandId with different content is rejected', async () => {
+    const harness = makeApp();
+    const cellId = nextCellId();
+    const original = cmd('CreateCell', createCellPayload(), cellId);
+    await harness.app.handleCommand(request(original));
+    const changed: Command = { ...original, payload: { ...createCellPayload(), amount: makeAmount(20000n) } };
+    const result = await harness.app.handleCommand(request(changed));
+    expect(result.outcome).toBe('APPLICATION_REJECTION');
+    if (result.outcome !== 'APPLICATION_REJECTION') return;
+    expect(result.error.code).toBe('IDEMPOTENCY_CONFLICT');
+    expect(await harness.persistence.eventStore.getEvents(cellId)).toHaveLength(1);
+  });
+
+  test('concurrent duplicate execution produces one event', async () => {
+    const harness = makeApp();
+    const cellId = nextCellId();
+    const command = cmd('CreateCell', createCellPayload(), cellId);
+    const [first, second] = await Promise.all([
+      harness.app.handleCommand(request(command)),
+      harness.app.handleCommand(request(command)),
+    ]);
+    expect(second).toEqual(first);
+    expect(first.outcome).toBe('SUCCESS');
+    expect(await harness.persistence.eventStore.getEvents(cellId)).toHaveLength(1);
+  });
+
+  test('idempotency survives application recreation over the same persistence', async () => {
+    const persistence = new InMemoryPersistenceAdapter();
+    const cellId = nextCellId();
+    const command = cmd('CreateCell', createCellPayload(), cellId);
+    const firstApp = new CellApplication({ persistence, kernel: cellKernel, clock: fixedClock(T0), eventIds: createEventIdFactory('restart-a') });
+    const secondApp = new CellApplication({ persistence, kernel: cellKernel, clock: fixedClock(T0), eventIds: createEventIdFactory('restart-b') });
+    const identity = actorIdentity(PAYER);
+    const firstIngress = createTestIngress(firstApp, [identity]);
+    const secondIngress = createTestIngress(secondApp, [identity]);
+    const external = { credential: identity.credential, command };
+    const first = await firstIngress.handle(external);
+    const replay = await secondIngress.handle(external);
+    expect(replay).toEqual(first);
+    expect(await persistence.eventStore.getEvents(cellId)).toHaveLength(1);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // 2. Application loads existing events before command
 // ---------------------------------------------------------------------------
@@ -296,7 +394,7 @@ describe('4. FundCell succeeds when funderId matches payer', () => {
 // ---------------------------------------------------------------------------
 
 describe('5. Application does not bypass Kernel authorization', () => {
-  test('FundCell with stranger funderId is rejected by Kernel, not Application', async () => {
+  test('verified gateway FundCell with non-payer evidence is rejected by Kernel', async () => {
     const harness = makeApp();
     const cellId = nextCellId();
     await createCell(harness, cellId);
@@ -319,11 +417,10 @@ describe('5. Application does not bypass Kernel authorization', () => {
 
     expect(result.outcome).toBe('KERNEL_REJECTION');
     if (result.outcome !== 'KERNEL_REJECTION' || direct.ok) return;
-    expect(result.error).toEqual(direct.error);
     expect(result.error.code).toBe('AUTHORIZATION_DENIED');
   });
 
-  test('stranger RequestRelease is Kernel AUTHORIZATION_DENIED', async () => {
+  test('stranger RequestRelease impersonation is rejected before Kernel', async () => {
     const harness = makeApp();
     const cellId = nextCellId();
     await createCell(harness, cellId);
@@ -333,9 +430,9 @@ describe('5. Application does not bypass Kernel authorization', () => {
       request(cmd('RequestRelease', { requestedBy: STRANGER }, cellId)),
     );
 
-    expect(result.outcome).toBe('KERNEL_REJECTION');
-    if (result.outcome !== 'KERNEL_REJECTION') return;
-    expect(result.error.code).toBe('AUTHORIZATION_DENIED');
+    expect(result.outcome).toBe('APPLICATION_REJECTION');
+    if (result.outcome !== 'APPLICATION_REJECTION') return;
+    expect(result.error.code).toBe('ACTOR_MISMATCH');
 
     const stored = await harness.persistence.eventStore.getEvents(cellId);
     expect(stored).toHaveLength(2);
@@ -842,7 +939,7 @@ describe('constitution extras', () => {
     expect(await harness.persistence.eventStore.getEvents(cellId)).toHaveLength(0);
   });
 
-  test('FundCell without an authorized gateway is GATEWAY_DENIED', async () => {
+  test('FundCell without verified gateway credential is UNAUTHENTICATED', async () => {
     const harness = makeApp();
     const cellId = nextCellId();
     await createCell(harness, cellId);
@@ -852,7 +949,7 @@ describe('constitution extras', () => {
     });
     expect(result.outcome).toBe('APPLICATION_REJECTION');
     if (result.outcome !== 'APPLICATION_REJECTION') return;
-    expect(result.error.code).toBe('GATEWAY_DENIED');
+    expect(result.error.code).toBe('UNAUTHENTICATED');
   });
 
   test('unrecognized command type is INVALID_INPUT', async () => {
