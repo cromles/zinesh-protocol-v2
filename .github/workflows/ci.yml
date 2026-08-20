@@ -54,6 +54,9 @@ jobs:
           node-version-file: .node-version
           cache: npm
 
+      - name: Set up isolated BuildKit builder
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
       - name: Verify runtime pin
         shell: bash
         run: |
