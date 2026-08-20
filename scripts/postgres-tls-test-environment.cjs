@@ -21,7 +21,7 @@ if (command === 'stop') {
 
 function start(directory, statePath, envPath) {
   const suffix = `${process.pid}-${Date.now()}`;
-  const state = { directory, containers: [], volumes: [] };
+  const state = { directory, containers: [], volumes: [], networks: [] };
   try {
     mkdirSync(directory, { recursive: false });
     const password = randomBytes(24).toString('base64url');
@@ -30,21 +30,23 @@ function start(directory, statePath, envPath) {
       new Date(now.getTime() - 86_400_000), new Date(now.getTime() + 86_400_000));
     const wrongCa = certificateAuthority('Zinesh unrelated PostgreSQL test root',
       new Date(now.getTime() - 86_400_000), new Date(now.getTime() + 86_400_000));
-    const validServer = serverCertificate(validCa, ['localhost', 'host.docker.internal'], [],
+    const validServer = serverCertificate(validCa, ['localhost', 'postgres-tls.test'], [],
       new Date(now.getTime() - 60_000), new Date(now.getTime() + 3_600_000));
     const hostnameMismatchServer = serverCertificate(validCa, ['wrong-host.invalid'], [],
       new Date(now.getTime() - 60_000), new Date(now.getTime() + 3_600_000));
-    const expiredServer = serverCertificate(validCa, ['localhost', 'host.docker.internal'], [],
+    const expiredServer = serverCertificate(validCa, ['localhost'], [],
       new Date(now.getTime() - 7_200_000), new Date(now.getTime() - 3_600_000));
     const intermediate = intermediateAuthority(validCa, 'Zinesh ephemeral missing intermediate',
       new Date(now.getTime() - 86_400_000), new Date(now.getTime() + 86_400_000));
-    const invalidChainServer = serverCertificate(intermediate, ['localhost', 'host.docker.internal'], [],
+    const invalidChainServer = serverCertificate(intermediate, ['localhost'], [],
       new Date(now.getTime() - 60_000), new Date(now.getTime() + 3_600_000));
 
     writeFileSync(join(directory, 'ca.pem'), validCa.certificate, { mode: 0o600 });
     writeFileSync(join(directory, 'wrong-ca.pem'), wrongCa.certificate, { mode: 0o600 });
     writeFileSync(join(directory, 'database-password'), password, { mode: 0o600 });
-    const valid = launch('valid', validServer, password, suffix, directory, state);
+    const network = `zinesh-pg-tls-${suffix}`;
+    docker(['network', 'create', network]); state.networks.push(network);
+    const valid = launch('valid', validServer, password, suffix, directory, state, network, 'postgres-tls.test');
     const hostnameMismatch = launch('hostname-mismatch', hostnameMismatchServer, password, suffix, directory, state);
     const expired = launch('expired', expiredServer, password, suffix, directory, state);
     const invalidChain = launch('invalid-chain', invalidChainServer, password, suffix, directory, state);
@@ -56,6 +58,7 @@ function start(directory, statePath, envPath) {
       `PG_PASSWORD_FILE=${join(directory, 'database-password')}`,
       'PG_TLS_MODE=verify-full', `PG_TLS_CA_PATH=${join(directory, 'ca.pem')}`,
       `PG_TLS_WRONG_CA_PATH=${join(directory, 'wrong-ca.pem')}`,
+      `PG_TLS_DOCKER_NETWORK=${network}`, 'PG_TLS_DOCKER_HOST=postgres-tls.test',
       `PG_TLS_HOSTNAME_MISMATCH_PORT=${hostnameMismatch.port}`,
       `PG_TLS_EXPIRED_PORT=${expired.port}`, `PG_TLS_INVALID_CHAIN_PORT=${invalidChain.port}`,
     ].join('\n') + '\n');
@@ -66,7 +69,7 @@ function start(directory, statePath, envPath) {
   }
 }
 
-function launch(kind, server, password, suffix, directory, state) {
+function launch(kind, server, password, suffix, directory, state, network, alias) {
   const source = join(directory, kind); mkdirSync(source);
   writeFileSync(join(source, 'server.crt'), server.certificate, { mode: 0o600 });
   writeFileSync(join(source, 'server.key'), server.privateKey, { mode: 0o600 });
@@ -85,6 +88,7 @@ function launch(kind, server, password, suffix, directory, state) {
   ]);
   docker([
     'run', '--detach', '--name', container, '--publish', '127.0.0.1::5432',
+    ...(network ? ['--network', network] : []), ...(alias ? ['--network-alias', alias] : []),
     '--env', 'POSTGRES_DB=zinesh_tls_test', '--env', 'POSTGRES_USER=zinesh_tls_test',
     '--env', `POSTGRES_PASSWORD=${password}`, '--mount', `type=volume,source=${volume},target=/tls,readonly`,
     'postgres:16-alpine', '-c', 'ssl=on', '-c', 'ssl_cert_file=/tls/server.crt',
@@ -106,6 +110,7 @@ function launch(kind, server, password, suffix, directory, state) {
 function cleanup(state, statePath) {
   for (const container of state.containers ?? []) spawnSync('docker', ['rm', '-f', container]);
   for (const volume of state.volumes ?? []) spawnSync('docker', ['volume', 'rm', '-f', volume]);
+  for (const network of state.networks ?? []) spawnSync('docker', ['network', 'rm', network]);
   if (state.directory) rmSync(state.directory, { recursive: true, force: true });
   if (statePath) rmSync(statePath, { force: true });
 }

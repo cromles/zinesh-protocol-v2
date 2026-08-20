@@ -13,7 +13,8 @@ const { PostgresMigrator } = require('../dist/adapters/postgres-migrator');
 
 const image = process.argv[2];
 assert.ok(image, 'usage: node scripts/verify-container-startup.cjs <image>');
-for (const name of ['PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER', 'PG_PASSWORD_FILE', 'PG_TLS_CA_PATH']) {
+for (const name of ['PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER', 'PG_PASSWORD_FILE', 'PG_TLS_CA_PATH',
+  'PG_TLS_DOCKER_NETWORK', 'PG_TLS_DOCKER_HOST']) {
   assert.ok(process.env[name], `${name} is required for container startup smoke`);
 }
 
@@ -69,7 +70,7 @@ async function execute() {
   ]);
 
   const environment = {
-    PGHOST: 'host.docker.internal', PGPORT: process.env.PGPORT, PGDATABASE: database,
+    PGHOST: process.env.PG_TLS_DOCKER_HOST, PGPORT: '5432', PGDATABASE: database,
     PGUSER: process.env.PGUSER, PG_PASSWORD_FILE: '/run/zinesh-tls/database-password',
     PG_TLS_MODE: 'verify-full', PG_TLS_CA_PATH: '/run/zinesh-tls/database-ca.pem',
     AUTH_TRUSTED_ISSUER: 'https://issuer.artifact.test', AUTH_TRUSTED_AUDIENCE: 'zinesh-artifact-smoke',
@@ -93,7 +94,7 @@ async function execute() {
   };
   const args = [
     'run', '--detach', '--name', container, '--read-only', '--cap-drop=ALL',
-    '--security-opt=no-new-privileges:true', '--add-host=host.docker.internal:host-gateway',
+    '--security-opt=no-new-privileges:true', '--network', process.env.PG_TLS_DOCKER_NETWORK,
     '--publish', '127.0.0.1::8443',
     '--mount', `type=volume,source=${volume},target=/run/zinesh-tls,readonly`,
   ];
