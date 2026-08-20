@@ -45,6 +45,8 @@ jobs:
     steps:
       - name: Checkout exact commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Set up pinned Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -52,9 +54,14 @@ jobs:
           node-version-file: .node-version
           cache: npm
 
+      - name: Set up isolated BuildKit builder
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
       - name: Verify runtime pin
         shell: bash
-        run: test "$(node --version)" = "v$(cat .node-version)"
+        run: |
+          test "$(node --version)" = "v$(tr -d '\r\n' < .node-version)"
+          test "$(npm --version)" = "$(tr -d '\r\n' < .npm-version)"
 
       - name: Clean install from lockfile
         run: npm ci
@@ -85,3 +92,84 @@ jobs:
 
       - name: Smoke-test production-only install artifact
         run: npm run artifact:smoke
+
+      - name: Restore complete install for artifact verification
+        run: npm ci
+
+      - name: Define deterministic OCI metadata
+        shell: bash
+        run: |
+          echo "SOURCE_REVISION=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> "$GITHUB_ENV"
+          echo "OCI_CREATED=$(date -u -d "@$(git log -1 --pretty=%ct)" +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=zinesh-phase-b:$(git rev-parse --short=12 HEAD)" >> "$GITHUB_ENV"
+
+      - name: Build production OCI image
+        shell: bash
+        run: |
+          docker buildx build --platform linux/amd64 --load \
+            --provenance=false --sbom=false \
+            --build-arg SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
+            --build-arg OCI_CREATED="$OCI_CREATED" \
+            --build-arg OCI_REVISION="$SOURCE_REVISION" \
+            --build-arg OCI_VERSION=2.0.0 \
+            --tag "$IMAGE_TAG" .
+
+      - name: Audit hardened image
+        run: node scripts/verify-container-image.cjs "$IMAGE_TAG"
+
+      - name: Startup and SIGTERM smoke
+        run: node scripts/verify-container-startup.cjs "$IMAGE_TAG"
+
+      - name: Build two clean attested OCI artifacts
+        shell: bash
+        run: |
+          for build in 1 2; do
+            SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" docker buildx build --no-cache --platform linux/amd64 \
+              --build-arg SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
+              --build-arg OCI_CREATED="$OCI_CREATED" \
+              --build-arg OCI_REVISION="$SOURCE_REVISION" \
+              --build-arg OCI_VERSION=2.0.0 \
+              --attest type=sbom,generator=docker.io/docker/buildkit-syft-scanner:stable-1@sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68 \
+              --attest type=provenance,mode=max \
+              --output "type=oci,dest=zinesh-build-${build}.oci.tar,rewrite-timestamp=true" .
+          done
+
+      - name: Verify runtime subject digest reproducibility
+        shell: bash
+        run: |
+          BUILD_1_DIGEST=$(node scripts/verify-oci-artifact.cjs zinesh-build-1.oci.tar --digest-only)
+          BUILD_2_DIGEST=$(node scripts/verify-oci-artifact.cjs zinesh-build-2.oci.tar --digest-only)
+          echo "BUILD 1: $BUILD_1_DIGEST"
+          echo "BUILD 2: $BUILD_2_DIGEST"
+          test "$BUILD_1_DIGEST" = "$BUILD_2_DIGEST"
+          node scripts/verify-oci-artifact.cjs zinesh-build-1.oci.tar \
+            --sbom-output=zinesh-runtime.sbom.json \
+            --inventory-output=zinesh-runtime.inventory.json \
+            --metadata-output=zinesh-runtime.metadata.json
+          node scripts/test-runtime-sbom-parity.cjs \
+            zinesh-build-1.oci.tar zinesh-runtime.sbom.json zinesh-runtime.inventory.json
+          echo "RUNTIME_DIGEST=$BUILD_1_DIGEST" >> "$GITHUB_ENV"
+
+      - name: Scan OS and production npm inventory
+        shell: bash
+        run: |
+          mkdir zinesh-oci-layout
+          tar -xf zinesh-build-1.oci.tar -C zinesh-oci-layout
+          docker run --rm --platform linux/amd64 \
+            --mount "type=bind,source=$PWD,target=/workspace" \
+            aquasec/trivy:0.73.0@sha256:4bbf3824d974b70f27631005e2e6194d4d8fbd6e72c4a9e04cf521e25c5cb07f \
+            image --input /workspace/zinesh-oci-layout --scanners vuln \
+            --severity HIGH,CRITICAL --exit-code 1 --no-progress --skip-version-check \
+            --format json --output /workspace/zinesh-trivy.scan.json
+
+      - name: Scan standalone Node runtime and complete SBOM
+        shell: bash
+        run: |
+          docker run --rm --platform linux/amd64 \
+            --mount "type=bind,source=$PWD,target=/workspace" \
+            anchore/grype:v0.117.0@sha256:ab8d929faec38875a45aba74c9651549cd096756d1981773c04375f282e91075 \
+            sbom:/workspace/zinesh-runtime.sbom.json --fail-on high \
+            --output json --file /workspace/zinesh-grype.scan.json
+          node scripts/verify-vulnerability-coverage.cjs \
+            zinesh-trivy.scan.json zinesh-grype.scan.json zinesh-runtime.metadata.json
