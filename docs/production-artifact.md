@@ -1,13 +1,13 @@
 # Zinesh V2 production artifact standard
 
-The production artifact is a single-platform (`linux/amd64`) OCI image built from an exact Git commit. Build and dependency stages use the exact Debian slim Node image. The final stage is `scratch` and receives only the verified Node executable, its required shared libraries, the application, and production dependencies.
+The production artifact is a single-platform (`linux/amd64`) OCI image built from an exact Git commit. Build and dependency stages use an exact Alpine Node image. The final stage is `scratch` and receives only the verified Node executable, its required musl/GCC runtime libraries, their filtered Alpine package inventory, the application, and production dependencies.
 
 ## Immutable inputs
 
-- Node.js: `24.16.0`
-- npm: `11.13.0`
-- Base: `node:24.16.0-bookworm-slim`
-- Base linux/amd64 manifest: `sha256:ca520832af80fa37a57c14077ed0fcdd83b5aefccc356059fdc3a9a05b78ae1f`
+- Node.js: `24.18.1`
+- npm: `11.16.0`
+- Base: `node:24.18.1-alpine3.23`
+- Base linux/amd64 manifest: `sha256:ba63d8e0b5d4cbc6db9da12ea77ddb35a4783ad653a092ef115cc383526d4369`
 - Dependencies: `package-lock.json`, installed only with `npm ci --ignore-scripts`
 - Timestamp: the source commit timestamp supplied as `SOURCE_DATE_EPOCH`
 
@@ -36,10 +36,14 @@ The final `/app` contains only:
 
 The final image does not contain npm, Corepack, Yarn, a shell, or an operating-system package manager.
 
+The native runtime is limited to `musl`, `libgcc`, and `libstdc++`. Their exact Alpine package records remain in `/lib/apk/db/installed`, so an OS scanner can identify the libraries actually copied into the scratch image. Node's embedded OpenSSL version is checked at runtime and the standalone Node executable must appear as a binary component in the SBOM.
+
 Source, tests, development dependencies, Git metadata, local configuration, credentials, TLS material, caches, and coverage are forbidden.
 
 ## Supply-chain evidence
 
-CI performs two no-cache builds and requires identical runtime subject digests. BuildKit produces an SPDX SBOM and SLSA provenance for the OCI artifact. Trivy is pinned by its linux/amd64 manifest digest; Critical and High vulnerabilities fail the build unless a future exception is explicit, time-bounded, and reviewed.
+CI performs two no-cache builds and requires identical runtime subject digests. BuildKit produces an SPDX SBOM with a digest-pinned Syft generator and SLSA provenance attached to that digest. The SBOM gate requires Node, musl, libgcc, libstdc++, `pg`, and its production tree while rejecting development tooling.
+
+Trivy scans the final OCI artifact's Alpine/native and production npm inventories. Grype independently scans the attached SBOM so the standalone Node binary is included in vulnerability evaluation. Both scanners are pinned by linux/amd64 manifest digest. Critical and High vulnerabilities fail the build; Phase B defines no hidden ignore or exception path.
 
 Phase B does not push the image, sign it, deploy it, migrate a database, or define rollout policy.

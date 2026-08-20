@@ -130,7 +130,8 @@ jobs:
               --build-arg OCI_CREATED="$OCI_CREATED" \
               --build-arg OCI_REVISION="$SOURCE_REVISION" \
               --build-arg OCI_VERSION=2.0.0 \
-              --attest type=sbom --attest type=provenance,mode=max \
+              --attest type=sbom,generator=docker.io/docker/buildkit-syft-scanner:stable-1@sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68 \
+              --attest type=provenance,mode=max \
               --output "type=oci,dest=zinesh-build-${build}.oci.tar,rewrite-timestamp=true" .
           done
 
@@ -142,15 +143,30 @@ jobs:
           echo "BUILD 1: $BUILD_1_DIGEST"
           echo "BUILD 2: $BUILD_2_DIGEST"
           test "$BUILD_1_DIGEST" = "$BUILD_2_DIGEST"
-          node scripts/verify-oci-artifact.cjs zinesh-build-1.oci.tar
+          node scripts/verify-oci-artifact.cjs zinesh-build-1.oci.tar \
+            --sbom-output=zinesh-runtime.sbom.json \
+            --metadata-output=zinesh-runtime.metadata.json
+          echo "RUNTIME_DIGEST=$BUILD_1_DIGEST" >> "$GITHUB_ENV"
 
-      - name: Scan immutable OCI artifact
+      - name: Scan OS and production npm inventory
         shell: bash
         run: |
           mkdir zinesh-oci-layout
           tar -xf zinesh-build-1.oci.tar -C zinesh-oci-layout
           docker run --rm --platform linux/amd64 \
-            --mount "type=bind,source=$PWD,target=/workspace,readonly" \
+            --mount "type=bind,source=$PWD,target=/workspace" \
             aquasec/trivy:0.73.0@sha256:4bbf3824d974b70f27631005e2e6194d4d8fbd6e72c4a9e04cf521e25c5cb07f \
             image --input /workspace/zinesh-oci-layout --scanners vuln \
-            --severity HIGH,CRITICAL --exit-code 1 --no-progress --skip-version-check
+            --severity HIGH,CRITICAL --exit-code 1 --no-progress --skip-version-check \
+            --format json --output /workspace/zinesh-trivy.scan.json
+
+      - name: Scan standalone Node runtime and complete SBOM
+        shell: bash
+        run: |
+          docker run --rm --platform linux/amd64 \
+            --mount "type=bind,source=$PWD,target=/workspace" \
+            anchore/grype:v0.117.0@sha256:ab8d929faec38875a45aba74c9651549cd096756d1981773c04375f282e91075 \
+            sbom:/workspace/zinesh-runtime.sbom.json --fail-on high \
+            --output json --file /workspace/zinesh-grype.scan.json
+          node scripts/verify-vulnerability-coverage.cjs \
+            zinesh-trivy.scan.json zinesh-grype.scan.json zinesh-runtime.metadata.json

@@ -8,6 +8,7 @@ coverage/
 *.oci.tar
 *.sbom.json
 *.scan.json
+*.metadata.json
 zinesh-oci-layout/
 
 # Local environment and credentials

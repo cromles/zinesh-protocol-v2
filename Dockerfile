@@ -1,4 +1,4 @@
-FROM node:24.16.0-bookworm-slim@sha256:ca520832af80fa37a57c14077ed0fcdd83b5aefccc356059fdc3a9a05b78ae1f AS build
+FROM node:24.18.1-alpine3.23@sha256:ba63d8e0b5d4cbc6db9da12ea77ddb35a4783ad653a092ef115cc383526d4369 AS build
 
 WORKDIR /build
 COPY package.json package-lock.json .node-version .npm-version ./
@@ -14,7 +14,7 @@ RUN npm run build \
     && cd dist \
     && find . -type f -name '*.js' -exec cp --parents '{}' /runtime-dist/ \;
 
-FROM node:24.16.0-bookworm-slim@sha256:ca520832af80fa37a57c14077ed0fcdd83b5aefccc356059fdc3a9a05b78ae1f AS production-dependencies
+FROM node:24.18.1-alpine3.23@sha256:ba63d8e0b5d4cbc6db9da12ea77ddb35a4783ad653a092ef115cc383526d4369 AS production-dependencies
 
 WORKDIR /production
 COPY package.json package-lock.json .node-version .npm-version ./
@@ -26,6 +26,18 @@ RUN test "$(node --version)" = "v$(tr -d '\r\n' < .node-version)" \
     && find node_modules -type f \( -name '*.d.ts' -o -name '*.map' \) -delete \
     && node -e "require('pg')" \
     && rm -rf /root/.npm
+
+RUN mkdir -p /runtime-rootfs/lib/apk/db /runtime-rootfs/etc /runtime-rootfs/usr/lib /runtime-rootfs/usr/local/bin \
+    && cp /usr/local/bin/node /runtime-rootfs/usr/local/bin/node \
+    && cp /lib/ld-musl-x86_64.so.1 /runtime-rootfs/lib/ld-musl-x86_64.so.1 \
+    && cp /usr/lib/libgcc_s.so.1 /runtime-rootfs/usr/lib/libgcc_s.so.1 \
+    && cp -P /usr/lib/libstdc++.so.6 /runtime-rootfs/usr/lib/libstdc++.so.6 \
+    && cp /usr/lib/libstdc++.so.6.0.34 /runtime-rootfs/usr/lib/libstdc++.so.6.0.34 \
+    && cp /etc/alpine-release /etc/os-release /runtime-rootfs/etc/ \
+    && awk 'BEGIN { RS=""; ORS="\n\n" } /(^|\n)P:(musl|libgcc|libstdc\+\+)(\n|$)/ { print }' \
+       /lib/apk/db/installed > /runtime-rootfs/lib/apk/db/installed \
+    && test "$(grep -c '^P:' /runtime-rootfs/lib/apk/db/installed)" = 3 \
+    && chown -R 1000:1000 /runtime-rootfs/usr/local/bin/node
 
 FROM scratch AS runtime
 
@@ -43,16 +55,7 @@ ENV NODE_ENV=production
 ENV PATH=/usr/local/bin
 ENV HOME=/nonexistent
 WORKDIR /app
-COPY --from=production-dependencies /usr/local/bin/node /usr/local/bin/node
-COPY --from=production-dependencies /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
-COPY --from=production-dependencies /lib/x86_64-linux-gnu/libc.so.6 /lib/x86_64-linux-gnu/libc.so.6
-COPY --from=production-dependencies /lib/x86_64-linux-gnu/libdl.so.2 /lib/x86_64-linux-gnu/libdl.so.2
-COPY --from=production-dependencies /lib/x86_64-linux-gnu/libgcc_s.so.1 /lib/x86_64-linux-gnu/libgcc_s.so.1
-COPY --from=production-dependencies /lib/x86_64-linux-gnu/libm.so.6 /lib/x86_64-linux-gnu/libm.so.6
-COPY --from=production-dependencies /lib/x86_64-linux-gnu/libpthread.so.0 /lib/x86_64-linux-gnu/libpthread.so.0
-COPY --from=production-dependencies /lib/x86_64-linux-gnu/libstdc++.so.6 /lib/x86_64-linux-gnu/libstdc++.so.6
-COPY --from=production-dependencies /lib/x86_64-linux-gnu/libstdc++.so.6.0.30 /lib/x86_64-linux-gnu/libstdc++.so.6.0.30
-COPY --from=production-dependencies /lib64/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2
+COPY --from=production-dependencies /runtime-rootfs /
 COPY --from=production-dependencies --chown=1000:1000 /production/package.json /production/package-lock.json ./
 COPY --from=production-dependencies --chown=1000:1000 /production/node_modules ./node_modules
 COPY --from=build --chown=1000:1000 /runtime-dist ./dist

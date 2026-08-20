@@ -22,7 +22,7 @@ const database = `zinesh_artifact_smoke_${process.pid}_${Date.now()}`;
 const container = `zinesh-artifact-smoke-${suffix}`;
 const volume = `zinesh-artifact-tls-${suffix}`;
 const directory = mkdtempSync(join(tmpdir(), 'zinesh-artifact-tls-'));
-const base = 'node:24.16.0-bookworm-slim@sha256:ca520832af80fa37a57c14077ed0fcdd83b5aefccc356059fdc3a9a05b78ae1f';
+const base = 'node:24.18.1-alpine3.23@sha256:ba63d8e0b5d4cbc6db9da12ea77ddb35a4783ad653a092ef115cc383526d4369';
 let createdDatabase = false;
 
 void execute().catch(async (error) => {
