@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  production-verification:
+    name: PostgreSQL 16 / Node 24 production verification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: zinesh_ci
+          POSTGRES_USER: zinesh_ci
+          POSTGRES_PASSWORD: ci-test-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U zinesh_ci -d zinesh_ci"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      ZINESH_POSTGRES_TESTS: 'true'
+      PGHOST: 127.0.0.1
+      PGPORT: '5432'
+      PGDATABASE: zinesh_ci
+      PGUSER: zinesh_ci
+      PGPASSWORD: ci-test-only
+
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up pinned Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+
+      - name: Verify runtime pin
+        shell: bash
+        run: test "$(node --version)" = "v$(cat .node-version)"
+
+      - name: Clean install from lockfile
+        run: npm ci
+
+      - name: Verify PostgreSQL readiness
+        shell: bash
+        run: docker exec "${{ job.services.postgres.id }}" pg_isready -U "$PGUSER" -d "$PGDATABASE"
+
+      - name: Full PostgreSQL test suite with exact count gate
+        shell: bash
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee test-output.log
+          grep -F "Tests:       325 passed, 325 total" test-output.log
+          ! grep -E "Tests:.*(skipped|failed|pending)" test-output.log
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build production artifact
+        run: npm run build
+
+      - name: Smoke-test complete install artifact
+        run: npm run artifact:smoke
+
+      - name: Prune development dependencies
+        run: npm prune --omit=dev
+
+      - name: Smoke-test production-only install artifact
+        run: npm run artifact:smoke
