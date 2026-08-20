@@ -98,6 +98,7 @@ const pgConfig: PostgresConfig = {
   database: process.env['PGDATABASE'] ?? 'zinesh_test',
   user:     process.env['PGUSER']     ?? 'postgres',
   password: process.env['PGPASSWORD'] ?? 'postgres',
+  tls: { mode: 'verify-full', ca: 'Phase C Step 1 test contract; integration follows in Step 2' },
 };
 
 // ---------------------------------------------------------------------------

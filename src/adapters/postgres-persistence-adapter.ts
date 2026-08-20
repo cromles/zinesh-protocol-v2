@@ -33,6 +33,10 @@ export interface PostgresConfig {
   readonly database: string;
   readonly user: string;
   readonly password: string;
+  readonly tls: {
+    readonly mode: 'verify-full';
+    readonly ca: string;
+  };
 }
 
 export class PostgresPersistenceAdapter implements PersistenceAdapter {

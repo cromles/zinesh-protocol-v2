@@ -28,6 +28,7 @@ const config = {
   host: process.env['PGHOST'] ?? 'localhost', port: Number(process.env['PGPORT'] ?? 5432),
   database: process.env['PGDATABASE'] ?? 'zinesh_test', user: process.env['PGUSER'] ?? 'postgres',
   password: process.env['PGPASSWORD'] ?? 'postgres',
+  tls: { mode: 'verify-full' as const, ca: 'Phase C Step 1 test contract; integration follows in Step 2' },
 };
 const ACTOR = makeActorId('authority-actor');
 const ACTOR_2 = makeActorId('authority-actor-2');

@@ -56,6 +56,7 @@ async function execute() {
   );
   writeFileSync(join(directory, 'certificate.pem'), tls.certificate, { mode: 0o600 });
   writeFileSync(join(directory, 'private-key.pem'), tls.privateKey, { mode: 0o600 });
+  writeFileSync(join(directory, 'database-password'), process.env.PGPASSWORD, { mode: 0o600 });
 
   run(['volume', 'create', volume]);
   run([
@@ -63,12 +64,13 @@ async function execute() {
     '--mount', `type=bind,source=${directory},target=/source,readonly`,
     '--mount', `type=volume,source=${volume},target=/tls`,
     '--entrypoint', 'sh', base, '-c',
-    'cp /source/certificate.pem /tls/certificate.pem && cp /source/private-key.pem /tls/private-key.pem && chown 1000:1000 /tls/* && chmod 600 /tls/*',
+    'cp /source/certificate.pem /tls/certificate.pem && cp /source/private-key.pem /tls/private-key.pem && cp /source/database-password /tls/database-password && chown 1000:1000 /tls/* && chmod 600 /tls/*',
   ]);
 
   const environment = {
     PGHOST: 'host.docker.internal', PGPORT: process.env.PGPORT, PGDATABASE: database,
-    PGUSER: process.env.PGUSER, PGPASSWORD: process.env.PGPASSWORD,
+    PGUSER: process.env.PGUSER, PG_PASSWORD_FILE: '/run/zinesh-tls/database-password',
+    PG_TLS_MODE: 'verify-full', PG_TLS_CA_PATH: '/run/zinesh-tls/certificate.pem',
     AUTH_TRUSTED_ISSUER: 'https://issuer.artifact.test', AUTH_TRUSTED_AUDIENCE: 'zinesh-artifact-smoke',
     AUTH_JWKS_URL: 'https://jwks.artifact.test/keys', AUTH_ALLOWED_ALGORITHM: 'RS256',
     AUTH_CLOCK_SKEW_SECONDS: '30', AUTH_JWKS_CACHE_TTL_MS: '60000', AUTH_JWKS_TIMEOUT_MS: '1000',

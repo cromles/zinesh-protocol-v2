@@ -10,6 +10,7 @@ const config = {
   host: process.env['PGHOST'] ?? 'localhost', port: Number(process.env['PGPORT'] ?? 5432),
   database: process.env['PGDATABASE'] ?? 'zinesh_test', user: process.env['PGUSER'] ?? 'postgres',
   password: process.env['PGPASSWORD'] ?? 'postgres',
+  tls: { mode: 'verify-full' as const, ca: 'Phase C Step 1 test contract; integration follows in Step 2' },
 };
 const policy = (limit: number, windowMs = 60_000, retentionMs = 120_000): RateLimitPolicy =>
   ({ limit, windowMs, retentionMs, storageTimeoutMs: 2_000 });
