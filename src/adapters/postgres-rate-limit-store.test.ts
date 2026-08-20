@@ -1,3 +1,4 @@
+import fs from 'fs';
 import { Pool } from 'pg';
 import { PostgresMigrator } from './postgres-migrator';
 import { PostgresFixedWindowRateLimiter, PostgresRateLimitStore } from './postgres-rate-limit-store';
@@ -6,11 +7,18 @@ import type { RateLimitPolicy } from '../security/rate-limiter';
 
 const enabled = process.env['ZINESH_POSTGRES_TESTS'] === 'true';
 const maybeDescribe = enabled ? describe : describe.skip;
+const testSecret = (name: 'PG_PASSWORD_FILE' | 'PG_TLS_CA_PATH'): string => {
+  if (!enabled) return 'postgres-tests-disabled';
+  const filename = process.env[name];
+  if (!filename) throw new Error(`${name} is required for PostgreSQL integration tests`);
+  return fs.readFileSync(filename, 'utf8');
+};
 const config = {
   host: process.env['PGHOST'] ?? 'localhost', port: Number(process.env['PGPORT'] ?? 5432),
   database: process.env['PGDATABASE'] ?? 'zinesh_test', user: process.env['PGUSER'] ?? 'postgres',
-  password: process.env['PGPASSWORD'] ?? 'postgres',
-  tls: { mode: 'verify-full' as const, ca: 'Phase C Step 1 test contract; integration follows in Step 2' },
+  password: testSecret('PG_PASSWORD_FILE'),
+  tls: { mode: 'verify-full' as const, ca: testSecret('PG_TLS_CA_PATH') },
+  ssl: { ca: testSecret('PG_TLS_CA_PATH'), rejectUnauthorized: true },
 };
 const policy = (limit: number, windowMs = 60_000, retentionMs = 120_000): RateLimitPolicy =>
   ({ limit, windowMs, retentionMs, storageTimeoutMs: 2_000 });

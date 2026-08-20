@@ -19,29 +19,6 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
 
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_DB: zinesh_ci
-          POSTGRES_USER: zinesh_ci
-          POSTGRES_PASSWORD: ci-test-only
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U zinesh_ci -d zinesh_ci"
-          --health-interval 2s
-          --health-timeout 5s
-          --health-retries 20
-
-    env:
-      ZINESH_POSTGRES_TESTS: 'true'
-      PGHOST: 127.0.0.1
-      PGPORT: '5432'
-      PGDATABASE: zinesh_ci
-      PGUSER: zinesh_ci
-      PGPASSWORD: ci-test-only
-
     steps:
       - name: Checkout exact commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -66,9 +43,31 @@ jobs:
       - name: Clean install from lockfile
         run: npm ci
 
-      - name: Verify PostgreSQL readiness
+      - name: Start isolated authenticated-TLS PostgreSQL 16
         shell: bash
-        run: docker exec "${{ job.services.postgres.id }}" pg_isready -U "$PGUSER" -d "$PGDATABASE"
+        run: |
+          node scripts/postgres-tls-test-environment.cjs start \
+            "$RUNNER_TEMP/zinesh-postgres-tls" \
+            "$RUNNER_TEMP/zinesh-postgres-tls-state.json" \
+            "$RUNNER_TEMP/zinesh-postgres-tls.env"
+          cat "$RUNNER_TEMP/zinesh-postgres-tls.env" >> "$GITHUB_ENV"
+
+      - name: Verify authenticated PostgreSQL TLS readiness
+        shell: bash
+        run: |
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const { Pool } = require('pg');
+          const pool = new Pool({
+            host: process.env.PGHOST, port: Number(process.env.PGPORT),
+            database: process.env.PGDATABASE, user: process.env.PGUSER,
+            password: fs.readFileSync(process.env.PG_PASSWORD_FILE, 'utf8'),
+            ssl: { ca: fs.readFileSync(process.env.PG_TLS_CA_PATH, 'utf8'), rejectUnauthorized: true },
+          });
+          pool.query('SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()')
+            .then(({ rows }) => { if (rows[0]?.ssl !== true) throw new Error('PostgreSQL connection is not TLS'); })
+            .finally(() => pool.end());
+          NODE
 
       - name: Full PostgreSQL test suite with exact count gate
         shell: bash
@@ -173,3 +172,7 @@ jobs:
             --output json --file /workspace/zinesh-grype.scan.json
           node scripts/verify-vulnerability-coverage.cjs \
             zinesh-trivy.scan.json zinesh-grype.scan.json zinesh-runtime.metadata.json
+
+      - name: Remove isolated PostgreSQL TLS environment
+        if: always()
+        run: node scripts/postgres-tls-test-environment.cjs stop "$RUNNER_TEMP/zinesh-postgres-tls-state.json"
