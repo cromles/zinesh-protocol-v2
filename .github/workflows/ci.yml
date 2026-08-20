@@ -145,7 +145,10 @@ jobs:
           test "$BUILD_1_DIGEST" = "$BUILD_2_DIGEST"
           node scripts/verify-oci-artifact.cjs zinesh-build-1.oci.tar \
             --sbom-output=zinesh-runtime.sbom.json \
+            --inventory-output=zinesh-runtime.inventory.json \
             --metadata-output=zinesh-runtime.metadata.json
+          node scripts/test-runtime-sbom-parity.cjs \
+            zinesh-build-1.oci.tar zinesh-runtime.sbom.json zinesh-runtime.inventory.json
           echo "RUNTIME_DIGEST=$BUILD_1_DIGEST" >> "$GITHUB_ENV"
 
       - name: Scan OS and production npm inventory
