@@ -3,18 +3,24 @@
   "version": "2.0.0",
   "private": true,
   "description": "Zinesh Protocol V2 — event-sourced escrow kernel",
+  "engines": {
+    "node": "24.16.x"
+  },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "build": "tsc",
+    "build": "node scripts/clean-dist.cjs && tsc",
+    "artifact:smoke": "node scripts/verify-artifact.cjs",
     "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js --runInBand",
     "test:coverage": "node --experimental-vm-modules node_modules/jest/bin/jest.js --runInBand --coverage"
+  },
+  "dependencies": {
+    "pg": "^8.23.0"
   },
   "devDependencies": {
     "@types/jest": "^29.5.14",
     "@types/node": "^22.0.0",
     "@types/pg": "^8.23.1",
     "jest": "^29.7.0",
-    "pg": "^8.23.0",
     "ts-jest": "^29.2.0",
     "typescript": "^5.5.0"
   }
