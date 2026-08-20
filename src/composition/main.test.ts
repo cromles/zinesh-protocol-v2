@@ -6,6 +6,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import {
   ConfigurationError,
   RuntimeUnavailableError,
@@ -38,13 +39,27 @@ import {
 } from '../core/types';
 import { actorIdentity, createTestIngress } from '../security/testing';
 import { CommandHttpsTransport } from '../transport/command-https-transport';
+import { selfSignedTestCertificate } from '../transport/tls-test-certificate';
+
+const POSTGRES_CONFIG_DIRECTORY = fs.mkdtempSync(path.join(os.tmpdir(), 'zinesh-pg-config-'));
+const POSTGRES_PASSWORD = 'secret-must-never-appear';
+const POSTGRES_PASSWORD_PATH = path.join(POSTGRES_CONFIG_DIRECTORY, 'password');
+const POSTGRES_CA_PATH = path.join(POSTGRES_CONFIG_DIRECTORY, 'ca.pem');
+const POSTGRES_CA_CONTENT = selfSignedTestCertificate(
+  new Date(Date.now() - 60_000), new Date(Date.now() + 3_600_000), 'db.example.internal',
+).certificate;
+fs.writeFileSync(POSTGRES_PASSWORD_PATH, `${POSTGRES_PASSWORD}\n`, { mode: 0o600 });
+fs.writeFileSync(POSTGRES_CA_PATH, POSTGRES_CA_CONTENT);
+afterAll(() => fs.rmSync(POSTGRES_CONFIG_DIRECTORY, { recursive: true, force: true }));
 
 const VALID_ENV = {
   PGHOST: 'db.example.internal',
   PGPORT: '5432',
   PGDATABASE: 'zinesh',
   PGUSER: 'zinesh',
-  PGPASSWORD: 'secret-must-never-appear',
+  PG_PASSWORD_FILE: POSTGRES_PASSWORD_PATH,
+  PG_TLS_MODE: 'verify-full',
+  PG_TLS_CA_PATH: POSTGRES_CA_PATH,
   AUTH_TRUSTED_ISSUER: 'https://identity.example.test',
   AUTH_TRUSTED_AUDIENCE: 'zinesh-production',
   AUTH_JWKS_URL: 'https://identity.example.test/.well-known/jwks.json',
@@ -92,18 +107,23 @@ function compositionSource(): string {
 }
 
 describe('loadPostgresConfig', () => {
-  test('reads the five required libpq variables', () => {
+  test('loads the authenticated verify-full contract from runtime files', () => {
     const config = loadPostgresConfig(VALID_ENV);
     expect(config).toEqual({
       host: 'db.example.internal',
       port: 5432,
       database: 'zinesh',
       user: 'zinesh',
-      password: 'secret-must-never-appear',
+      password: POSTGRES_PASSWORD,
+      tls: { mode: 'verify-full', ca: POSTGRES_CA_CONTENT },
     });
+    expect(config).not.toHaveProperty('privateKey');
+    expect(config.tls).not.toHaveProperty('privateKey');
+    expect(VALID_ENV).not.toHaveProperty('PGPASSWORD');
+    expect(VALID_ENV.PG_PASSWORD_FILE).toBe(POSTGRES_PASSWORD_PATH);
   });
 
-  test.each(['PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER', 'PGPASSWORD'] as const)(
+  test.each(['PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER'] as const)(
     'fails fast when %s is missing',
     (name) => {
       const env = { ...VALID_ENV };
@@ -116,60 +136,65 @@ describe('loadPostgresConfig', () => {
         if (!(error instanceof ConfigurationError)) return;
         expect(error.variable).toBe(name);
         expect(error.message).toContain(name);
-        expect(error.message).not.toContain('secret-must-never-appear');
+        expect(error.message).not.toContain(POSTGRES_PASSWORD);
       }
     },
   );
 
-  test.each(['PGHOST', 'PGDATABASE', 'PGUSER'] as const)(
-    'rejects empty %s',
-    (name) => {
+  test('rejects empty host, database and user values', () => {
+    for (const name of ['PGHOST', 'PGDATABASE', 'PGUSER'] as const) {
       expect(() => loadPostgresConfig({ ...VALID_ENV, [name]: '' })).toThrow(
         ConfigurationError,
       );
-    },
-  );
-
-  test('rejects empty PGPASSWORD', () => {
-    expect(() => loadPostgresConfig({ ...VALID_ENV, PGPASSWORD: '' })).toThrow(
-      ConfigurationError,
-    );
-  });
-
-  test('rejects whitespace-only PGPASSWORD without echoing it', () => {
-    try {
-      loadPostgresConfig({ ...VALID_ENV, PGPASSWORD: '   ' });
-      throw new Error('expected ConfigurationError');
-    } catch (error) {
-      expect(error).toBeInstanceOf(ConfigurationError);
-      if (!(error instanceof ConfigurationError)) return;
-      expect(error.variable).toBe('PGPASSWORD');
-      expect(error.message).not.toContain('   ');
-      expect(error.message).not.toContain('secret');
     }
   });
 
-  test('rejects PGPORT trailing junk such as 5432abc', () => {
-    try {
-      loadPostgresConfig({ ...VALID_ENV, PGPORT: '5432abc' });
-      throw new Error('expected ConfigurationError');
-    } catch (error) {
-      expect(error).toBeInstanceOf(ConfigurationError);
-      if (!(error instanceof ConfigurationError)) return;
-      expect(error.variable).toBe('PGPORT');
-      expect(error.message).toContain('PGPORT');
-      expect(error.message).not.toContain('5432abc');
-      expect(error.message).not.toContain(VALID_ENV.PGPASSWORD);
+  test('rejects missing, non-regular, empty and malformed password files without disclosure', () => {
+    const directory = path.join(POSTGRES_CONFIG_DIRECTORY, 'invalid-password-directory');
+    fs.mkdirSync(directory);
+    const cases: ReadonlyArray<readonly [string, string | undefined]> = [
+      ['missing', undefined], ['empty', ''], ['whitespace', '   '], ['NUL', 'secret\0value'],
+      ['multiple-lines', 'one\ntwo\n'], ['extra-newline', 'one\n\n'],
+    ];
+    expect(() => loadPostgresConfig({ ...VALID_ENV, PG_PASSWORD_FILE: directory })).toThrow(ConfigurationError);
+    for (const [label, contents] of cases) {
+      const filename = path.join(POSTGRES_CONFIG_DIRECTORY, `invalid-password-${label}`);
+      if (contents !== undefined) fs.writeFileSync(filename, contents);
+      expect(() => loadPostgresConfig({ ...VALID_ENV, PG_PASSWORD_FILE: filename })).toThrow(ConfigurationError);
+      try { loadPostgresConfig({ ...VALID_ENV, PG_PASSWORD_FILE: filename }); } catch (error) {
+        if (contents !== undefined && contents !== '') {
+          expect(String(error)).not.toContain(contents);
+          expect(JSON.stringify(error)).not.toContain(contents);
+        }
+      }
     }
   });
 
-  test('rejects PGPORT 0 and 65536', () => {
-    expect(() => loadPostgresConfig({ ...VALID_ENV, PGPORT: '0' })).toThrow(
-      ConfigurationError,
-    );
-    expect(() => loadPostgresConfig({ ...VALID_ENV, PGPORT: '65536' })).toThrow(
-      ConfigurationError,
-    );
+  test('fails fast when password file, TLS mode or CA path is missing', () => {
+    for (const name of ['PG_PASSWORD_FILE', 'PG_TLS_MODE', 'PG_TLS_CA_PATH'] as const) {
+      const env = { ...VALID_ENV };
+      delete env[name];
+      expect(() => loadPostgresConfig(env)).toThrow(ConfigurationError);
+    }
+  });
+
+  test('rejects PGPASSWORD even when a valid password file is present', () => {
+    expect(() => loadPostgresConfig({ ...VALID_ENV, PGPASSWORD: POSTGRES_PASSWORD })).toThrow(ConfigurationError);
+  });
+
+  test('rejects malformed and out-of-range PGPORT values without echoing input', () => {
+    for (const port of ['5432abc', '0', '65536']) {
+      try {
+        loadPostgresConfig({ ...VALID_ENV, PGPORT: port });
+        throw new Error('expected ConfigurationError');
+      } catch (error) {
+        expect(error).toBeInstanceOf(ConfigurationError);
+        if (!(error instanceof ConfigurationError)) continue;
+        expect(error.variable).toBe('PGPORT');
+        expect(error.message).not.toContain(port);
+        expect(error.message).not.toContain(POSTGRES_PASSWORD);
+      }
+    }
   });
 
   test('accepts PGPORT 1 and 65535', () => {
@@ -179,6 +204,48 @@ describe('loadPostgresConfig', () => {
 
   test('does not apply production defaults', () => {
     expect(() => loadPostgresConfig({})).toThrow(ConfigurationError);
+  });
+
+  test('rejects insecure, boolean, empty and unknown TLS modes', () => {
+    for (const mode of ['disable', 'require', 'prefer', 'verify-ca', '', 'true', 'false', 'unknown']) {
+      expect(() => loadPostgresConfig({ ...VALID_ENV, PG_TLS_MODE: mode })).toThrow(ConfigurationError);
+    }
+  });
+
+  test('rejects missing, empty and malformed CA files without exposing CA contents', () => {
+    const empty = path.join(POSTGRES_CONFIG_DIRECTORY, 'empty-ca.pem');
+    const malformed = path.join(POSTGRES_CONFIG_DIRECTORY, 'malformed-ca.pem');
+    const malformedContent = 'not-a-ca-secret-content';
+    fs.writeFileSync(empty, ''); fs.writeFileSync(malformed, malformedContent);
+    const directory = path.join(POSTGRES_CONFIG_DIRECTORY, 'ca-directory'); fs.mkdirSync(directory);
+    for (const filename of [path.join(POSTGRES_CONFIG_DIRECTORY, 'missing-ca.pem'), directory, empty, malformed]) {
+      try {
+        loadPostgresConfig({ ...VALID_ENV, PG_TLS_CA_PATH: filename });
+        throw new Error('expected ConfigurationError');
+      } catch (error) {
+        expect(error).toBeInstanceOf(ConfigurationError);
+        expect(String(error)).not.toContain(malformedContent);
+        expect(JSON.stringify(error)).not.toContain(malformedContent);
+      }
+    }
+  });
+
+  test('rejects bypass options and never logs password or CA contents', async () => {
+    for (const bypass of [
+      { PGSSLMODE: 'disable' }, { PG_TLS_REJECT_UNAUTHORIZED: 'false' },
+      { PG_TLS_SERVER_NAME: 'attacker.example' }, { NODE_TLS_REJECT_UNAUTHORIZED: '0' },
+    ]) expect(() => loadPostgresConfig({ ...VALID_ENV, ...bypass })).toThrow(ConfigurationError);
+    const password = path.join(POSTGRES_CONFIG_DIRECTORY, 'logged-password');
+    fs.writeFileSync(password, `${POSTGRES_PASSWORD}\nsecond-line`);
+    const output: string[] = [];
+    const stderr = jest.spyOn(process.stderr, 'write').mockImplementation((value) => {
+      output.push(String(value)); return true;
+    });
+    try {
+      await main({ ...VALID_ENV, PG_PASSWORD_FILE: password }, () => undefined);
+    } finally { stderr.mockRestore(); }
+    expect(output.join('')).not.toContain(POSTGRES_PASSWORD);
+    expect(output.join('')).not.toContain(POSTGRES_CA_CONTENT);
   });
 });
 
@@ -432,6 +499,7 @@ describe('composeRuntime wiring', () => {
       database: 'unused',
       user: 'unused',
       password: 'unused',
+      tls: { mode: 'verify-full', ca: POSTGRES_CA_CONTENT },
     });
     try {
       expect(runtime.persistence).toBeInstanceOf(PostgresPersistenceAdapter);

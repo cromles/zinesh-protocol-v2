@@ -33,6 +33,10 @@ export interface PostgresConfig {
   readonly database: string;
   readonly user: string;
   readonly password: string;
+  readonly tls: {
+    readonly mode: 'verify-full';
+    readonly ca: string;
+  };
 }
 
 export class PostgresPersistenceAdapter implements PersistenceAdapter {
@@ -51,6 +55,10 @@ export class PostgresPersistenceAdapter implements PersistenceAdapter {
       database: config.database,
       user:     config.user,
       password: config.password,
+      ssl: {
+        ca: config.tls.ca,
+        rejectUnauthorized: true,
+      },
     });
     this.eventStore    = new PostgresEventStore(this.pool);
     this.snapshotStore = new PostgresSnapshotStore(this.pool);

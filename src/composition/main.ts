@@ -32,6 +32,8 @@ import type { CommandHttpConfig } from '../transport/command-http-transport';
 import { CommandHttpsTransport } from '../transport/command-https-transport';
 import type { CommandHttpsConfig } from '../transport/command-https-transport';
 import { isIP } from 'net';
+import { X509Certificate } from 'crypto';
+import { lstatSync, readFileSync } from 'fs';
 import { PostgresFixedWindowRateLimiter } from '../adapters/postgres-rate-limit-store';
 import { allowAllRateLimiter } from '../security/rate-limiter';
 import type { RateLimiter, RateLimitPolicy } from '../security/rate-limiter';
@@ -46,7 +48,11 @@ import type {
 /** Operational shutdown bound. Not a domain rule. Not configurable. */
 export const SHUTDOWN_TIMEOUT_MS = 10_000;
 
-const REQUIRED_VARS = ['PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER', 'PGPASSWORD'] as const;
+const REQUIRED_VARS = ['PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER'] as const;
+const FORBIDDEN_POSTGRES_VARS = [
+  'PGPASSWORD', 'PGSSLMODE', 'PG_TLS_REJECT_UNAUTHORIZED', 'PG_TLS_SERVER_NAME',
+  'NODE_TLS_REJECT_UNAUTHORIZED',
+] as const;
 
 export class ConfigurationError extends Error {
   readonly variable: string;
@@ -68,13 +74,21 @@ export class RuntimeUnavailableError extends Error {
 export type EnvMap = NodeJS.ProcessEnv;
 
 export function loadPostgresConfig(env: EnvMap): PostgresConfig {
+  for (const name of FORBIDDEN_POSTGRES_VARS) {
+    if (env[name] !== undefined) throw new ConfigurationError(name, 'is not accepted');
+  }
   const host = requiredNonEmpty(env, 'PGHOST');
   const port = requiredPort(env, 'PGPORT');
   const database = requiredNonEmpty(env, 'PGDATABASE');
   const user = requiredNonEmpty(env, 'PGUSER');
-  const password = requiredPassword(env, 'PGPASSWORD');
+  const passwordPath = requiredPostgresValue(env, 'PG_PASSWORD_FILE');
+  const password = readPasswordFile(passwordPath);
+  const mode = requiredPostgresValue(env, 'PG_TLS_MODE');
+  if (mode !== 'verify-full') throw new ConfigurationError('PG_TLS_MODE', 'must be verify-full');
+  const caPath = requiredPostgresValue(env, 'PG_TLS_CA_PATH');
+  const ca = readCaFile(caPath);
 
-  return { host, port, database, user, password };
+  return { host, port, database, user, password, tls: { mode: 'verify-full', ca } };
 }
 
 export function loadAuthenticationConfig(env: EnvMap): JwtAuthenticationConfig {
@@ -250,15 +264,53 @@ function requiredNonEmpty(env: EnvMap, name: 'PGHOST' | 'PGDATABASE' | 'PGUSER')
   return value;
 }
 
-function requiredPassword(env: EnvMap, name: 'PGPASSWORD'): string {
-  const value = readRaw(env, name);
+function requiredPostgresValue(
+  env: EnvMap,
+  name: 'PG_PASSWORD_FILE' | 'PG_TLS_MODE' | 'PG_TLS_CA_PATH',
+): string {
+  const value = env[name];
   if (value === undefined) {
     throw new ConfigurationError(name, 'is required');
   }
-  if (value === '' || value.trim() === '') {
-    throw new ConfigurationError(name, 'must not be empty');
+  if (value.trim() === '') {
+    throw new ConfigurationError(name, 'must be a non-empty string');
   }
   return value;
+}
+
+function readPasswordFile(filename: string): string {
+  let content: string;
+  try {
+    if (!lstatSync(filename).isFile()) throw new Error('not a regular file');
+    content = readFileSync(filename, 'utf8');
+  } catch {
+    throw new ConfigurationError('PG_PASSWORD_FILE', 'must reference a readable regular file');
+  }
+  if (content.endsWith('\r\n')) content = content.slice(0, -2);
+  else if (content.endsWith('\n')) content = content.slice(0, -1);
+  if (content === '' || content.trim() === '' || content.includes('\0') || /[\r\n]/.test(content)) {
+    throw new ConfigurationError('PG_PASSWORD_FILE', 'contains an invalid secret');
+  }
+  return content;
+}
+
+function readCaFile(filename: string): string {
+  let content: string;
+  try {
+    if (!lstatSync(filename).isFile()) throw new Error('not a regular file');
+    content = readFileSync(filename, 'utf8');
+  } catch {
+    throw new ConfigurationError('PG_TLS_CA_PATH', 'must reference a readable regular file');
+  }
+  const blocks = content.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g) ?? [];
+  const remainder = content.replace(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g, '').trim();
+  try {
+    if (blocks.length === 0 || remainder !== '') throw new Error('invalid PEM');
+    for (const block of blocks) new X509Certificate(block);
+  } catch {
+    throw new ConfigurationError('PG_TLS_CA_PATH', 'must contain valid PEM certificates');
+  }
+  return content;
 }
 
 function requiredPort(env: EnvMap, name: 'PGPORT'): number {

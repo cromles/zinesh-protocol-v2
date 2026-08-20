@@ -24,10 +24,18 @@ import type { SecurityEvent } from '../security/security-observability';
 
 const enabled = process.env['ZINESH_POSTGRES_TESTS'] === 'true';
 const maybeDescribe = enabled ? describe : describe.skip;
+const testSecret = (name: 'PG_PASSWORD_FILE' | 'PG_TLS_CA_PATH'): string => {
+  if (!enabled) return 'postgres-tests-disabled';
+  const filename = process.env[name];
+  if (!filename) throw new Error(`${name} is required for PostgreSQL integration tests`);
+  return fs.readFileSync(filename, 'utf8');
+};
 const config = {
   host: process.env['PGHOST'] ?? 'localhost', port: Number(process.env['PGPORT'] ?? 5432),
   database: process.env['PGDATABASE'] ?? 'zinesh_test', user: process.env['PGUSER'] ?? 'postgres',
-  password: process.env['PGPASSWORD'] ?? 'postgres',
+  password: testSecret('PG_PASSWORD_FILE'),
+  tls: { mode: 'verify-full' as const, ca: testSecret('PG_TLS_CA_PATH') },
+  ssl: { ca: testSecret('PG_TLS_CA_PATH'), rejectUnauthorized: true },
 };
 const ACTOR = makeActorId('authority-actor');
 const ACTOR_2 = makeActorId('authority-actor-2');

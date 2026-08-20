@@ -10,7 +10,8 @@
  * To run:
  *   ZINESH_POSTGRES_TESTS=true \
  *   PGHOST=localhost PGPORT=5432 \
- *   PGDATABASE=zinesh_test PGUSER=postgres PGPASSWORD=postgres \
+ *   PGDATABASE=zinesh_test PGUSER=postgres PG_PASSWORD_FILE=/run/secrets/postgres-password \
+ *   PG_TLS_CA_PATH=/run/secrets/postgres-ca.pem \
  *   npm test -- postgres-persistence
  *
  * Coverage:
@@ -80,6 +81,13 @@ import { cellKernel } from '../kernel';
 
 const POSTGRES_ENABLED = process.env['ZINESH_POSTGRES_TESTS'] === 'true';
 
+function testSecret(name: 'PG_PASSWORD_FILE' | 'PG_TLS_CA_PATH'): string {
+  if (!POSTGRES_ENABLED) return 'postgres-tests-disabled';
+  const filename = process.env[name];
+  if (!filename) throw new Error(`${name} is required for PostgreSQL integration tests`);
+  return fs.readFileSync(filename, 'utf8');
+}
+
 function maybeDescribe(name: string, fn: () => void): void {
   if (POSTGRES_ENABLED) {
     describe(name, fn);
@@ -97,7 +105,8 @@ const pgConfig: PostgresConfig = {
   port:     parseInt(process.env['PGPORT'] ?? '5432', 10),
   database: process.env['PGDATABASE'] ?? 'zinesh_test',
   user:     process.env['PGUSER']     ?? 'postgres',
-  password: process.env['PGPASSWORD'] ?? 'postgres',
+  password: testSecret('PG_PASSWORD_FILE'),
+  tls: { mode: 'verify-full', ca: testSecret('PG_TLS_CA_PATH') },
 };
 
 // ---------------------------------------------------------------------------
@@ -114,6 +123,62 @@ async function truncateTables(pool: Pool): Promise<void> {
   // Only allowed in tests — not in production code.
   // events is append-only in production; we truncate here only to reset test state.
   await pool.query('TRUNCATE TABLE events, snapshots, command_executions RESTART IDENTITY CASCADE');
+}
+
+async function expectTlsConnectionFailure(config: PostgresConfig, expected: RegExp): Promise<void> {
+  const candidate = new PostgresPersistenceAdapter(config);
+  try {
+    let failure: unknown;
+    try { await candidate.connect(); } catch (error) { failure = error; }
+    expect(failure).toBeDefined();
+    const message = String(failure);
+    expect(message).toMatch(expected);
+    expect(message).not.toContain(pgConfig.password);
+  } finally {
+    await candidate.disconnect();
+  }
+}
+
+async function verifyAuthenticatedTlsBoundary(): Promise<void> {
+  const required = (name: string): string => {
+    const value = process.env[name];
+    if (!value) throw new Error(`${name} is required for PostgreSQL TLS verification`);
+    return value;
+  };
+  const wrongCa = fs.readFileSync(required('PG_TLS_WRONG_CA_PATH'), 'utf8');
+  await expectTlsConnectionFailure(
+    { ...pgConfig, tls: { mode: 'verify-full', ca: wrongCa } }, /certificate|issuer|self.signed/i,
+  );
+  await expectTlsConnectionFailure(
+    { ...pgConfig, port: Number(required('PG_TLS_HOSTNAME_MISMATCH_PORT')) }, /hostname|altnames/i,
+  );
+  await expectTlsConnectionFailure(
+    { ...pgConfig, port: Number(required('PG_TLS_EXPIRED_PORT')) }, /expired/i,
+  );
+  await expectTlsConnectionFailure(
+    { ...pgConfig, port: Number(required('PG_TLS_INVALID_CHAIN_PORT')) }, /certificate|issuer|verify/i,
+  );
+
+  const plaintext = new Pool({
+    host: pgConfig.host, port: pgConfig.port, database: pgConfig.database,
+    user: pgConfig.user, password: pgConfig.password, ssl: false,
+  });
+  try {
+    await expect(plaintext.query('SELECT 1')).rejects.toThrow(/no pg_hba.conf entry|SSL off|no encryption|rejects connection/i);
+  } finally {
+    await plaintext.end();
+  }
+
+  const bypass = new PostgresPersistenceAdapter({
+    ...pgConfig,
+    tls: { mode: 'verify-full', ca: wrongCa },
+    ssl: { rejectUnauthorized: false },
+  } as unknown as PostgresConfig);
+  try {
+    await expect(bypass.connect()).rejects.toThrow(/certificate|issuer|self.signed/i);
+  } finally {
+    await bypass.disconnect();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -194,6 +259,7 @@ maybeDescribe('PostgreSQL Persistence', () => {
   // -------------------------------------------------------------------------
 
   test('1. insert one event → retrieve it', async () => {
+    await verifyAuthenticatedTlsBoundary();
     const CELL = freshCellId();
     const event = makeEvent(CELL, V1, T1);
     const result = await adapter.eventStore.append(CELL, [event]);

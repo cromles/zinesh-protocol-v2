@@ -13,7 +13,8 @@ const { PostgresMigrator } = require('../dist/adapters/postgres-migrator');
 
 const image = process.argv[2];
 assert.ok(image, 'usage: node scripts/verify-container-startup.cjs <image>');
-for (const name of ['PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER', 'PGPASSWORD']) {
+for (const name of ['PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER', 'PG_PASSWORD_FILE', 'PG_TLS_CA_PATH',
+  'PG_TLS_DOCKER_NETWORK', 'PG_TLS_DOCKER_HOST']) {
   assert.ok(process.env[name], `${name} is required for container startup smoke`);
 }
 
@@ -56,6 +57,8 @@ async function execute() {
   );
   writeFileSync(join(directory, 'certificate.pem'), tls.certificate, { mode: 0o600 });
   writeFileSync(join(directory, 'private-key.pem'), tls.privateKey, { mode: 0o600 });
+  writeFileSync(join(directory, 'database-password'), readFileSync(process.env.PG_PASSWORD_FILE), { mode: 0o600 });
+  writeFileSync(join(directory, 'database-ca.pem'), readFileSync(process.env.PG_TLS_CA_PATH), { mode: 0o600 });
 
   run(['volume', 'create', volume]);
   run([
@@ -63,12 +66,13 @@ async function execute() {
     '--mount', `type=bind,source=${directory},target=/source,readonly`,
     '--mount', `type=volume,source=${volume},target=/tls`,
     '--entrypoint', 'sh', base, '-c',
-    'cp /source/certificate.pem /tls/certificate.pem && cp /source/private-key.pem /tls/private-key.pem && chown 1000:1000 /tls/* && chmod 600 /tls/*',
+    'cp /source/certificate.pem /tls/certificate.pem && cp /source/private-key.pem /tls/private-key.pem && cp /source/database-password /tls/database-password && cp /source/database-ca.pem /tls/database-ca.pem && chown 1000:1000 /tls/* && chmod 600 /tls/*',
   ]);
 
   const environment = {
-    PGHOST: 'host.docker.internal', PGPORT: process.env.PGPORT, PGDATABASE: database,
-    PGUSER: process.env.PGUSER, PGPASSWORD: process.env.PGPASSWORD,
+    PGHOST: process.env.PG_TLS_DOCKER_HOST, PGPORT: '5432', PGDATABASE: database,
+    PGUSER: process.env.PGUSER, PG_PASSWORD_FILE: '/run/zinesh-tls/database-password',
+    PG_TLS_MODE: 'verify-full', PG_TLS_CA_PATH: '/run/zinesh-tls/database-ca.pem',
     AUTH_TRUSTED_ISSUER: 'https://issuer.artifact.test', AUTH_TRUSTED_AUDIENCE: 'zinesh-artifact-smoke',
     AUTH_JWKS_URL: 'https://jwks.artifact.test/keys', AUTH_ALLOWED_ALGORITHM: 'RS256',
     AUTH_CLOCK_SKEW_SECONDS: '30', AUTH_JWKS_CACHE_TTL_MS: '60000', AUTH_JWKS_TIMEOUT_MS: '1000',
@@ -90,7 +94,7 @@ async function execute() {
   };
   const args = [
     'run', '--detach', '--name', container, '--read-only', '--cap-drop=ALL',
-    '--security-opt=no-new-privileges:true', '--add-host=host.docker.internal:host-gateway',
+    '--security-opt=no-new-privileges:true', '--network', process.env.PG_TLS_DOCKER_NETWORK,
     '--publish', '127.0.0.1::8443',
     '--mount', `type=volume,source=${volume},target=/run/zinesh-tls,readonly`,
   ];
@@ -122,7 +126,8 @@ async function execute() {
 function postgresConfig(databaseName) {
   return {
     host: process.env.PGHOST, port: Number(process.env.PGPORT), database: databaseName,
-    user: process.env.PGUSER, password: process.env.PGPASSWORD,
+    user: process.env.PGUSER, password: readFileSync(process.env.PG_PASSWORD_FILE, 'utf8'),
+    ssl: { ca: readFileSync(process.env.PG_TLS_CA_PATH, 'utf8'), rejectUnauthorized: true },
   };
 }
 
