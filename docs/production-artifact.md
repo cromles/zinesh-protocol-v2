@@ -17,12 +17,18 @@ The reproducibility target is the runtime image subject manifest digest. SBOM an
 
 - Numeric user and group: `1000:1000`
 - Working directory: `/app`
-- Entrypoint: `node dist/composition/main.js`
+- Default entrypoint: `node dist/composition/main.js` (serving; verifies schema; never migrates)
+- One-shot schema apply: override the entrypoint to `node dist/composition/migrate.js`
 - Stop signal: `SIGTERM`
 - Writable application directories: none
 - Logs: JSON lines on stdout/stderr
 - TLS certificate and private key: read-only runtime mounts, never image content
 - PostgreSQL password and CA: read-only runtime mounts, never image content. See [production runtime contract](production-runtime.md).
+
+Schema apply must succeed on this artifact before serving replicas of the same
+image are treated as ready. Serving does not run migrations. Schema version
+equality is exact. There are no down migrations. Failed apply rolls back its
+transaction. Backup and restore are not defined here.
 
 The private key must be a regular file owned/readable by the runtime identity with no group or world permission bits. The runtime is verified with a read-only root filesystem, all Linux capabilities dropped, and `no-new-privileges`.
 

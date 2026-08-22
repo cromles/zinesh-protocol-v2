@@ -74,7 +74,7 @@ jobs:
         run: |
           set -o pipefail
           npm test 2>&1 | tee test-output.log
-          grep -F "Tests:       340 passed, 340 total" test-output.log
+          grep -F "Tests:       349 passed, 349 total" test-output.log
           ! grep -E "Tests:.*(skipped|failed|pending)" test-output.log
 
       - name: Typecheck

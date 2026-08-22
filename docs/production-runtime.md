@@ -100,7 +100,37 @@ include schema version, host, path, pool state, driver errors, or telemetry.
 `beginShutdown()` returns `503 {"error":{"code":"RUNTIME_UNAVAILABLE"}}`.
 Liveness stays `200` until the process exits.
 
+## Schema apply ownership
+
+Schema apply is a **one-shot command on the same production artifact**. It is not
+the serving process.
+
+| Command | Role |
+|---|---|
+| `node dist/composition/migrate.js` | Apply schema, verify expected version, exit |
+| `node dist/composition/main.js` | Serve commands. Verify schema only. Never migrate. |
+
+Release order:
+
+1. Run the schema apply job with the new image and the same PostgreSQL TLS/secret
+   contract (`PG_PASSWORD_FILE`, `PG_TLS_CA_PATH`, `PG_TLS_MODE=verify-full`).
+2. The job must exit `0`. Failure is opaque (`Invalid configuration: ...` or
+   `Persistence startup failed`).
+3. Only then start or replace serving replicas of that image.
+
+Serving replicas call `verifyExpectedVersion()` at startup and on `/ready`.
+Schema version equality is exact: this image requires `{1,2,3,4}`. A newer or
+older schema is not ready. There is no mixed-version compatibility window.
+
+Concurrent apply jobs are serialized by the existing PostgreSQL advisory lock.
+A failed apply rolls back its transaction. There are **no down migrations**.
+Release rollback is a previous image plus an operator backup restore, which is
+not part of this contract.
+
+The apply command does not create HTTPS, listen, initialize JWT, or serve
+`/live` or `/ready`.
+
 ## Out of scope
 
-Migrations, backup, registry, signing, deployment, and payment integration
-are not part of this contract.
+Backup, restore, registry, signing, deployment automation, mixed-version
+rollouts, and payment integration are not part of this contract.
