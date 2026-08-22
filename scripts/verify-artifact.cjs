@@ -8,9 +8,11 @@ const { spawnSync } = require('node:child_process');
 const repositoryRoot = join(__dirname, '..');
 const distributionRoot = join(repositoryRoot, 'dist');
 const entrypoint = join(distributionRoot, 'composition', 'main.js');
+const migrateEntrypoint = join(distributionRoot, 'composition', 'migrate.js');
 const packageJson = JSON.parse(readFileSync(join(repositoryRoot, 'package.json'), 'utf8'));
 
 assert.equal(existsSync(entrypoint), true, 'compiled production entrypoint is missing');
+assert.equal(existsSync(migrateEntrypoint), true, 'compiled production schema-apply command is missing');
 assert.equal(typeof packageJson.dependencies?.pg, 'string', 'pg must be a production dependency');
 require.resolve('pg', { paths: [repositoryRoot] });
 
@@ -36,6 +38,14 @@ assert.equal(startup.status, 1, `entrypoint did not fail closed: ${startup.error
 assert.match(startup.stderr, /^Invalid configuration: PGHOST is required\r?\n$/,
   'entrypoint did not report the expected opaque configuration failure');
 assert.equal(startup.stdout, '', 'entrypoint emitted unexpected stdout during fail-closed startup');
+
+const migrateStartup = spawnSync(process.execPath, [migrateEntrypoint], {
+  cwd: repositoryRoot, env: environment, encoding: 'utf8', timeout: 10_000,
+});
+assert.equal(migrateStartup.status, 1, `schema-apply command did not fail closed: ${migrateStartup.error?.message ?? migrateStartup.stderr}`);
+assert.match(migrateStartup.stderr, /^Invalid configuration: PGHOST is required\r?\n$/,
+  'schema-apply command did not report the expected opaque configuration failure');
+assert.equal(migrateStartup.stdout, '', 'schema-apply command emitted unexpected stdout during fail-closed startup');
 
 process.stdout.write(`Artifact smoke PASS (${artifactFiles.length} files)\n`);
 

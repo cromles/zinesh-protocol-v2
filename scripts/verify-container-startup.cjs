@@ -9,7 +9,6 @@ const { spawnSync } = require('node:child_process');
 const Module = require('node:module');
 const ts = require('typescript');
 const { Pool } = require('pg');
-const { PostgresMigrator } = require('../dist/adapters/postgres-migrator');
 
 const image = process.argv[2];
 assert.ok(image, 'usage: node scripts/verify-container-startup.cjs <image>');
@@ -26,6 +25,7 @@ const volume = `zinesh-artifact-tls-${suffix}`;
 const directory = mkdtempSync(join(tmpdir(), 'zinesh-artifact-tls-'));
 const base = 'node:24.18.1-alpine3.23@sha256:ba63d8e0b5d4cbc6db9da12ea77ddb35a4783ad653a092ef115cc383526d4369';
 let createdDatabase = false;
+let unmigratedDatabase = '';
 
 void execute().catch(async (error) => {
   await cleanup();
@@ -40,15 +40,6 @@ async function execute() {
     createdDatabase = true;
   } finally {
     await admin.end();
-  }
-
-  const smokePool = new Pool(postgresConfig(database));
-  try {
-    const migrator = new PostgresMigrator(smokePool);
-    await migrator.migrate();
-    await migrator.verifyExpectedVersion();
-  } finally {
-    await smokePool.end();
   }
 
   const fixture = loadTlsFixture();
@@ -69,6 +60,22 @@ async function execute() {
     '--entrypoint', 'sh', base, '-c',
     'cp /source/certificate.pem /tls/certificate.pem && cp /source/private-key.pem /tls/private-key.pem && cp /source/database-password /tls/database-password && cp /source/database-ca.pem /tls/database-ca.pem && chown 1000:1000 /tls/* && chmod 600 /tls/database-password /tls/private-key.pem && chmod 644 /tls/database-ca.pem /tls/certificate.pem',
   ]);
+
+  const firstApply = runImageMigrate(database);
+  assert.equal(firstApply.status, 0, `in-image schema apply failed: ${firstApply.stderr}`);
+  assert.equal(firstApply.stdout, '');
+  assert.equal(firstApply.stderr, '');
+  const secondApply = runImageMigrate(database);
+  assert.equal(secondApply.status, 0, `idempotent in-image schema apply failed: ${secondApply.stderr}`);
+  const smokePool = new Pool(postgresConfig(database));
+  try {
+    assert.deepEqual(
+      (await smokePool.query('SELECT version FROM schema_migrations ORDER BY version')).rows,
+      [{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }],
+    );
+  } finally {
+    await smokePool.end();
+  }
 
   const environment = {
     PGHOST: process.env.PG_TLS_DOCKER_HOST, PGPORT: '5432', PGDATABASE: database,
@@ -193,6 +200,32 @@ async function execute() {
     assert.match(denied.stderr, /^Invalid configuration: PG_PASSWORD_FILE /);
     assert.equal(denied.stdout, '');
     assert.equal(denied.stderr.includes(password), false, 'password leaked in permission-denial logs');
+
+    unmigratedDatabase = `zinesh_unmigrated_${process.pid}_${Date.now()}`;
+    const adminUnmigrated = new Pool(postgresConfig(process.env.PGDATABASE));
+    try {
+      await adminUnmigrated.query(`CREATE DATABASE ${quoteIdentifier(unmigratedDatabase)}`);
+    } finally {
+      await adminUnmigrated.end();
+    }
+    run([
+      'run', '--rm', '--mount', `type=volume,source=${volume},target=/tls`,
+      '--entrypoint', 'sh', base, '-c', 'chmod 600 /tls/database-password',
+    ]);
+    const unmigrated = spawnSync('docker', [
+      'run', '--name', `${container}-unmigrated`, '--read-only', '--cap-drop=ALL',
+      '--security-opt=no-new-privileges:true', '--network', process.env.PG_TLS_DOCKER_NETWORK,
+      '--mount', `type=volume,source=${volume},target=/run/zinesh-tls,readonly`,
+      ...Object.entries({ ...environment, PGDATABASE: unmigratedDatabase })
+        .flatMap(([name, value]) => ['--env', `${name}=${value}`]),
+      image,
+    ], { encoding: 'utf8', timeout: 20_000 });
+    spawnSync('docker', ['rm', '-f', `${container}-unmigrated`], { encoding: 'utf8' });
+    assert.equal(unmigrated.status, 1, `unmigrated serving must fail closed: ${unmigrated.stderr}`);
+    assert.match(unmigrated.stderr, /^Persistence startup failed\r?\n$/);
+    assert.equal(unmigrated.stdout, '');
+    assert.equal(unmigrated.stderr.includes(password), false, 'password leaked in unmigrated serving logs');
+
     process.stdout.write('Container startup and SIGTERM smoke PASS\n');
   } finally {
     await cleanup();
@@ -272,14 +305,37 @@ function httpsPostCommands(port) {
   }));
 }
 
+function runImageMigrate(databaseName) {
+  const migrateEnv = {
+    PGHOST: process.env.PG_TLS_DOCKER_HOST, PGPORT: '5432', PGDATABASE: databaseName,
+    PGUSER: process.env.PGUSER, PG_PASSWORD_FILE: '/run/zinesh-tls/database-password',
+    PG_TLS_MODE: 'verify-full', PG_TLS_CA_PATH: '/run/zinesh-tls/database-ca.pem',
+  };
+  return spawnSync('docker', [
+    'run', '--rm', '--name', `${container}-migrate`,
+    '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges:true',
+    '--network', process.env.PG_TLS_DOCKER_NETWORK,
+    '--mount', `type=volume,source=${volume},target=/run/zinesh-tls,readonly`,
+    ...Object.entries(migrateEnv).flatMap(([name, value]) => ['--env', `${name}=${value}`]),
+    '--entrypoint', 'node', image, 'dist/composition/migrate.js',
+  ], { encoding: 'utf8', timeout: 30_000 });
+}
+
 function delay(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 async function cleanup() {
   spawnSync('docker', ['rm', '-f', container], { encoding: 'utf8' });
   spawnSync('docker', ['rm', '-f', hang], { encoding: 'utf8' });
   spawnSync('docker', ['rm', '-f', `${container}-world-readable`], { encoding: 'utf8' });
+  spawnSync('docker', ['rm', '-f', `${container}-migrate`], { encoding: 'utf8' });
+  spawnSync('docker', ['rm', '-f', `${container}-unmigrated`], { encoding: 'utf8' });
   spawnSync('docker', ['volume', 'rm', '-f', volume], { encoding: 'utf8' });
   rmSync(directory, { recursive: true, force: true });
   if (createdDatabase) { createdDatabase = false; await dropDatabase(database); }
+  if (unmigratedDatabase) {
+    const name = unmigratedDatabase;
+    unmigratedDatabase = '';
+    await dropDatabase(name);
+  }
 }
 function run(args) {
   const result = spawnSync('docker', args, { encoding: 'utf8' });

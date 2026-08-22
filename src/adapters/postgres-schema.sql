@@ -1,5 +1,10 @@
 -- ZINESH PROTOCOL V2 — PostgreSQL Schema
 --
+-- TEST FIXTURE — NOT PRODUCTION SCHEMA SOURCE
+-- Production schema is applied only by PostgresMigrator (versions 1..4)
+-- via `node dist/composition/migrate.js`. This file remains a historical
+-- core-event fixture for tests. Do not treat it as the operator contract.
+--
 -- Constitution rules enforced here:
 --   - events is APPEND-ONLY (INSERT + SELECT only; no UPDATE, DELETE, TRUNCATE)
 --   - event versions are caller-supplied (NO SERIAL, NO IDENTITY, NO sequence)

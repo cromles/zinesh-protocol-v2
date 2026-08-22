@@ -633,6 +633,12 @@ describe('constitution', () => {
     expect(src).not.toMatch(/eventFolder/);
     expect(src).not.toMatch(/DEADLINE_VIOLATION/);
     expect(src).not.toMatch(/\.migrate\(/);
+    const connectAt = src.indexOf('await runtime.persistence.connect()');
+    const verifyAt = src.indexOf('await runtime.persistence.migrator.verifyExpectedVersion()');
+    const listenAt = src.indexOf('await transport.listen()');
+    expect(connectAt).toBeGreaterThan(-1);
+    expect(verifyAt).toBeGreaterThan(connectAt);
+    expect(listenAt).toBeGreaterThan(verifyAt);
     expect(src).toMatch(/PostgresPersistenceAdapter/);
     expect(src).toMatch(/cellKernel/);
     expect(src).toMatch(/systemClock/);
