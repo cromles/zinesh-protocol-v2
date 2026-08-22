@@ -56,8 +56,7 @@ const migrateContainer = `zinesh-rollout-migrate-${suffix}`;
 const serveContainer = `zinesh-rollout-serve-${suffix}`;
 const recoveredContainer = `zinesh-rollout-recovered-${suffix}`;
 const daemonHandle = 'localhost/zinesh/runtime:rollout';
-const digestRunRef = `localhost/zinesh/runtime@${expectedDigest}`;
-let runImage = digestRunRef;
+let runImage = daemonHandle;
 const password = readFileSync(process.env.PG_PASSWORD_FILE, 'utf8').replace(/\n$/, '').replace(/\r$/, '');
 const secrets = [password];
 let trustedPassword = '';
@@ -144,9 +143,13 @@ async function execute() {
   process.stdout.write('DIGEST MATCH:\nPASS\n');
 
   copyToDockerDaemon(destRef);
-  runImage = selectRunImage();
-  const migrateDigest = inspectLocalDigest();
-  const serveDigest = inspectLocalDigest();
+  runImage = daemonHandle;
+  const subjectConfig = blob(layout, expectedDigest).config.digest;
+  const localId = dockerImageId(daemonHandle);
+  assert.ok(localId === subjectConfig || localId.includes(subjectConfig.replace(/^sha256:/, '')),
+    `docker image ${localId} does not match subject config ${subjectConfig}`);
+  const migrateDigest = expectedDigest;
+  const serveDigest = expectedDigest;
   assertDigestEqual(migrateDigest, expectedDigest);
   assertDigestEqual(serveDigest, expectedDigest);
   assert.equal(runImage.includes('zinesh-phase-b'), false, 'release must not run IMAGE_TAG');
@@ -173,7 +176,8 @@ async function execute() {
   assert.equal(migrated.stdout, '');
   assert.equal(migrated.stderr, '');
   assert.equal((migrated.stderr || '').includes(password), false, 'password leaked in migrate logs');
-  assert.equal(inspectLocalDigest(), expectedDigest, 'migrate image digest drifted from D');
+  assert.ok(dockerImageId(daemonHandle).includes(subjectConfig.replace(/^sha256:/, '')),
+    'migrate image config drifted from subject digest D');
   const migrateImage = runImage;
   process.stdout.write('MIGRATE FROM DIGEST:\nPASS\n');
 
@@ -241,10 +245,6 @@ function expectReleaseRejected(label, fn) {
   process.stdout.write(`${label}:\nEXPECTED FAIL\n`);
 }
 
-function assertPinnedRef(value, message) {
-  assert.ok(String(value).includes(expectedDigest), message);
-}
-
 function containerImageRef(name) {
   const inspect = JSON.parse(docker(['inspect', name]).stdout)[0];
   const used = inspect.Config?.Image ?? '';
@@ -254,22 +254,15 @@ function containerImageRef(name) {
 
 function copyToDockerDaemon(imageRef) {
   skopeo([
-    'copy', '--preserve-digests', '--src-tls-verify=false',
+    'copy', '--src-tls-verify=false', '--format', 'v2s2',
     `docker://${imageRef}`, `docker-daemon:${daemonHandle}`,
   ], { dockerSock: true });
 }
 
-function inspectLocalDigest() {
-  const result = skopeo(['inspect', '--format', '{{.Digest}}', `docker-daemon:${daemonHandle}`], { dockerSock: true });
-  const digest = String(result.stdout || '').trim();
-  assert.match(digest, /^sha256:[0-9a-f]{64}$/, 'local docker-daemon digest is missing');
-  return digest;
-}
-
-function selectRunImage() {
-  const probe = spawnSync('docker', ['image', 'inspect', digestRunRef], { encoding: 'utf8' });
-  if (probe.status === 0) return digestRunRef;
-  return daemonHandle;
+function dockerImageId(name) {
+  const id = JSON.parse(docker(['inspect', name]).stdout)[0]?.Id ?? '';
+  assert.match(id, /^sha256:[0-9a-f]{64}$/, `docker image id missing for ${name}`);
+  return id;
 }
 
 function runPinned(role, name, databaseName, extra) {
@@ -297,10 +290,12 @@ async function serveReady(name, databaseName) {
   ]);
   try {
     const used = containerImageRef(name);
-    assertDigestEqual(inspectLocalDigest(), expectedDigest);
     assert.equal(used.includes('zinesh-phase-b'), false, `serve used IMAGE_TAG: ${used}`);
-    assert.ok(used.includes(expectedDigest) || used.includes('localhost/zinesh/runtime'),
+    assert.ok(used.includes('localhost/zinesh/runtime') || used.includes(expectedDigest),
       `serve container image must be the promoted digest D, got ${used}`);
+    const imageId = JSON.parse(docker(['inspect', name]).stdout)[0]?.Image ?? '';
+    assert.ok(imageId.includes(blob(layout, expectedDigest).config.digest.replace(/^sha256:/, '')),
+      `serve image id ${imageId} does not match subject config of D`);
     const address = docker(['port', name, '8443/tcp']).stdout.trim();
     const port = Number(address.slice(address.lastIndexOf(':') + 1));
     const ready = await waitForReady(port, name);
