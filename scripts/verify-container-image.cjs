@@ -28,8 +28,11 @@ const installed=fs.readFileSync('/lib/apk/db/installed','utf8');
 const packages=[...installed.matchAll(/^P:(.+)$/gm)].map((m)=>m[1]).sort();
 assert.deepEqual(packages,['libgcc','libstdc++','musl']);
 const files=[]; function walk(p){for(const e of fs.readdirSync(p,{withFileTypes:true})){const c=path.join(p,e.name);e.isDirectory()?walk(c):files.push(c)}} walk('/app');
-const forbiddenNames=/(^|\\/)(\\.env(?:\\.|$)|\\.git(?:\\/|$)|coverage(?:\\/|$)|src(?:\\/|$)|npm-cache(?:\\/|$))|\\.(pem|key|pfx|p12|crt|cer|der)$|\\.test\\.|tls-test-certificate|security\\/testing/;
+const forbiddenNames=/(^|\\/)(\\.env(?:\\.|$)|\\.git(?:\\/|$)|coverage(?:\\/|$)|src(?:\\/|$)|npm-cache(?:\\/|$))|\\.(pem|key|pfx|p12|crt|cer|der)$|\\.test\\.|tls-test-certificate|security\\/testing|database-password/;
 assert.equal(files.some(f=>forbiddenNames.test(f.replaceAll('\\\\','/'))),false,'forbidden artifact path found');
+for (const baked of ['/run/zinesh-tls','/run/zinesh-tls/database-password','/run/zinesh-tls/database-ca.pem','/run/zinesh-tls/certificate.pem','/run/zinesh-tls/private-key.pem','/run/secrets']) {
+  assert.equal(fs.existsSync(baked),false,baked+' must not be baked into the image');
+}
 for(const f of files){const b=fs.readFileSync(f); if(b.length<5_000_000){const s=b.toString('utf8');assert.equal(/-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/.test(s),false,'private key material found')}}
 process.stdout.write('Container filesystem audit PASS\\n');`;
 
@@ -47,7 +50,7 @@ assert.match(startup.stderr, /^Invalid configuration: PGHOST is required\r?\n$/)
 assert.equal(startup.stdout, '');
 
 const history = run(['history', '--no-trunc', '--format', '{{.CreatedBy}}', image]).stdout;
-assert.equal(/BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY|PGPASSWORD=|TLS_PRIVATE_KEY=/.test(history), false,
+assert.equal(/BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY|PGPASSWORD=|TLS_PRIVATE_KEY=|\/run\/zinesh-tls/.test(history), false,
   'sensitive material appears in image history');
 
 process.stdout.write('Container image audit PASS\n');

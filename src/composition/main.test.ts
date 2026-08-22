@@ -149,7 +149,46 @@ describe('loadPostgresConfig', () => {
     }
   });
 
-  test('rejects missing, non-regular, empty and malformed password files without disclosure', () => {
+  test('accepts a 0600 password file and rejects group or world access without disclosure', () => {
+    if (process.platform === 'win32') {
+      expect(loadPostgresConfig(VALID_ENV).password).toBe(POSTGRES_PASSWORD);
+      return;
+    }
+    expect(loadPostgresConfig(VALID_ENV).password).toBe(POSTGRES_PASSWORD);
+    const secret = `permission-secret-${POSTGRES_PASSWORD}`;
+    for (const mode of [0o640, 0o644, 0o604]) {
+      const filename = path.join(POSTGRES_CONFIG_DIRECTORY, `password-${mode.toString(8)}`);
+      fs.writeFileSync(filename, `${secret}\n`, { mode: 0o600 });
+      fs.chmodSync(filename, mode);
+      try {
+        loadPostgresConfig({ ...VALID_ENV, PG_PASSWORD_FILE: filename });
+        throw new Error(`expected ConfigurationError for mode ${mode.toString(8)}`);
+      } catch (error) {
+        expect(error).toBeInstanceOf(ConfigurationError);
+        if (!(error instanceof ConfigurationError)) continue;
+        expect(error.variable).toBe('PG_PASSWORD_FILE');
+        expect(error.message).not.toContain(secret);
+        expect(error.message).not.toContain(POSTGRES_PASSWORD);
+        expect(JSON.stringify(error)).not.toContain(secret);
+      }
+    }
+  });
+
+  test('rejects a password path that is not a regular file without disclosure', () => {
+    const directory = path.join(POSTGRES_CONFIG_DIRECTORY, 'password-not-a-file');
+    fs.mkdirSync(directory);
+    try {
+      loadPostgresConfig({ ...VALID_ENV, PG_PASSWORD_FILE: directory });
+      throw new Error('expected ConfigurationError');
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConfigurationError);
+      if (!(error instanceof ConfigurationError)) return;
+      expect(error.variable).toBe('PG_PASSWORD_FILE');
+      expect(error.message).not.toContain(POSTGRES_PASSWORD);
+    }
+  });
+
+  test('rejects missing, empty and malformed password files without disclosure', () => {
     const directory = path.join(POSTGRES_CONFIG_DIRECTORY, 'invalid-password-directory');
     fs.mkdirSync(directory);
     const cases: ReadonlyArray<readonly [string, string | undefined]> = [
@@ -159,7 +198,7 @@ describe('loadPostgresConfig', () => {
     expect(() => loadPostgresConfig({ ...VALID_ENV, PG_PASSWORD_FILE: directory })).toThrow(ConfigurationError);
     for (const [label, contents] of cases) {
       const filename = path.join(POSTGRES_CONFIG_DIRECTORY, `invalid-password-${label}`);
-      if (contents !== undefined) fs.writeFileSync(filename, contents);
+      if (contents !== undefined) fs.writeFileSync(filename, contents, { mode: 0o600 });
       expect(() => loadPostgresConfig({ ...VALID_ENV, PG_PASSWORD_FILE: filename })).toThrow(ConfigurationError);
       try { loadPostgresConfig({ ...VALID_ENV, PG_PASSWORD_FILE: filename }); } catch (error) {
         if (contents !== undefined && contents !== '') {

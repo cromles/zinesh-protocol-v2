@@ -66,7 +66,7 @@ async function execute() {
     '--mount', `type=bind,source=${directory},target=/source,readonly`,
     '--mount', `type=volume,source=${volume},target=/tls`,
     '--entrypoint', 'sh', base, '-c',
-    'cp /source/certificate.pem /tls/certificate.pem && cp /source/private-key.pem /tls/private-key.pem && cp /source/database-password /tls/database-password && cp /source/database-ca.pem /tls/database-ca.pem && chown 1000:1000 /tls/* && chmod 600 /tls/*',
+    'cp /source/certificate.pem /tls/certificate.pem && cp /source/private-key.pem /tls/private-key.pem && cp /source/database-password /tls/database-password && cp /source/database-ca.pem /tls/database-ca.pem && chown 1000:1000 /tls/* && chmod 600 /tls/database-password /tls/private-key.pem && chmod 644 /tls/database-ca.pem /tls/certificate.pem',
   ]);
 
   const environment = {
@@ -103,6 +103,19 @@ async function execute() {
   run(args);
 
   try {
+    const inspect = JSON.parse(run(['inspect', container]).stdout)[0];
+    assert.equal(inspect.Config.User, '1000:1000');
+    assert.equal(inspect.HostConfig.ReadonlyRootfs, true);
+    const tlsMount = inspect.Mounts.find((mount) => mount.Destination === '/run/zinesh-tls');
+    assert.ok(tlsMount, 'canonical /run/zinesh-tls mount is missing');
+    assert.equal(tlsMount.RW, false, 'secret/TLS mount must be read-only');
+
+    const identity = run([
+      'exec', container, 'node', '-e',
+      'const fs=require("fs"); const s=(p)=>fs.statSync(p); const pw=s("/run/zinesh-tls/database-password"); const key=s("/run/zinesh-tls/private-key.pem"); const ca=s("/run/zinesh-tls/database-ca.pem"); const cert=s("/run/zinesh-tls/certificate.pem"); if (process.getuid()!==1000 || process.getgid()!==1000) process.exit(2); if ((pw.mode & 0o777) !== 0o600 || (key.mode & 0o777) !== 0o600) process.exit(3); if ((ca.mode & 0o022) !== 0 || (cert.mode & 0o022) !== 0) process.exit(4); process.stdout.write("runtime-mount-ok");',
+    ]).stdout.trim();
+    assert.equal(identity, 'runtime-mount-ok');
+
     const address = run(['port', container, '8443/tcp']).stdout.trim();
     const port = Number(address.slice(address.lastIndexOf(':') + 1));
     assert.ok(Number.isInteger(port) && port > 0, `invalid published port: ${address}`);
@@ -113,10 +126,30 @@ async function execute() {
     const logs = run(['logs', container]).stdout.trim().split(/\r?\n/).filter(Boolean);
     assert.ok(logs.some((line) => { try { JSON.parse(line); return true; } catch { return false; } }),
       'container did not emit JSON logging');
+    const password = readFileSync(process.env.PG_PASSWORD_FILE, 'utf8');
+    assert.equal(run(['logs', container]).stdout.includes(password), false, 'password leaked in success logs');
     run(['stop', '--time', '15', container]);
     const state = JSON.parse(run(['inspect', container, '--format', '{{json .State}}']).stdout);
     assert.equal(state.ExitCode, 0, `SIGTERM shutdown exit code was ${state.ExitCode}`);
     assert.equal(state.OOMKilled, false);
+
+    run(['rm', '-f', container]);
+    run([
+      'run', '--rm', '--mount', `type=volume,source=${volume},target=/tls`,
+      '--entrypoint', 'sh', base, '-c', 'chmod 644 /tls/database-password',
+    ]);
+    const denied = spawnSync('docker', [
+      'run', '--name', `${container}-world-readable`, '--read-only', '--cap-drop=ALL',
+      '--security-opt=no-new-privileges:true', '--network', process.env.PG_TLS_DOCKER_NETWORK,
+      '--mount', `type=volume,source=${volume},target=/run/zinesh-tls,readonly`,
+      ...Object.entries(environment).flatMap(([name, value]) => ['--env', `${name}=${value}`]),
+      image,
+    ], { encoding: 'utf8', timeout: 15_000 });
+    spawnSync('docker', ['rm', '-f', `${container}-world-readable`], { encoding: 'utf8' });
+    assert.equal(denied.status, 1, `world-readable password must fail closed: ${denied.stderr}`);
+    assert.match(denied.stderr, /^Invalid configuration: PG_PASSWORD_FILE /);
+    assert.equal(denied.stdout, '');
+    assert.equal(denied.stderr.includes(password), false, 'password leaked in permission-denial logs');
     process.stdout.write('Container startup and SIGTERM smoke PASS\n');
   } finally {
     await cleanup();
@@ -177,6 +210,7 @@ function httpsGet(port) {
 function delay(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 async function cleanup() {
   spawnSync('docker', ['rm', '-f', container], { encoding: 'utf8' });
+  spawnSync('docker', ['rm', '-f', `${container}-world-readable`], { encoding: 'utf8' });
   spawnSync('docker', ['volume', 'rm', '-f', volume], { encoding: 'utf8' });
   rmSync(directory, { recursive: true, force: true });
   if (createdDatabase) { createdDatabase = false; await dropDatabase(database); }
