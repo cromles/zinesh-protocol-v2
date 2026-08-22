@@ -22,7 +22,7 @@ assert.equal(process.getuid(),1000); assert.equal(process.getgid(),1000); requir
 assert.equal(process.version,'v24.18.1'); assert.equal(process.versions.openssl,'3.5.7');
 for(const name of ['jest','typescript','ts-jest']) assert.throws(()=>require.resolve(name));
 assert.deepEqual(fs.readdirSync('/app').sort(),['dist','node_modules','package-lock.json','package.json']);
-for(const p of ['/bin/sh','/bin/busybox','/sbin/apk','/usr/local/bin/npm','/usr/local/bin/npx','/usr/local/bin/corepack','/usr/local/bin/yarn','/opt/yarn-v1.22.22']) assert.equal(fs.existsSync(p),false,p+' must not exist');
+for(const p of ['/bin/sh','/bin/busybox','/sbin/apk','/usr/local/bin/npm','/usr/local/bin/npx','/usr/local/bin/corepack','/usr/local/bin/yarn','/opt/yarn-v1.22.22','/usr/local/bin/cosign','/usr/bin/cosign','/ko-app/cosign','/cosign.key','/cosign.pub','/root/.docker/config.json']) assert.equal(fs.existsSync(p),false,p+' must not exist');
 for(const p of ['/lib/ld-musl-x86_64.so.1','/usr/lib/libgcc_s.so.1','/usr/lib/libstdc++.so.6','/lib/apk/db/installed','/etc/alpine-release']) assert.equal(fs.existsSync(p),true,p+' must exist');
 const installed=fs.readFileSync('/lib/apk/db/installed','utf8');
 const packages=[...installed.matchAll(/^P:(.+)$/gm)].map((m)=>m[1]).sort();

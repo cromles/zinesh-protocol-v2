@@ -57,4 +57,11 @@ CI performs two no-cache builds and requires identical runtime subject digests. 
 
 Trivy scans the final OCI artifact's Alpine/native and production npm inventories. Grype independently scans the attached SBOM so the standalone Node binary is included in vulnerability evaluation. Both scanners are pinned by linux/amd64 manifest digest. Critical and High vulnerabilities fail the build; Phase B defines no hidden ignore or exception path.
 
-Phase B does not push the image, sign it, deploy it, migrate a database, or define rollout policy.
+Phase C signs that runtime subject digest with pinned Cosign, pushes and pulls it
+by digest through an OCI registry, and fail-closes unsigned, wrong-key, mutated,
+and digest-mismatched artifacts. Tags are not authority. See
+[production release and artifact trust](production-release.md).
+
+The scratch image still does not contain Cosign, signing keys, or registry
+credentials. This contract does not deploy the image to Kubernetes or select a
+cloud registry.

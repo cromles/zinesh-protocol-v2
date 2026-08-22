@@ -130,10 +130,15 @@ pre-apply backup. See [production backup and restore](production-backup.md).
 The apply command does not create HTTPS, listen, initialize JWT, or serve
 `/live` or `/ready`. It does not dump or restore PostgreSQL.
 
+Production migrate and serve jobs must use the same **signed digest**. See
+[production release and artifact trust](production-release.md).
+
 ## Out of scope
 
-Registry, signing, deployment automation, mixed-version rollouts, payment
-integration, and WAL/PITR replication are not part of this contract.
+Deployment automation, mixed-version rollouts, payment integration, and
+WAL/PITR replication are not part of this contract.
 
 Logical PostgreSQL backup and restore are defined in
-[production-backup.md](production-backup.md).
+[production-backup.md](production-backup.md). Artifact signing, digest pinning,
+and registry pull verification are defined in
+[production-release.md](production-release.md).
