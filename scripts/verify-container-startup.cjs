@@ -100,7 +100,7 @@ async function execute() {
     '--mount', `type=volume,source=${volume},target=/run/zinesh-tls,readonly`,
   ];
   for (const [name, value] of Object.entries(environment)) args.push('--env', `${name}=${value}`);
-  run(args);
+  args.push(image);
 
   run([
     'run', '--detach', '--name', hang,
@@ -109,6 +109,8 @@ async function execute() {
     '--entrypoint', 'node', base, '-e',
     'require("net").createServer((socket) => { socket.on("error", () => undefined); }).listen(443);',
   ]);
+  assert.equal(run(['inspect', hang, '--format', '{{.State.Running}}']).stdout.trim(), 'true');
+  run(args);
 
   try {
     const inspect = JSON.parse(run(['inspect', container]).stdout)[0];
