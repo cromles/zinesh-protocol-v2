@@ -281,9 +281,18 @@ function requiredPostgresValue(
 function readPasswordFile(filename: string): string {
   let content: string;
   try {
-    if (!lstatSync(filename).isFile()) throw new Error('not a regular file');
+    const stat = lstatSync(filename);
+    if (!stat.isFile()) {
+      throw new ConfigurationError('PG_PASSWORD_FILE', 'must reference a readable regular file');
+    }
+    if (process.platform !== 'win32' && (stat.mode & 0o077) !== 0) {
+      throw new ConfigurationError('PG_PASSWORD_FILE', 'must not be group or world accessible');
+    }
     content = readFileSync(filename, 'utf8');
-  } catch {
+  } catch (error) {
+    if (error instanceof ConfigurationError) {
+      throw error;
+    }
     throw new ConfigurationError('PG_PASSWORD_FILE', 'must reference a readable regular file');
   }
   if (content.endsWith('\r\n')) content = content.slice(0, -2);
