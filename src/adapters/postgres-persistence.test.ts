@@ -74,6 +74,7 @@ import {
   ZERO_VERSION,
 } from '../core/types';
 import type { CellId, Event, Version } from '../core/types';
+import { cellKernel } from '../kernel';
 import { PostgresMigrator } from './postgres-migrator';
 
 // ---------------------------------------------------------------------------
