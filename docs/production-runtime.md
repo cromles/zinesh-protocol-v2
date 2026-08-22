@@ -124,13 +124,16 @@ older schema is not ready. There is no mixed-version compatibility window.
 
 Concurrent apply jobs are serialized by the existing PostgreSQL advisory lock.
 A failed apply rolls back its transaction. There are **no down migrations**.
-Release rollback is a previous image plus an operator backup restore, which is
-not part of this contract.
+Release rollback of a successful apply is a previous image plus restore of a
+pre-apply backup. See [production backup and restore](production-backup.md).
 
 The apply command does not create HTTPS, listen, initialize JWT, or serve
-`/live` or `/ready`.
+`/live` or `/ready`. It does not dump or restore PostgreSQL.
 
 ## Out of scope
 
-Backup, restore, registry, signing, deployment automation, mixed-version
-rollouts, and payment integration are not part of this contract.
+Registry, signing, deployment automation, mixed-version rollouts, payment
+integration, and WAL/PITR replication are not part of this contract.
+
+Logical PostgreSQL backup and restore are defined in
+[production-backup.md](production-backup.md).

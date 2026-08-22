@@ -120,6 +120,9 @@ jobs:
       - name: Startup and SIGTERM smoke
         run: node scripts/verify-container-startup.cjs "$IMAGE_TAG"
 
+      - name: Backup and restore verification
+        run: node scripts/verify-backup-restore.cjs "$IMAGE_TAG"
+
       - name: Build two clean attested OCI artifacts
         shell: bash
         run: |

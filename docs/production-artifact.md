@@ -25,10 +25,14 @@ The reproducibility target is the runtime image subject manifest digest. SBOM an
 - TLS certificate and private key: read-only runtime mounts, never image content
 - PostgreSQL password and CA: read-only runtime mounts, never image content. See [production runtime contract](production-runtime.md).
 
+The scratch image does not contain `pg_dump` or `pg_restore`. Backup tooling is
+not part of the runtime serving image. Backup and restore run from an operator
+or CI PostgreSQL 16 client. See [production backup and restore](production-backup.md).
+
 Schema apply must succeed on this artifact before serving replicas of the same
 image are treated as ready. Serving does not run migrations. Schema version
 equality is exact. There are no down migrations. Failed apply rolls back its
-transaction. Backup and restore are not defined here.
+transaction.
 
 The private key must be a regular file owned/readable by the runtime identity with no group or world permission bits. The runtime is verified with a read-only root filesystem, all Linux capabilities dropped, and `no-new-privileges`.
 

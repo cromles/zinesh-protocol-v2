@@ -20,6 +20,7 @@ coverage
 *.cer
 *.der
 docs
+*.dump
 **/*.test.ts
 src/security/testing.ts
 src/transport/tls-test-certificate.ts
