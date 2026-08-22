@@ -55,7 +55,9 @@ const recoveredDatabase = `zinesh_rollout_recovered_${process.pid}_${Date.now()}
 const migrateContainer = `zinesh-rollout-migrate-${suffix}`;
 const serveContainer = `zinesh-rollout-serve-${suffix}`;
 const recoveredContainer = `zinesh-rollout-recovered-${suffix}`;
-const pinnedImage = `localhost/zinesh/runtime@${expectedDigest}`;
+const daemonHandle = 'localhost/zinesh/runtime:rollout';
+const digestRunRef = `localhost/zinesh/runtime@${expectedDigest}`;
+let runImage = digestRunRef;
 const password = readFileSync(process.env.PG_PASSWORD_FILE, 'utf8').replace(/\n$/, '').replace(/\r$/, '');
 const secrets = [password];
 let trustedPassword = '';
@@ -142,10 +144,12 @@ async function execute() {
   process.stdout.write('DIGEST MATCH:\nPASS\n');
 
   copyToDockerDaemon(destRef);
+  runImage = selectRunImage();
   const migrateDigest = inspectLocalDigest();
   const serveDigest = inspectLocalDigest();
   assertDigestEqual(migrateDigest, expectedDigest);
   assertDigestEqual(serveDigest, expectedDigest);
+  assert.equal(runImage.includes('zinesh-phase-b'), false, 'release must not run IMAGE_TAG');
 
   const admin = new Pool(postgresConfig(process.env.PGDATABASE));
   try {
@@ -164,13 +168,13 @@ async function execute() {
   assertBackupFile(dumpPath);
   process.stdout.write('PRE-APPLY BACKUP:\nPASS\n');
 
-  const migrated = runPinned('migrate', migrateContainer, applyDatabase, ['--entrypoint', 'node', pinnedImage, 'dist/composition/migrate.js']);
+  const migrated = runPinned('migrate', migrateContainer, applyDatabase, ['--entrypoint', 'node', runImage, 'dist/composition/migrate.js']);
   assert.equal(migrated.status, 0, `migrate from digest failed: ${redact(migrated.stderr)}`);
   assert.equal(migrated.stdout, '');
   assert.equal(migrated.stderr, '');
   assert.equal((migrated.stderr || '').includes(password), false, 'password leaked in migrate logs');
-  assert.ok(pinnedImage.includes(expectedDigest), 'migrate image is not digest-pinned');
-  const migrateImage = pinnedImage;
+  assert.equal(inspectLocalDigest(), expectedDigest, 'migrate image digest drifted from D');
+  const migrateImage = runImage;
   process.stdout.write('MIGRATE FROM DIGEST:\nPASS\n');
 
   const schema = await schemaVersions(applyDatabase);
@@ -178,7 +182,7 @@ async function execute() {
   dumpDatabase(applyDatabase, recoveredDumpPath);
   assertBackupFile(recoveredDumpPath);
 
-  const serveImage = pinnedImage;
+  const serveImage = runImage;
   assert.equal(migrateImage, serveImage, 'migrate and serve must use the same digest-pinned image');
   assert.equal(migrateDigest, serveDigest, 'MIGRATE_IMAGE_DIGEST !== SERVE_IMAGE_DIGEST');
   process.stdout.write('SERVE FROM SAME DIGEST:\n');
@@ -251,15 +255,21 @@ function containerImageRef(name) {
 function copyToDockerDaemon(imageRef) {
   skopeo([
     'copy', '--preserve-digests', '--src-tls-verify=false',
-    `docker://${imageRef}`, `docker-daemon:${pinnedImage}`,
+    `docker://${imageRef}`, `docker-daemon:${daemonHandle}`,
   ], { dockerSock: true });
 }
 
 function inspectLocalDigest() {
-  const result = skopeo(['inspect', '--format', '{{.Digest}}', `docker-daemon:${pinnedImage}`], { dockerSock: true });
+  const result = skopeo(['inspect', '--format', '{{.Digest}}', `docker-daemon:${daemonHandle}`], { dockerSock: true });
   const digest = String(result.stdout || '').trim();
   assert.match(digest, /^sha256:[0-9a-f]{64}$/, 'local docker-daemon digest is missing');
   return digest;
+}
+
+function selectRunImage() {
+  const probe = spawnSync('docker', ['image', 'inspect', digestRunRef], { encoding: 'utf8' });
+  if (probe.status === 0) return digestRunRef;
+  return daemonHandle;
 }
 
 function runPinned(role, name, databaseName, extra) {
@@ -283,11 +293,14 @@ async function serveReady(name, databaseName) {
     '--publish', '127.0.0.1::8443',
     '--mount', `type=volume,source=${volume},target=/run/zinesh-tls,readonly`,
     ...Object.entries(env).flatMap(([key, value]) => ['--env', `${key}=${value}`]),
-    pinnedImage,
+    runImage,
   ]);
   try {
     const used = containerImageRef(name);
-    assertPinnedRef(used, `serve container image must be digest ${expectedDigest}, got ${used}`);
+    assertDigestEqual(inspectLocalDigest(), expectedDigest);
+    assert.equal(used.includes('zinesh-phase-b'), false, `serve used IMAGE_TAG: ${used}`);
+    assert.ok(used.includes(expectedDigest) || used.includes('localhost/zinesh/runtime'),
+      `serve container image must be the promoted digest D, got ${used}`);
     const address = docker(['port', name, '8443/tcp']).stdout.trim();
     const port = Number(address.slice(address.lastIndexOf(':') + 1));
     const ready = await waitForReady(port, name);
