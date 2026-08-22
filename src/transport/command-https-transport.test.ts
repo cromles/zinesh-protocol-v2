@@ -137,6 +137,25 @@ async function post(h: Harness, body: unknown = command(), extraHeaders: Record<
   });
 }
 
+async function get(h: Harness, path: string, extraHeaders: Record<string, string> = {}) {
+  return new Promise<{ readonly status: number; readonly json: Record<string, unknown> }>((resolve, reject) => {
+    const request = https.request({
+      host: '127.0.0.1', port: h.port, path, method: 'GET',
+      rejectUnauthorized: false, agent: false,
+      headers: { host: HOST, ...extraHeaders },
+    }, (response) => {
+      const chunks: Buffer[] = [];
+      response.on('data', (chunk: Buffer) => chunks.push(chunk));
+      response.on('end', () => resolve({
+        status: response.statusCode ?? 0,
+        json: JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>,
+      }));
+    });
+    request.once('error', reject);
+    request.end();
+  });
+}
+
 async function plaintextRejected(h: Harness, headers: Record<string, string> = {}): Promise<boolean> {
   return new Promise((resolve) => {
     const request = http.request({
@@ -207,6 +226,43 @@ describe('Phase 7F real TLS public ingress', () => {
     expect((await post(unknown, command('unknown-proxy'), { 'x-forwarded-proto': 'https' })).status).toBe(403);
     const trusted = await harness(['127.0.0.1']);
     expect((await post(trusted, command('known-proxy'), { 'x-forwarded-proto': 'https' })).status).toBe(200);
+  });
+
+  test('GET /live and GET /ready require the allowed Host and stay opaque', async () => {
+    const h = await harness();
+    expect(await get(h, '/live')).toEqual({ status: 200, json: { status: 'ok' } });
+    expect(await get(h, '/')).toEqual({ status: 404, json: { error: { code: 'NOT_FOUND' } } });
+    expect(await get(h, '/ready?x=1')).toEqual({ status: 404, json: { error: { code: 'NOT_FOUND' } } });
+    expect((await get(h, '/live', { host: 'evil.example' })).status).toBe(421);
+    expect(await get(h, '/ready')).toEqual({ status: 503, json: { status: 'unavailable' } });
+  });
+
+  test('HTTPS GET /ready follows shutdown and readyCheck without command audits', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'zinesh-7f-ready-'));
+    const tls = selfSignedTestCertificate(new Date(Date.now() - 60_000), new Date(Date.now() + 86_400_000), HOST);
+    const certificatePath = path.join(directory, 'certificate.pem');
+    const privateKeyPath = path.join(directory, 'private-key.pem');
+    await Promise.all([writeFile(certificatePath, tls.certificate), writeFile(privateKeyPath, tls.privateKey, { mode: 0o600 })]);
+    const audit = new Audit();
+    let shuttingDown = false;
+    let ready = true;
+    const transport = await CommandHttpsTransport.create(
+      { async handleCommand() { throw new Error('commands must not run for probes'); } },
+      config(certificatePath, privateKeyPath), audit, undefined, undefined, undefined,
+      { shuttingDown: () => shuttingDown, readyCheck: async () => ready },
+    );
+    await transport.listen();
+    const h = { transport, port: transport.address()!.port, token: '', audit, directory,
+      persistence: new InMemoryPersistenceAdapter(), securityEvents: [] };
+    open.push(h);
+    expect(await get(h, '/ready')).toEqual({ status: 200, json: { status: 'ok' } });
+    shuttingDown = true;
+    expect(await get(h, '/ready')).toEqual({ status: 503, json: { status: 'unavailable' } });
+    expect(await get(h, '/live')).toEqual({ status: 200, json: { status: 'ok' } });
+    shuttingDown = false;
+    ready = false;
+    expect(await get(h, '/ready')).toEqual({ status: 503, json: { status: 'unavailable' } });
+    expect(audit.entries).toEqual([]);
   });
 
   test('arbitrary Host cannot influence command routing', async () => {

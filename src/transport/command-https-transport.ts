@@ -9,7 +9,7 @@ import {
   CommandHttpTransport,
 } from './command-http-transport';
 import type {
-  CommandDispatcher, CommandHttpConfig, TransportAuditSink,
+  CommandDispatcher, CommandHttpConfig, ProcessProbes, TransportAuditSink,
 } from './command-http-transport';
 import type { RateLimiter } from '../security/rate-limiter';
 import { noOpSecurityTelemetry, serverCorrelationId } from '../security/security-observability';
@@ -40,6 +40,7 @@ export class CommandHttpsTransport {
     now: Date = new Date(),
     preAuthenticationRateLimiter?: RateLimiter,
     telemetry: SecurityTelemetry = noOpSecurityTelemetry,
+    probes?: ProcessProbes,
   ): Promise<CommandHttpsTransport> {
     let material: Awaited<ReturnType<typeof loadAndValidateTlsMaterial>>;
     try {
@@ -73,6 +74,7 @@ export class CommandHttpsTransport {
       admission,
       preAuthenticationRateLimiter,
       telemetry,
+      probes,
     );
     return new CommandHttpsTransport(transport);
   }

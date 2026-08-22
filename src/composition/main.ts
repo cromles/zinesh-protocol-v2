@@ -28,7 +28,7 @@ import {
 } from '../security/jwt-authentication';
 import type { JwtAuthenticationConfig } from '../security/jwt-authentication';
 import { JsonLineTransportAuditSink } from '../transport/command-http-transport';
-import type { CommandHttpConfig } from '../transport/command-http-transport';
+import type { CommandHttpConfig, ProcessProbes } from '../transport/command-http-transport';
 import { CommandHttpsTransport } from '../transport/command-https-transport';
 import type { CommandHttpsConfig } from '../transport/command-https-transport';
 import { isIP } from 'net';
@@ -405,6 +405,16 @@ export function createCommandGate(): CommandGate {
   };
 }
 
+export function createProcessProbes(
+  gate: CommandGate,
+  persistence: PostgresPersistenceAdapter,
+): ProcessProbes {
+  return {
+    shuttingDown: () => gate.shuttingDown,
+    readyCheck: () => persistence.readyCheck(),
+  };
+}
+
 export interface ComposedRuntime {
   readonly persistence: PostgresPersistenceAdapter;
   readonly gate: CommandGate;
@@ -571,6 +581,7 @@ export async function main(
     transport = await CommandHttpsTransport.create(
       runtime, transportConfig, new JsonLineTransportAuditSink(), undefined,
       runtime.preAuthenticationRateLimiter, runtime.telemetry,
+      createProcessProbes(runtime.gate, runtime.persistence),
     );
     await runtime.persistence.connect();
     await runtime.persistence.migrator.verifyExpectedVersion();

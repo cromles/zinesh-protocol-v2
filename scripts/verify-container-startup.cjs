@@ -122,13 +122,48 @@ async function execute() {
     const response = await waitForHttps(port);
     assert.equal(response.statusCode, 404);
     assert.match(response.body, /"NOT_FOUND"/);
+    const live = await httpsRequest(port, '/live');
+    assert.equal(live.statusCode, 200);
+    assert.equal(live.body, '{"status":"ok"}');
+    const ready = await httpsRequest(port, '/ready');
+    assert.equal(ready.statusCode, 200);
+    assert.equal(ready.body, '{"status":"ok"}');
+    const root = await httpsRequest(port, '/');
+    assert.equal(root.statusCode, 404);
+    const queried = await httpsRequest(port, '/ready?x=1');
+    assert.equal(queried.statusCode, 404);
+    assert.match(queried.body, /"NOT_FOUND"/);
     await delay(100);
     const logs = run(['logs', container]).stdout.trim().split(/\r?\n/).filter(Boolean);
     assert.ok(logs.some((line) => { try { JSON.parse(line); return true; } catch { return false; } }),
       'container did not emit JSON logging');
     const password = readFileSync(process.env.PG_PASSWORD_FILE, 'utf8');
     assert.equal(run(['logs', container]).stdout.includes(password), false, 'password leaked in success logs');
-    run(['stop', '--time', '15', container]);
+    httpsPostCommands(port);
+    await delay(100);
+    run(['kill', '-s', 'SIGTERM', container]);
+    let liveDuringDrain = false;
+    let readyDuringDrain = false;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      try {
+        const liveDrain = await httpsRequest(port, '/live');
+        const readyDrain = await httpsRequest(port, '/ready');
+        if (liveDrain.statusCode === 200 && liveDrain.body === '{"status":"ok"}') liveDuringDrain = true;
+        if (readyDrain.statusCode === 503 && readyDrain.body === '{"status":"unavailable"}') {
+          readyDuringDrain = true;
+          assert.equal(readyDrain.body.includes('schema'), false);
+          assert.equal(readyDrain.body.includes(password), false);
+        }
+        if (liveDuringDrain && readyDuringDrain) break;
+      } catch {
+        // The process may close the listener after drain completes.
+      }
+      await delay(50);
+    }
+    assert.equal(liveDuringDrain, true, 'liveness was not 200 during drain');
+    assert.equal(readyDuringDrain, true, 'readiness was not 503 during drain');
+    const wait = spawnSync('docker', ['wait', container], { encoding: 'utf8', timeout: 20_000 });
+    assert.equal(wait.status, 0, `docker wait failed: ${wait.stderr}`);
     const state = JSON.parse(run(['inspect', container, '--format', '{{json .State}}']).stdout);
     assert.equal(state.ExitCode, 0, `SIGTERM shutdown exit code was ${state.ExitCode}`);
     assert.equal(state.OOMKilled, false);
@@ -188,16 +223,16 @@ function loadTlsFixture() {
 async function waitForHttps(port) {
   let lastError;
   for (let attempt = 0; attempt < 40; attempt += 1) {
-    try { return await httpsGet(port); } catch (error) { lastError = error; await delay(250); }
+    try { return await httpsRequest(port, '/'); } catch (error) { lastError = error; await delay(250); }
     const status = spawnSync('docker', ['inspect', container, '--format', '{{.State.Status}}'], { encoding: 'utf8' });
     if (status.status === 0 && status.stdout.trim() === 'exited') break;
   }
   throw new Error(`HTTPS startup failed: ${lastError}; logs=${spawnSync('docker', ['logs', container], { encoding: 'utf8' }).stdout}`);
 }
 
-function httpsGet(port) {
+function httpsRequest(port, requestPath) {
   return new Promise((resolve, reject) => {
-    const req = request({ hostname: '127.0.0.1', port, path: '/', method: 'GET', rejectUnauthorized: false,
+    const req = request({ hostname: '127.0.0.1', port, path: requestPath, method: 'GET', rejectUnauthorized: false,
       headers: { host: 'localhost' } }, (response) => {
       const chunks = [];
       response.on('data', (chunk) => chunks.push(chunk));
@@ -205,6 +240,22 @@ function httpsGet(port) {
     });
     req.on('error', reject); req.end();
   });
+}
+
+function httpsPostCommands(port) {
+  const req = request({ hostname: '127.0.0.1', port, path: '/commands', method: 'POST', rejectUnauthorized: false,
+    headers: { host: 'localhost', authorization: 'Bearer smoke-drain-token', 'content-type': 'application/json' } },
+  () => undefined);
+  req.on('error', () => undefined);
+  req.end(JSON.stringify({
+    command: {
+      commandId: 'smoke-drain', cellId: 'smoke-drain-cell', type: 'CreateCell',
+      payload: {
+        payer: 'payer-1', payee: 'payee-1', amount: '10000', currency: 'TRY',
+        fundingDeadline: 2_000_000, completionDeadline: 5_000_000,
+      },
+    },
+  }));
 }
 
 function delay(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }

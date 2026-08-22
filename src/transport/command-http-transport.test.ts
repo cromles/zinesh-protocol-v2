@@ -197,7 +197,84 @@ describe('Phase 7E real HTTP trusted command transport', () => {
     expect(auditDump).not.toContain('must-not-leak');
     expect(JSON.stringify(timedOut.securityEvents)).not.toContain(timedOut.token);
     expect(JSON.stringify(timedOut.securityEvents)).not.toContain('must-not-leak');
+  });
 
+  test('GET /live is unauthenticated, ignores Authorization, and is not a command audit', async () => {
+    const h = await setup();
+    const secret = `Bearer ${h.token}`;
+    const response = await fetch(`http://127.0.0.1:${h.transport.address()!.port}/live`, {
+      method: 'GET', headers: { authorization: secret },
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ status: 'ok' });
+    expect(h.audit.entries).toEqual([]);
+    expect(JSON.stringify(h.securityEvents)).not.toContain(h.token);
+  });
+
+  test('GET /ready is opaque and follows process probes without parsing Authorization', async () => {
+    const audit = new Audit();
+    let shuttingDown = false;
+    let ready = true;
+    const transport = new CommandHttpTransport(
+      { async handleCommand() { throw new Error('commands must not run for probes'); } },
+      { host: '127.0.0.1', port: 0, maxBodyBytes: 2048, maxHeaderBytes: 4096,
+        requestTimeoutMs: 2_000, headersTimeoutMs: 1_000 },
+      audit, () => 'probe-correlation', undefined, undefined, undefined, undefined,
+      { shuttingDown: () => shuttingDown, readyCheck: async () => ready },
+    );
+    await transport.listen(); open.push(transport);
+    const base = `http://127.0.0.1:${transport.address()!.port}`;
+    const secret = 'Bearer probe-token-must-not-leak';
+    const readyOk = await fetch(`${base}/ready`, { headers: { authorization: secret } });
+    expect(readyOk.status).toBe(200);
+    expect(await readyOk.json()).toEqual({ status: 'ok' });
+    ready = false;
+    const notReady = await fetch(`${base}/ready`);
+    expect(notReady.status).toBe(503);
+    expect(await notReady.text()).toBe('{"status":"unavailable"}');
+    ready = true;
+    shuttingDown = true;
+    const draining = await fetch(`${base}/ready`);
+    expect(draining.status).toBe(503);
+    expect(await draining.json()).toEqual({ status: 'unavailable' });
+    const live = await fetch(`${base}/live`);
+    expect(live.status).toBe(200);
+    expect(await live.json()).toEqual({ status: 'ok' });
+    expect(audit.entries).toEqual([]);
+  });
+
+  test('GET / and GET /ready with a query string remain NOT_FOUND', async () => {
+    const h = await setup();
+    const base = `http://127.0.0.1:${h.transport.address()!.port}`;
+    const root = await fetch(base);
+    expect(root.status).toBe(404);
+    expect(await root.json()).toEqual({ error: { code: 'NOT_FOUND' } });
+    const queried = await fetch(`${base}/ready?x=1`);
+    expect(queried.status).toBe(404);
+    expect(await queried.json()).toEqual({ error: { code: 'NOT_FOUND' } });
+  });
+
+  test('POST /commands during shutdown returns opaque 503 RUNTIME_UNAVAILABLE', async () => {
+    const audit = new Audit();
+    const transport = new CommandHttpTransport(
+      { async handleCommand() {
+        const error = new Error('Runtime is shutting down');
+        error.name = 'RuntimeUnavailableError';
+        throw error;
+      } },
+      { host: '127.0.0.1', port: 0, maxBodyBytes: 2048, maxHeaderBytes: 4096,
+        requestTimeoutMs: 2_000, headersTimeoutMs: 1_000 }, audit,
+    );
+    await transport.listen(); open.push(transport);
+    const response = await fetch(`http://127.0.0.1:${transport.address()!.port}/commands`, {
+      method: 'POST', headers: { authorization: 'Bearer placeholder-token', 'content-type': 'application/json' },
+      body: JSON.stringify({ command: command('draining') }),
+    });
+    expect(response.status).toBe(503);
+    expect(await response.text()).toBe('{"error":{"code":"RUNTIME_UNAVAILABLE"}}');
+  });
+
+  test('internal failure return opaque errors without credential leakage', async () => {
     const audit = new Audit();
     const broken = new CommandHttpTransport(
       { async handleCommand() { throw new Error('password=secret SQL SELECT /private/path'); } },
@@ -206,7 +283,7 @@ describe('Phase 7E real HTTP trusted command transport', () => {
     );
     await broken.listen(); open.push(broken);
     const response = await fetch(`http://127.0.0.1:${broken.address()!.port}/commands`, {
-      method: 'POST', headers: { authorization: `Bearer ${timedOut.token}`, 'content-type': 'application/json' },
+      method: 'POST', headers: { authorization: 'Bearer placeholder-token', 'content-type': 'application/json' },
       body: JSON.stringify({ command: command('internal') }),
     });
     expect(response.status).toBe(500);

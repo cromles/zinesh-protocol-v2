@@ -62,6 +62,7 @@ import path from 'path';
 import { Pool } from 'pg';
 import { PostgresPersistenceAdapter } from './postgres-persistence-adapter';
 import type { PostgresConfig } from './postgres-persistence-adapter';
+import { READY_CHECK_TIMEOUT_MS } from './postgres-persistence-adapter';
 import {
   makeActorId,
   makeCellId,
@@ -779,6 +780,58 @@ maybeDescribe('PostgreSQL Persistence', () => {
     expect(retry.kind).toBe('EXECUTED');
     expect(await adapter.eventStore.getEvents(CELL)).toHaveLength(1);
   });
+
+  test('34. readyCheck succeeds for SELECT 1 and expected schema without migrating', async () => {
+    const migrate = jest.spyOn(adapter.migrator, 'migrate');
+    await expect(adapter.readyCheck()).resolves.toBe(true);
+    expect(migrate).not.toHaveBeenCalled();
+    migrate.mockRestore();
+  });
+
+  test('35. readyCheck coalesces in-flight work and caches success for at most one second', async () => {
+    await new Promise((resolve) => setTimeout(resolve, READY_CHECK_TIMEOUT_MS + 600));
+    const pool = (adapter as unknown as { pool: Pool }).pool;
+    let selectCount = 0;
+    const original = pool.query.bind(pool) as Pool['query'];
+    const spy = jest.spyOn(pool, 'query').mockImplementation((...args: Parameters<Pool['query']>) => {
+      const text = typeof args[0] === 'string' ? args[0] : (args[0] as { text?: string } | undefined)?.text;
+      if (text === 'SELECT 1') selectCount += 1;
+      return original(...args);
+    });
+    try {
+      const [first, second] = await Promise.all([adapter.readyCheck(), adapter.readyCheck()]);
+      expect(first).toBe(true);
+      expect(second).toBe(true);
+      expect(selectCount).toBe(1);
+      await expect(adapter.readyCheck()).resolves.toBe(true);
+      expect(selectCount).toBe(1);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test('36. readyCheck is opaque not-ready when schema is not the expected version', async () => {
+    const extra = new PostgresPersistenceAdapter(pgConfig);
+    await extra.connect();
+    const pool = (extra as unknown as { pool: Pool }).pool;
+    await pool.query('INSERT INTO schema_migrations(version,name) VALUES (99,$1)', ['probe-break']);
+    try {
+      const result = await extra.readyCheck();
+      expect(result).toBe(false);
+      expect(String(result)).not.toContain('99');
+      expect(String(result)).not.toContain(pgConfig.password);
+    } finally {
+      await pool.query('DELETE FROM schema_migrations WHERE version = 99');
+      await extra.disconnect();
+    }
+  });
+
+  test('37. readyCheck is false after the pool is ended', async () => {
+    const extra = new PostgresPersistenceAdapter(pgConfig);
+    await extra.connect();
+    await extra.disconnect();
+    await expect(extra.readyCheck()).resolves.toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -791,3 +844,18 @@ if (!POSTGRES_ENABLED) {
     expect(POSTGRES_ENABLED).toBe(false);
   });
 }
+
+test('readyCheck is opaque false when PostgreSQL is unreachable', async () => {
+  const extra = new PostgresPersistenceAdapter({
+    ...pgConfig,
+    port: 1,
+    password: 'unreachable-secret-must-not-leak',
+  });
+  try {
+    const result = await extra.readyCheck();
+    expect(result).toBe(false);
+    expect(String(result)).not.toContain('unreachable-secret-must-not-leak');
+  } finally {
+    await extra.disconnect();
+  }
+});

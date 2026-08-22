@@ -50,6 +50,11 @@ export type CommandRequestAdmission = (
 ) => { readonly ok: true; readonly networkSource?: string } |
   { readonly ok: false; readonly status: number; readonly code: string };
 
+export interface ProcessProbes {
+  readonly shuttingDown: () => boolean;
+  readonly readyCheck: () => Promise<boolean>;
+}
+
 export class CommandHttpTransport {
   private readonly server: Server;
   private activeRequests = 0;
@@ -65,6 +70,7 @@ export class CommandHttpTransport {
     private readonly admission: CommandRequestAdmission = () => ({ ok: true }),
     private readonly preAuthenticationRateLimiter?: RateLimiter,
     private readonly telemetry: SecurityTelemetry = noOpSecurityTelemetry,
+    private readonly probes?: ProcessProbes,
   ) {
     this.server = serverFactory((request, response) => {
       void this.route(request, response);
@@ -108,11 +114,23 @@ export class CommandHttpTransport {
     let commandType: string | undefined;
     let outcome = 'INTERNAL_FAILURE';
     let acquiredRequestSlot = false;
+    let probe = false;
     try {
       const admitted = this.admission(request);
       if (!admitted.ok) {
         outcome = admitted.code;
         this.respond(response, admitted.status, { error: { code: admitted.code } });
+        return;
+      }
+      if (request.method === 'GET' && request.url === '/live') {
+        probe = true;
+        this.respond(response, 200, { status: 'ok' });
+        return;
+      }
+      if (request.method === 'GET' && request.url === '/ready') {
+        probe = true;
+        const ready = await this.isReady();
+        this.respond(response, ready ? 200 : 503, { status: ready ? 'ok' : 'unavailable' });
         return;
       }
       if (request.method !== 'POST' || request.url !== '/commands') {
@@ -173,11 +191,15 @@ export class CommandHttpTransport {
     } catch (error) {
       if (error instanceof BodyTooLargeError) {
         outcome = 'REQUEST_TOO_LARGE'; this.respond(response, 413, { error: { code: 'REQUEST_TOO_LARGE' } });
+      } else if (error instanceof Error && error.name === 'RuntimeUnavailableError') {
+        outcome = 'RUNTIME_UNAVAILABLE';
+        this.respond(response, 503, { error: { code: 'RUNTIME_UNAVAILABLE' } });
       } else {
         outcome = 'INTERNAL_FAILURE'; this.respond(response, 500, { error: { code: 'INTERNAL_FAILURE' } });
       }
     } finally {
       if (acquiredRequestSlot) this.activeRequests -= 1;
+      if (probe) return;
       const audit: TransportAuditRecord = {
         correlationId, outcome, durationMs: Math.max(0, Date.now() - started),
         ...(commandId === undefined ? {} : { commandId }),
@@ -190,6 +212,16 @@ export class CommandHttpTransport {
         });
       }
       this.recordRequestTelemetry(audit);
+    }
+  }
+
+  private async isReady(): Promise<boolean> {
+    if (!this.server.listening) return false;
+    if (this.probes === undefined || this.probes.shuttingDown()) return false;
+    try {
+      return await this.probes.readyCheck();
+    } catch {
+      return false;
     }
   }
 

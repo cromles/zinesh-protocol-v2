@@ -39,8 +39,15 @@ export interface PostgresConfig {
   };
 }
 
+/** Bounded probe budget. Not a domain rule. Not operator-configurable. */
+export const READY_CHECK_TIMEOUT_MS = 500;
+const READY_SUCCESS_CACHE_MS = 1_000;
+
 export class PostgresPersistenceAdapter implements PersistenceAdapter {
   private readonly pool: Pool;
+  private closed = false;
+  private readyCheckInFlight: Promise<boolean> | undefined;
+  private readySuccessUntil = 0;
   readonly eventStore: PostgresEventStore;
   readonly snapshotStore: PostgresSnapshotStore;
   readonly commandExecutionStore: PostgresCommandExecutionStore;
@@ -75,6 +82,68 @@ export class PostgresPersistenceAdapter implements PersistenceAdapter {
   }
 
   async disconnect(): Promise<void> {
+    this.closed = true;
+    this.readySuccessUntil = 0;
     await this.pool.end();
   }
+
+  /**
+   * Orchestrator readiness only. SELECT 1 plus expected schema version.
+   * Never migrates. Never throws driver, SQL, host, or secret details.
+   */
+  readyCheck(): Promise<boolean> {
+    if (this.closed) {
+      return Promise.resolve(false);
+    }
+    if (Date.now() < this.readySuccessUntil) {
+      return Promise.resolve(true);
+    }
+    if (this.readyCheckInFlight !== undefined) {
+      return this.readyCheckInFlight;
+    }
+    const pending = this.executeReadyCheck().finally(() => {
+      if (this.readyCheckInFlight === pending) {
+        this.readyCheckInFlight = undefined;
+      }
+    });
+    this.readyCheckInFlight = pending;
+    return pending;
+  }
+
+  private async executeReadyCheck(): Promise<boolean> {
+    if (this.closed) {
+      return false;
+    }
+    try {
+      await withTimeout(this.queryReadiness(), READY_CHECK_TIMEOUT_MS);
+      if (this.closed) {
+        return false;
+      }
+      this.readySuccessUntil = Date.now() + READY_SUCCESS_CACHE_MS;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async queryReadiness(): Promise<void> {
+    await this.pool.query('SELECT 1');
+    await this.migrator.verifyExpectedVersion();
+  }
+}
+
+function withTimeout(work: Promise<void>, timeoutMs: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('ready-check-timeout')), timeoutMs);
+    work.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
 }
