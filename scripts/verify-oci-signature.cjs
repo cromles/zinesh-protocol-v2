@@ -3,7 +3,7 @@
 const assert = require('node:assert/strict');
 const { createHash, randomBytes } = require('node:crypto');
 const {
-  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
+  chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
 } = require('node:fs');
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
@@ -22,6 +22,8 @@ assert.match(expectedDigest, /^sha256:[0-9a-f]{64}$/, 'expected digest must be s
 const suffix = `${process.pid}-${Date.now()}`;
 const work = mkdtempSync(join(tmpdir(), 'zinesh-oci-trust-'));
 const layout = join(work, 'layout');
+const subjectLayout = join(work, 'subject');
+const mutatedLayout = join(work, 'mutated');
 const pulled = join(work, 'pulled');
 const trustedKeys = join(work, 'trusted-keys');
 const wrongKeys = join(work, 'wrong-keys');
@@ -77,9 +79,10 @@ function execute() {
   secrets.push(readFileSync(join(trustedKeys, 'cosign.key'), 'utf8'));
   secrets.push(readFileSync(join(wrongKeys, 'cosign.key'), 'utf8'));
 
+  materializeSubjectLayout(layout, subjectLayout, expectedDigest);
   skopeo([
     'copy', '--preserve-digests', '--format', 'oci',
-    '--dest-tls-verify=false', `oci:${layout}@${expectedDigest}`, `docker://${runtimeRef}`,
+    '--dest-tls-verify=false', `oci:${subjectLayout}`, `docker://${runtimeRef}`,
   ]);
   cosign(['sign', '--key', '/work/cosign.key', '--tlog-upload=false',
     '--allow-insecure-registry', '--yes', runtimeRef], trustedKeys);
@@ -104,7 +107,7 @@ function execute() {
 
   skopeo([
     'copy', '--preserve-digests', '--format', 'oci', '--dest-tls-verify=false',
-    `oci:${layout}@${expectedDigest}`, `docker://${unsignedRef}`,
+    `oci:${subjectLayout}`, `docker://${unsignedRef}`,
   ]);
   expectVerifyFailure('UNSIGNED', unsignedRef, trustedKeys);
   expectVerifyFailure('WRONG KEY', runtimeRef, wrongKeys);
@@ -112,9 +115,10 @@ function execute() {
   const mutatedDigest = mutateRuntimeSubject(layout, expectedDigest);
   assert.notEqual(mutatedDigest, expectedDigest, 'mutated manifest digest must differ from the signed digest');
   const mutatedRef = `registry.test:5000/zinesh/mutated@${mutatedDigest}`;
+  materializeSubjectLayout(layout, mutatedLayout, mutatedDigest);
   skopeo([
     'copy', '--preserve-digests', '--format', 'oci', '--dest-tls-verify=false',
-    `oci:${layout}@${mutatedDigest}`, `docker://${mutatedRef}`,
+    `oci:${mutatedLayout}`, `docker://${mutatedRef}`,
   ]);
   const sigTag = `sha256-${expectedDigest.slice('sha256:'.length)}.sig`;
   const mutatedSigTag = `sha256-${mutatedDigest.slice('sha256:'.length)}.sig`;
@@ -153,6 +157,30 @@ function flatten(directory, entries) {
 
 function blob(directory, digest) {
   return JSON.parse(readFileSync(join(directory, 'blobs', 'sha256', digest.replace('sha256:', '')), 'utf8'));
+}
+
+function materializeSubjectLayout(sourceDir, destDir, digest) {
+  rmSync(destDir, { recursive: true, force: true });
+  mkdirSync(join(destDir, 'blobs', 'sha256'), { recursive: true });
+  writeFileSync(join(destDir, 'oci-layout'), readFileSync(join(sourceDir, 'oci-layout')));
+  const manifest = blob(sourceDir, digest);
+  const hexes = [digest, manifest.config.digest, ...(manifest.layers ?? []).map((layer) => layer.digest)]
+    .map((value) => value.replace(/^sha256:/, ''));
+  for (const hex of hexes) {
+    cpSync(join(sourceDir, 'blobs', 'sha256', hex), join(destDir, 'blobs', 'sha256', hex));
+  }
+  const descriptors = flatten(sourceDir, JSON.parse(readFileSync(join(sourceDir, 'index.json'), 'utf8')).manifests ?? []);
+  const subject = descriptors.find((entry) => entry.digest === digest);
+  assert.ok(subject, 'subject descriptor is missing from the source OCI layout');
+  writeFileSync(join(destDir, 'index.json'), `${JSON.stringify({
+    schemaVersion: 2,
+    manifests: [{
+      mediaType: subject.mediaType,
+      digest: subject.digest,
+      size: subject.size,
+      platform: subject.platform ?? { os: 'linux', architecture: 'amd64' },
+    }],
+  })}\n`);
 }
 
 function ociLayoutDigest(directory) {
