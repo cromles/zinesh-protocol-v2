@@ -74,7 +74,7 @@ import {
   ZERO_VERSION,
 } from '../core/types';
 import type { CellId, Event, Version } from '../core/types';
-import { cellKernel } from '../kernel';
+import { PostgresMigrator } from './postgres-migrator';
 
 // ---------------------------------------------------------------------------
 // Skip guard — tests require a real PostgreSQL instance
@@ -782,6 +782,8 @@ maybeDescribe('PostgreSQL Persistence', () => {
   });
 
   test('34. readyCheck succeeds for SELECT 1 and expected schema without migrating', async () => {
+    const pool = (adapter as unknown as { pool: Pool }).pool;
+    await new PostgresMigrator(pool).migrate();
     const migrate = jest.spyOn(adapter.migrator, 'migrate');
     await expect(adapter.readyCheck()).resolves.toBe(true);
     expect(migrate).not.toHaveBeenCalled();
@@ -791,6 +793,7 @@ maybeDescribe('PostgreSQL Persistence', () => {
   test('35. readyCheck coalesces in-flight work and caches success for at most one second', async () => {
     await new Promise((resolve) => setTimeout(resolve, READY_CHECK_TIMEOUT_MS + 600));
     const pool = (adapter as unknown as { pool: Pool }).pool;
+    await new PostgresMigrator(pool).migrate();
     let selectCount = 0;
     const original = pool.query.bind(pool) as Pool['query'];
     const spy = jest.spyOn(pool, 'query').mockImplementation((...args: Parameters<Pool['query']>) => {
@@ -814,6 +817,7 @@ maybeDescribe('PostgreSQL Persistence', () => {
     const extra = new PostgresPersistenceAdapter(pgConfig);
     await extra.connect();
     const pool = (extra as unknown as { pool: Pool }).pool;
+    await new PostgresMigrator(pool).migrate();
     await pool.query('INSERT INTO schema_migrations(version,name) VALUES (99,$1)', ['probe-break']);
     try {
       const result = await extra.readyCheck();
