@@ -111,8 +111,8 @@ An empty, unmigrated database must still fail-close serving startup.
 |---|---|
 | `migrate.js` throws | Existing transactional rollback and advisory lock (schema apply) |
 | Serving process crash | Restart the same image. The database is unchanged. |
-| Successful schema apply must be undone | Restore a **pre-apply** backup onto a fresh database, then run the **previous** image. There are no down migrations. |
-| Corrupt or lost database | Fresh PostgreSQL 16 cluster plus restore of the last good dump, then the matching serving image |
+| Successful schema apply must be undone | Restore a **pre-apply** backup onto a fresh database, then run the **previous signed digest**. There are no down migrations. |
+| Corrupt or lost database | Fresh PostgreSQL 16 cluster plus restore of the last good dump, then the matching **signed** serving digest |
 
 Image rollout is orchestration. This contract defines the database half.
 
@@ -127,5 +127,5 @@ Image rollout is orchestration. This contract defines the database half.
 ## Out of scope
 
 WAL archiving, point-in-time recovery, streaming replicas, failover, cloud
-snapshot products, registry, signing, deployment manifests, mixed-version
+snapshot products, deployment manifests, mixed-version
 application/schema compatibility, down migrations, and payment integration.
