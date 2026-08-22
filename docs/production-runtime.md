@@ -79,7 +79,28 @@ password content, invalid CA PEM, or any forbidden TLS bypass variable must exit
 the process with status `1`. Errors name the variable. They must not print
 password, CA, or private-key contents, connection strings, or driver internals.
 
+## Process probes
+
+The public HTTPS listener serves unauthenticated `GET /live` and `GET /ready`.
+There is no plaintext health port.
+
+Probe requests still require TLS and an allowed `Host`. Orchestrators must send
+`Host` from `TLS_ALLOWED_HOSTS`. Query strings are not accepted (`GET /ready?x`
+is `404`). `Authorization` is ignored and not parsed.
+
+| Path | Ready meaning |
+|---|---|
+| `GET /live` | Process can answer. No PostgreSQL, schema, JWKS, or telemetry check. `200` during graceful shutdown. |
+| `GET /ready` | Listener is up, runtime is not shutting down, PostgreSQL answers `SELECT 1`, schema is exactly the expected version, and the pool is not ended. |
+
+Bodies are opaque: `{"status":"ok"}` or `{"status":"unavailable"}`. They never
+include schema version, host, path, pool state, driver errors, or telemetry.
+
+`GET /ready` becoming `503` is the drain signal. `POST /commands` after
+`beginShutdown()` returns `503 {"error":{"code":"RUNTIME_UNAVAILABLE"}}`.
+Liveness stays `200` until the process exits.
+
 ## Out of scope
 
-Health/readiness endpoints, migrations, backup, registry, signing, deployment,
-and payment integration are not part of this contract.
+Migrations, backup, registry, signing, deployment, and payment integration
+are not part of this contract.

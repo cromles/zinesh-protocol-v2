@@ -21,6 +21,7 @@ for (const name of ['PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER', 'PG_PASSWORD_FIL
 const suffix = `${process.pid}-${Date.now()}`;
 const database = `zinesh_artifact_smoke_${process.pid}_${Date.now()}`;
 const container = `zinesh-artifact-smoke-${suffix}`;
+const hang = `zinesh-jwks-hang-${suffix}`;
 const volume = `zinesh-artifact-tls-${suffix}`;
 const directory = mkdtempSync(join(tmpdir(), 'zinesh-artifact-tls-'));
 const base = 'node:24.18.1-alpine3.23@sha256:ba63d8e0b5d4cbc6db9da12ea77ddb35a4783ad653a092ef115cc383526d4369';
@@ -75,7 +76,7 @@ async function execute() {
     PG_TLS_MODE: 'verify-full', PG_TLS_CA_PATH: '/run/zinesh-tls/database-ca.pem',
     AUTH_TRUSTED_ISSUER: 'https://issuer.artifact.test', AUTH_TRUSTED_AUDIENCE: 'zinesh-artifact-smoke',
     AUTH_JWKS_URL: 'https://jwks.artifact.test/keys', AUTH_ALLOWED_ALGORITHM: 'RS256',
-    AUTH_CLOCK_SKEW_SECONDS: '30', AUTH_JWKS_CACHE_TTL_MS: '60000', AUTH_JWKS_TIMEOUT_MS: '1000',
+    AUTH_CLOCK_SKEW_SECONDS: '30', AUTH_JWKS_CACHE_TTL_MS: '60000', AUTH_JWKS_TIMEOUT_MS: '3000',
     HTTPS_HOST: '0.0.0.0', HTTPS_PORT: '8443', HTTP_MAX_BODY_BYTES: '65536',
     HTTP_MAX_HEADER_BYTES: '16384', HTTP_REQUEST_TIMEOUT_MS: '5000', HTTP_HEADERS_TIMEOUT_MS: '4000',
     HTTP_MAX_CONCURRENT_REQUESTS: '32', TLS_CERTIFICATE_PATH: '/run/zinesh-tls/certificate.pem',
@@ -100,6 +101,15 @@ async function execute() {
   ];
   for (const [name, value] of Object.entries(environment)) args.push('--env', `${name}=${value}`);
   args.push(image);
+
+  run([
+    'run', '--detach', '--name', hang,
+    '--network', process.env.PG_TLS_DOCKER_NETWORK,
+    '--network-alias', 'jwks.artifact.test',
+    '--entrypoint', 'node', base, '-e',
+    'require("net").createServer((socket) => { socket.on("error", () => undefined); }).listen(443);',
+  ]);
+  assert.equal(run(['inspect', hang, '--format', '{{.State.Running}}']).stdout.trim(), 'true');
   run(args);
 
   try {
@@ -122,13 +132,46 @@ async function execute() {
     const response = await waitForHttps(port);
     assert.equal(response.statusCode, 404);
     assert.match(response.body, /"NOT_FOUND"/);
+    const live = await httpsRequest(port, '/live');
+    assert.equal(live.statusCode, 200);
+    assert.equal(live.body, '{"status":"ok"}');
+    const ready = await httpsRequest(port, '/ready');
+    assert.equal(ready.statusCode, 200);
+    assert.equal(ready.body, '{"status":"ok"}');
+    const root = await httpsRequest(port, '/');
+    assert.equal(root.statusCode, 404);
+    const queried = await httpsRequest(port, '/ready?x=1');
+    assert.equal(queried.statusCode, 404);
+    assert.match(queried.body, /"NOT_FOUND"/);
     await delay(100);
     const logs = run(['logs', container]).stdout.trim().split(/\r?\n/).filter(Boolean);
     assert.ok(logs.some((line) => { try { JSON.parse(line); return true; } catch { return false; } }),
       'container did not emit JSON logging');
     const password = readFileSync(process.env.PG_PASSWORD_FILE, 'utf8');
     assert.equal(run(['logs', container]).stdout.includes(password), false, 'password leaked in success logs');
-    run(['stop', '--time', '15', container]);
+    httpsPostCommands(port);
+    await delay(150);
+    run(['kill', '-s', 'SIGTERM', container]);
+    let observedDrain = false;
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      try {
+        const liveDrain = await httpsRequest(port, '/live');
+        const readyDrain = await httpsRequest(port, '/ready');
+        if (liveDrain.statusCode === 200 && liveDrain.body === '{"status":"ok"}'
+          && readyDrain.statusCode === 503 && readyDrain.body === '{"status":"unavailable"}') {
+          assert.equal(readyDrain.body.includes('schema'), false);
+          assert.equal(readyDrain.body.includes(password), false);
+          observedDrain = true;
+          break;
+        }
+      } catch {
+        // The process may close the listener after drain completes.
+      }
+      await delay(50);
+    }
+    assert.equal(observedDrain, true, 'did not observe live=200 and ready=503 during drain');
+    const wait = spawnSync('docker', ['wait', container], { encoding: 'utf8', timeout: 20_000 });
+    assert.equal(wait.status, 0, `docker wait failed: ${wait.stderr}`);
     const state = JSON.parse(run(['inspect', container, '--format', '{{json .State}}']).stdout);
     assert.equal(state.ExitCode, 0, `SIGTERM shutdown exit code was ${state.ExitCode}`);
     assert.equal(state.OOMKilled, false);
@@ -188,16 +231,16 @@ function loadTlsFixture() {
 async function waitForHttps(port) {
   let lastError;
   for (let attempt = 0; attempt < 40; attempt += 1) {
-    try { return await httpsGet(port); } catch (error) { lastError = error; await delay(250); }
+    try { return await httpsRequest(port, '/'); } catch (error) { lastError = error; await delay(250); }
     const status = spawnSync('docker', ['inspect', container, '--format', '{{.State.Status}}'], { encoding: 'utf8' });
     if (status.status === 0 && status.stdout.trim() === 'exited') break;
   }
   throw new Error(`HTTPS startup failed: ${lastError}; logs=${spawnSync('docker', ['logs', container], { encoding: 'utf8' }).stdout}`);
 }
 
-function httpsGet(port) {
+function httpsRequest(port, requestPath) {
   return new Promise((resolve, reject) => {
-    const req = request({ hostname: '127.0.0.1', port, path: '/', method: 'GET', rejectUnauthorized: false,
+    const req = request({ hostname: '127.0.0.1', port, path: requestPath, method: 'GET', rejectUnauthorized: false,
       headers: { host: 'localhost' } }, (response) => {
       const chunks = [];
       response.on('data', (chunk) => chunks.push(chunk));
@@ -207,9 +250,32 @@ function httpsGet(port) {
   });
 }
 
+function httpsPostCommands(port) {
+  const header = Buffer.from(JSON.stringify({ alg: 'RS256', kid: 'smoke-key' })).toString('base64url');
+  const claims = Buffer.from(JSON.stringify({
+    iss: 'https://issuer.artifact.test', sub: 'smoke-subject', aud: 'zinesh-artifact-smoke',
+    exp: Math.floor(Date.now() / 1000) + 300,
+  })).toString('base64url');
+  const token = `${header}.${claims}.not-a-signature`;
+  const req = request({ hostname: '127.0.0.1', port, path: '/commands', method: 'POST', rejectUnauthorized: false,
+    headers: { host: 'localhost', authorization: `Bearer ${token}`, 'content-type': 'application/json' } },
+  () => undefined);
+  req.on('error', () => undefined);
+  req.end(JSON.stringify({
+    command: {
+      commandId: 'smoke-drain', cellId: 'smoke-drain-cell', type: 'CreateCell',
+      payload: {
+        payer: 'payer-1', payee: 'payee-1', amount: '10000', currency: 'TRY',
+        fundingDeadline: 2_000_000, completionDeadline: 5_000_000,
+      },
+    },
+  }));
+}
+
 function delay(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 async function cleanup() {
   spawnSync('docker', ['rm', '-f', container], { encoding: 'utf8' });
+  spawnSync('docker', ['rm', '-f', hang], { encoding: 'utf8' });
   spawnSync('docker', ['rm', '-f', `${container}-world-readable`], { encoding: 'utf8' });
   spawnSync('docker', ['volume', 'rm', '-f', volume], { encoding: 'utf8' });
   rmSync(directory, { recursive: true, force: true });

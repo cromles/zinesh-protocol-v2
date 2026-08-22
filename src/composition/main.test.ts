@@ -14,6 +14,7 @@ import {
   composeRuntime,
   createCommandGate,
   createProcessEventIdPrefix,
+  createProcessProbes,
   loadPostgresConfig,
   loadAuthenticationConfig,
   loadPublicIngressConfig,
@@ -447,6 +448,21 @@ describe('createCommandGate', () => {
   });
 });
 
+describe('createProcessProbes', () => {
+  test('readiness is false while shutting down and ignores persistence success', async () => {
+    const gate = createCommandGate();
+    const persistence = {
+      async readyCheck() { return true; },
+    } as PostgresPersistenceAdapter;
+    const probes = createProcessProbes(gate, persistence);
+    await expect(probes.readyCheck()).resolves.toBe(true);
+    expect(probes.shuttingDown()).toBe(false);
+    gate.beginShutdown();
+    expect(probes.shuttingDown()).toBe(true);
+    await expect(probes.readyCheck()).resolves.toBe(true);
+  });
+});
+
 describe('performShutdown', () => {
   test('exits 0 after drain and disconnect', async () => {
     const gate = createCommandGate();
@@ -616,6 +632,7 @@ describe('constitution', () => {
     expect(src).not.toMatch(/TERMINAL_STATUSES/);
     expect(src).not.toMatch(/eventFolder/);
     expect(src).not.toMatch(/DEADLINE_VIOLATION/);
+    expect(src).not.toMatch(/\.migrate\(/);
     expect(src).toMatch(/PostgresPersistenceAdapter/);
     expect(src).toMatch(/cellKernel/);
     expect(src).toMatch(/systemClock/);
