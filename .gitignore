@@ -6,6 +6,7 @@ coverage/
 *.tsbuildinfo
 *.log
 *.oci.tar
+*.dump
 *.sbom.json
 *.scan.json
 *.metadata.json
