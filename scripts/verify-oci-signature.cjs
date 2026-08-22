@@ -85,7 +85,7 @@ function execute() {
     '--dest-tls-verify=false', `oci:${subjectLayout}`, `docker://${runtimeRef}`,
   ]);
   cosign(['sign', '--key', '/work/cosign.key', '--tlog-upload=false',
-    '--allow-insecure-registry', '--yes', runtimeRef], trustedKeys);
+    '--allow-http-registry', '--allow-insecure-registry', '--yes', runtimeRef], trustedKeys);
   skopeo([
     'copy', '--preserve-digests', '--src-tls-verify=false',
     `docker://${runtimeRef}`, `oci:${pulled}`,
@@ -95,7 +95,7 @@ function execute() {
   assertDigestEqual(inspected, expectedDigest);
   assertDigestEqual(pulledDigest, expectedDigest);
   cosign(['verify', '--key', '/work/cosign.pub', '--insecure-ignore-tlog',
-    '--allow-insecure-registry', runtimeRef], trustedKeys);
+    '--allow-http-registry', '--allow-insecure-registry', runtimeRef], trustedKeys);
 
   process.stdout.write([
     'SIGN:', 'PASS',
@@ -221,7 +221,8 @@ function mutateRuntimeSubject(directory, subjectDigest) {
 
 function generateKeyPair(directory, password) {
   chmodSync(directory, 0o700);
-  writeFileSync(join(directory, '.cosign-env'), `COSIGN_PASSWORD=${password}\nCOSIGN_YES=true\n`, { mode: 0o600 });
+  writeFileSync(join(directory, '.cosign-env'),
+    `COSIGN_PASSWORD=${password}\nCOSIGN_YES=true\n`, { mode: 0o600 });
   cosign(['generate-key-pair'], directory);
   chmodSync(join(directory, 'cosign.key'), 0o600);
   chmodSync(join(directory, 'cosign.pub'), 0o600);
@@ -248,7 +249,7 @@ function assertDigestEqual(actual, expected) {
 function expectVerifyFailure(label, imageRef, keyDir) {
   expectFailure(label, () => {
     cosign(['verify', '--key', '/work/cosign.pub', '--insecure-ignore-tlog',
-      '--allow-insecure-registry', imageRef], keyDir);
+      '--allow-http-registry', '--allow-insecure-registry', imageRef], keyDir);
   });
 }
 
