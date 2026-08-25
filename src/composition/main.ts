@@ -21,6 +21,8 @@ import type {
   AuthenticationPort,
   ExternalCommandRequest,
   FundingEvidencePort,
+  FundingConfirmationRequest,
+  FundingDestinationResolver,
   PrincipalAuthority,
 } from '../security/trusted-ingress';
 import {
@@ -421,6 +423,7 @@ export interface ComposedRuntime {
   readonly preAuthenticationRateLimiter: RateLimiter;
   readonly telemetry: SecurityTelemetry;
   handleCommand(request: ExternalCommandRequest): Promise<HandleCommandResult>;
+  handleFundingConfirmation(request: FundingConfirmationRequest): Promise<HandleCommandResult>;
 }
 
 export interface SecurityPorts {
@@ -428,6 +431,7 @@ export interface SecurityPorts {
   readonly principals: PrincipalAuthority;
   readonly fundingEvidence: FundingEvidencePort;
   readonly principalRateLimiter: RateLimiter;
+  readonly fundingDestinations: FundingDestinationResolver;
 }
 
 export function composeRuntime(
@@ -459,6 +463,7 @@ export function composeRuntime(
     security?.fundingEvidence ?? rejectAllFundingEvidence,
     principalRateLimiter,
     telemetry,
+    security?.fundingDestinations,
   );
 
   return {
@@ -468,6 +473,9 @@ export function composeRuntime(
     telemetry,
     handleCommand(request: ExternalCommandRequest): Promise<HandleCommandResult> {
       return gate.run(() => ingress.handle(request));
+    },
+    handleFundingConfirmation(request: FundingConfirmationRequest): Promise<HandleCommandResult> {
+      return gate.run(() => ingress.handleFundingConfirmation(request));
     },
   };
 }

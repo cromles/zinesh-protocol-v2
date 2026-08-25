@@ -18,6 +18,8 @@
 import type { PersistenceAdapter } from '../adapters/persistence-adapter';
 import type { EventStore } from '../adapters/event-store';
 import type { EventStoreError } from '../adapters/event-store';
+import type { FundingReceiptStore } from '../adapters/funding-receipt-store';
+import { createHash } from 'crypto';
 import type {
   ActorId,
   Amount,
@@ -54,6 +56,7 @@ import {
 } from './errors';
 import type { TrustedHandleCommandRequest, HandleCommandResult } from './types';
 import { isVerifiedFundingContext, isVerifiedPrincipal } from '../security/trusted-ingress';
+import type { FundingReceipt, VerifiedFundingContext } from '../funding/types';
 
 const RECOGNIZED_COMMAND_TYPES: ReadonlySet<DomainCommandType> = new Set([
   'CreateCell',
@@ -130,8 +133,10 @@ export class CellApplication {
       execution = await this.persistence.commandExecutionStore.execute(
         command.commandId,
         fingerprint,
-        async (eventStore) => ({
-          encodedResult: canonicalEncode(await this.executeOnce(command, now, eventStore)),
+        async (eventStore, fundingReceiptStore) => ({
+          encodedResult: canonicalEncode(await this.executeOnce(
+            command, now, eventStore, fundingReceiptStore, request.fundingContext,
+          )),
         }),
       );
     } catch (err) {
@@ -161,6 +166,8 @@ export class CellApplication {
     command: Command,
     now: Timestamp,
     eventStore: EventStore,
+    fundingReceiptStore: FundingReceiptStore,
+    fundingContext?: VerifiedFundingContext,
   ): Promise<HandleCommandResult> {
 
     const cellId = command.cellId;
@@ -196,6 +203,18 @@ export class CellApplication {
     }
 
     if (kernelResult.events.length > 0) {
+      if (command.type === 'FundCell') {
+        const fundedEvent = kernelResult.events.find((event) => event.type === 'CellFunded');
+        if (fundedEvent === undefined || fundingContext === undefined) {
+          return applicationRejection({ type: 'ApplicationError', code: 'FUNDING_EVIDENCE_INVALID', message: 'Verified funding evidence required' });
+        }
+        const claimed = await fundingReceiptStore.claim(
+          createFundingReceipt(fundingContext, command, fundedEvent, now),
+        );
+        if (claimed.kind !== 'CLAIMED') {
+          return applicationRejection({ type: 'ApplicationError', code: 'FUNDING_RECEIPT_CONFLICT', message: 'Funding receipt identity conflicts with an existing receipt' });
+        }
+      }
       let appendResult;
       try {
         appendResult = await eventStore.append(
@@ -221,6 +240,29 @@ export class CellApplication {
       version,
     };
   }
+
+  async getCellState(cellId: CellId): Promise<CellState | null> {
+    const events = await this.persistence.eventStore.getEvents(cellId);
+    if (events.length === 0) return null;
+    const evolved = this.kernel.evolve(cellId, events);
+    if (isKernelError(evolved)) throw new Error('Invalid authoritative cell stream');
+    return evolved;
+  }
+}
+
+function createFundingReceipt(
+  context: VerifiedFundingContext, command: Command, event: Event, now: Timestamp,
+): FundingReceipt {
+  const receiptId = `funding-${createHash('sha256')
+    .update(`${context.provider}\u0000${context.providerTransactionId}`).digest('hex')}`;
+  return {
+    receiptId, provider: context.provider, providerTransactionId: context.providerTransactionId,
+    cellId: command.cellId, commandId: command.commandId, fundingEventId: event.eventId,
+    gatewayPrincipalId: context.gatewayPrincipalId, payer: context.payer, amount: context.amount,
+    currency: context.currency, destinationId: context.destinationId, confirmedAt: context.confirmedAt,
+    finality: context.finality, evidenceDigest: context.evidenceDigest, verifiedAt: context.verifiedAt,
+    createdAt: now,
+  };
 }
 
 function callerMatchesCommand(actorId: ActorId, command: Command): boolean {

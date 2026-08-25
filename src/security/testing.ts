@@ -1,6 +1,6 @@
 import type { ActorId } from '../core/types';
 import type { PrincipalRecord } from './trusted-ingress';
-import { TrustedCommandIngress } from './trusted-ingress';
+import { TrustedCommandIngress, rejectAllFundingEvidence } from './trusted-ingress';
 import type { CellApplication } from '../application/cell-application';
 import type { RateLimiter } from './rate-limiter';
 
@@ -14,7 +14,7 @@ export interface TestIdentity {
 export function createTestIngress(
   application: CellApplication,
   identities: ReadonlyArray<TestIdentity>,
-  fundingVerifier: ConstructorParameters<typeof TrustedCommandIngress>[3] = { async verify() { return null; } },
+  fundingVerifier: ConstructorParameters<typeof TrustedCommandIngress>[3] = rejectAllFundingEvidence,
   principalRateLimiter?: RateLimiter,
 ): TrustedCommandIngress {
   const byCredential = new Map(identities.map((entry) => [entry.credential, {
@@ -33,6 +33,8 @@ export function createTestIngress(
     { async resolve(identity) { return bySubject.get(`${identity.issuer}\u0000${identity.subject}`) ?? null; } },
     fundingVerifier,
     principalRateLimiter,
+    undefined,
+    { async resolve() { return 'test-custody'; } },
   );
 }
 

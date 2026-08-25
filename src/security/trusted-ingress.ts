@@ -1,5 +1,6 @@
-import type { ActorId, Command } from '../core/types';
-import type { VerifiedFundingContext } from '../funding/types';
+import type { ActorId, CellId, Command, CommandId } from '../core/types';
+import { makeActorId, makeAmount } from '../core/types';
+import type { ExpectedFundingBinding, FundingEvidence, FundingVerificationResult, VerifiedFundingContext } from '../funding/types';
 export type { VerifiedFundingContext } from '../funding/types';
 import type { CellApplication } from '../application/cell-application';
 import type { HandleCommandResult, TrustedHandleCommandRequest } from '../application/types';
@@ -51,13 +52,25 @@ export interface PrincipalAuthority {
 }
 
 export interface FundingEvidencePort {
-  verify(evidence: unknown): Promise<VerifiedFundingContext | null>;
+  verify(evidence: FundingEvidence, expected: ExpectedFundingBinding): Promise<FundingVerificationResult>;
+}
+
+export interface FundingDestinationResolver {
+  resolve(provider: string): Promise<string | null>;
 }
 
 export interface ExternalCommandRequest {
   readonly credential: unknown;
   readonly command: Command;
   readonly fundingEvidence?: unknown;
+  readonly correlationId?: string;
+}
+
+export interface FundingConfirmationRequest {
+  readonly credential: unknown;
+  readonly commandId: CommandId;
+  readonly cellId: CellId;
+  readonly evidence: FundingEvidence;
   readonly correlationId?: string;
 }
 
@@ -92,14 +105,30 @@ export class TrustedCommandIngress {
     private readonly fundingEvidence: FundingEvidencePort,
     private readonly principalRateLimiter: RateLimiter = allowAllRateLimiter,
     private readonly telemetry: SecurityTelemetry = noOpSecurityTelemetry,
+    private readonly fundingDestinations: FundingDestinationResolver = rejectAllFundingDestinations,
   ) {}
 
-  async handle(request: ExternalCommandRequest): Promise<HandleCommandResult> {
+  async handleFundingConfirmation(request: FundingConfirmationRequest): Promise<HandleCommandResult> {
+    const command: Command = {
+      commandId: request.commandId, cellId: request.cellId, type: 'FundCell',
+      payload: { funderId: makeActorId('server-derived-funding-payer'), amount: makeAmount(1n) },
+    };
+    return this.handle({
+      credential: request.credential, command, fundingEvidence: request.evidence,
+      ...(request.correlationId === undefined ? {} : { correlationId: request.correlationId }),
+    });
+  }
+
+  async handle(
+    request: ExternalCommandRequest,
+    fundingBoundary?: { readonly state: Awaited<ReturnType<CellApplication['getCellState']>> & object; readonly destinationId: string },
+  ): Promise<HandleCommandResult> {
+    let command = request.command;
     const requestedCorrelationId = serverCorrelationId(request.correlationId);
-    const correlationId = requestedCorrelationId === String(request.command.commandId)
+    const correlationId = requestedCorrelationId === String(command.commandId)
       ? serverCorrelationId() : requestedCorrelationId;
     const commandContext = {
-      correlationId, commandId: String(request.command.commandId), commandType: request.command.type,
+      correlationId, commandId: String(command.commandId), commandType: command.type,
     } as const;
     const authenticationStarted = Date.now();
     let authenticated: Awaited<ReturnType<AuthenticationPort['authenticate']>>;
@@ -186,7 +215,7 @@ export class TrustedCommandIngress {
 
     const principal = verifyPrincipal(record);
     let fundingContext: VerifiedFundingContext | undefined;
-    if (request.command.type === 'FundCell') {
+    if (command.type === 'FundCell') {
       if (principal.type !== 'GATEWAY' || !principal.capabilities.includes('CONFIRM_FUNDING')) {
         this.telemetry.record({
           category: 'AUTHORIZATION', action: 'COMMAND', outcome: 'REJECTED',
@@ -195,15 +224,43 @@ export class TrustedCommandIngress {
         });
         return securityRejection('COMMAND_NOT_PERMITTED');
       }
-      const evidence = await this.fundingEvidence.verify(request.fundingEvidence);
-      if (evidence === null) {
+      if (!isFundingEvidence(request.fundingEvidence)) {
+        return securityRejection('FUNDING_EVIDENCE_INVALID');
+      }
+      if (fundingBoundary === undefined) {
+        let state;
+        try { state = await this.application.getCellState(command.cellId); }
+        catch { return fundingIngressRejection('FUNDING_DEPENDENCY_UNAVAILABLE'); }
+        if (state === null) return fundingIngressRejection('CELL_NOT_FOUND');
+        let destinationId: string | null;
+        try { destinationId = await this.fundingDestinations.resolve(request.fundingEvidence.provider); }
+        catch { return fundingIngressRejection('FUNDING_DEPENDENCY_UNAVAILABLE'); }
+        if (destinationId === null) return securityRejection('FUNDING_EVIDENCE_INVALID');
+        fundingBoundary = { state, destinationId };
+      }
+      command = { commandId: command.commandId, cellId: command.cellId, type: 'FundCell',
+        payload: { funderId: fundingBoundary.state.payer, amount: fundingBoundary.state.amount } };
+      const expected: ExpectedFundingBinding = {
+        gatewayPrincipalId: principal.principalId, cellId: command.cellId,
+        payer: fundingBoundary.state.payer, amount: fundingBoundary.state.amount,
+        currency: fundingBoundary.state.currency, destinationId: fundingBoundary.destinationId,
+      };
+      let verification: FundingVerificationResult;
+      try { verification = await this.fundingEvidence.verify(request.fundingEvidence, expected); }
+      catch { return fundingIngressRejection('FUNDING_DEPENDENCY_UNAVAILABLE'); }
+      if (verification.outcome !== 'VERIFIED') {
         this.telemetry.record({
           category: 'AUTHORIZATION', action: 'COMMAND', outcome: 'REJECTED',
           reason: 'FUNDING_EVIDENCE_INVALID', ...principalContext,
         });
+        if (verification.outcome === 'NOT_FINAL') return fundingIngressRejection('FUNDING_NOT_FINAL');
+        if (verification.outcome === 'DEPENDENCY_UNAVAILABLE') return fundingIngressRejection('FUNDING_DEPENDENCY_UNAVAILABLE');
         return securityRejection('FUNDING_EVIDENCE_INVALID');
       }
-      fundingContext = verifyFundingContext(evidence);
+      if (!matchesExpectedBinding(verification.context, expected)) {
+        return securityRejection('FUNDING_EVIDENCE_INVALID');
+      }
+      fundingContext = verifyFundingContext(verification.context);
     }
 
     this.telemetry.record({
@@ -211,8 +268,8 @@ export class TrustedCommandIngress {
     });
 
     const trusted: TrustedHandleCommandRequest = fundingContext === undefined
-      ? { command: request.command, principal }
-      : { command: request.command, principal, fundingContext };
+      ? { command, principal }
+      : { command, principal, fundingContext };
     const commandStarted = Date.now();
     const result = await this.application.handleCommand(trusted);
     this.recordCommandResult(result, commandStarted, principalContext);
@@ -263,7 +320,28 @@ export const emptyPrincipalAuthority: PrincipalAuthority = {
 };
 
 export const rejectAllFundingEvidence: FundingEvidencePort = {
-  async verify() { return null; },
+  async verify() { return { outcome: 'INVALID', reason: 'UNSUPPORTED_PAYMENT' }; },
 };
+
+export const rejectAllFundingDestinations: FundingDestinationResolver = {
+  async resolve() { return null; },
+};
+
+function isFundingEvidence(value: unknown): value is FundingEvidence {
+  return typeof value === 'object' && value !== null
+    && typeof (value as FundingEvidence).provider === 'string'
+    && typeof (value as FundingEvidence).providerTransactionId === 'string';
+}
+
+function matchesExpectedBinding(context: VerifiedFundingContext, expected: ExpectedFundingBinding): boolean {
+  return context.gatewayPrincipalId === expected.gatewayPrincipalId && context.cellId === expected.cellId
+    && context.payer === expected.payer && context.amount === expected.amount
+    && context.currency === expected.currency && context.destinationId === expected.destinationId
+    && context.finality === 'SETTLED';
+}
+
+function fundingIngressRejection(code: 'FUNDING_NOT_FINAL' | 'FUNDING_DEPENDENCY_UNAVAILABLE' | 'CELL_NOT_FOUND' | 'FUNDING_EVIDENCE_INVALID'): HandleCommandResult {
+  return { outcome: 'APPLICATION_REJECTION', error: { type: 'ApplicationError', code, message: 'Funding confirmation rejected' } };
+}
 
 function elapsed(started: number): number { return Math.max(0, Date.now() - started); }

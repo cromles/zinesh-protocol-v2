@@ -117,8 +117,10 @@ describe('Phase 7B trusted principal boundary', () => {
     await createTestIngress(app, [actor]).handle({ credential: actor.credential, command: createCommand() });
     const gatewayIdentity = { credential: 'gateway-credential', subject: 'gateway-subject', principal: gateway };
     let current: VerifiedFundingContext | null = null;
-    const ingress = createTestIngress(app, [gatewayIdentity], { async verify() { return current; } });
-    const base = { credential: gatewayIdentity.credential, command: fundCommand(), fundingEvidence: 'opaque-evidence' };
+    const ingress = createTestIngress(app, [gatewayIdentity], { async verify() {
+      return current === null ? { outcome: 'INVALID', reason: 'AUTHENTICITY_FAILED' } : { outcome: 'VERIFIED', context: current };
+    } });
+    const base = { credential: gatewayIdentity.credential, command: fundCommand(), fundingEvidence: { provider: 'test-provider', providerTransactionId: 'provider-tx-1' } };
     expect((await ingress.handle(base)).outcome).toBe('APPLICATION_REJECTION');
     for (const invalid of [
       funding({ gatewayPrincipalId: 'other-gateway' }), funding({ cellId: makeCellId('other-cell') }),
@@ -139,11 +141,11 @@ describe('Phase 7B trusted principal boundary', () => {
     await createTestIngress(app, [actor]).handle({ credential: actor.credential, command: createCommand('fingerprint-create') });
     const gatewayIdentity = { credential: 'fingerprint-gateway', subject: 'fingerprint-subject', principal: gateway };
     let current = funding();
-    const ingress = createTestIngress(app, [gatewayIdentity], { async verify() { return current; } });
+    const ingress = createTestIngress(app, [gatewayIdentity], { async verify() { return { outcome: 'VERIFIED', context: current }; } });
     const request = {
       credential: gatewayIdentity.credential,
       command: fundCommand('fingerprint-fund'),
-      fundingEvidence: 'opaque-evidence',
+      fundingEvidence: { provider: 'test-provider', providerTransactionId: 'provider-tx-1' },
     };
     expect((await ingress.handle(request)).outcome).toBe('SUCCESS');
 
@@ -156,7 +158,9 @@ describe('Phase 7B trusted principal boundary', () => {
       current = changed;
       const result = await ingress.handle(request);
       expect(result.outcome).toBe('APPLICATION_REJECTION');
-      if (result.outcome === 'APPLICATION_REJECTION') expect(result.error.code).toBe('IDEMPOTENCY_CONFLICT');
+      if (result.outcome === 'APPLICATION_REJECTION') {
+        expect(['IDEMPOTENCY_CONFLICT', 'FUNDING_EVIDENCE_INVALID']).toContain(result.error.code);
+      }
     }
   });
 

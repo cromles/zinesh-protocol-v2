@@ -165,8 +165,8 @@ function makeApp(now: Timestamp = T0): AppHarness {
   };
   const ingress = createTestIngress(application, [...identities, gatewayIdentity], {
     async verify(evidence) {
-      if (typeof evidence !== 'object' || evidence === null) return null;
-      return evidence as import('../security/trusted-ingress').VerifiedFundingContext;
+      if (typeof evidence !== 'object' || evidence === null) return { outcome: 'INVALID', reason: 'AUTHENTICITY_FAILED' };
+      return { outcome: 'VERIFIED', context: evidence as import('../security/trusted-ingress').VerifiedFundingContext };
     },
   });
   const app = {
@@ -398,7 +398,7 @@ describe('4. FundCell succeeds when funderId matches payer', () => {
 // ---------------------------------------------------------------------------
 
 describe('5. Application does not bypass Kernel authorization', () => {
-  test('verified gateway FundCell with non-payer evidence is rejected by Kernel', async () => {
+  test('verified gateway FundCell with non-payer evidence is rejected before Kernel', async () => {
     const harness = makeApp();
     const cellId = nextCellId();
     await createCell(harness, cellId);
@@ -419,9 +419,9 @@ describe('5. Application does not bypass Kernel authorization', () => {
       request(command, { gateway: gateway() }),
     );
 
-    expect(result.outcome).toBe('KERNEL_REJECTION');
-    if (result.outcome !== 'KERNEL_REJECTION' || direct.ok) return;
-    expect(result.error.code).toBe('AUTHORIZATION_DENIED');
+    expect(result.outcome).toBe('APPLICATION_REJECTION');
+    if (result.outcome !== 'APPLICATION_REJECTION' || direct.ok) return;
+    expect(result.error.code).toBe('FUNDING_EVIDENCE_INVALID');
   });
 
   test('stranger RequestRelease impersonation is rejected before Kernel', async () => {
@@ -740,16 +740,15 @@ describe('17. Version conflict is surfaced as Application persistence error', ()
     ]);
 
     const outcomes = [a.outcome, b.outcome].sort();
-    expect(outcomes).toEqual(['PERSISTENCE_FAILURE', 'SUCCESS']);
+    expect(outcomes).toEqual(['APPLICATION_REJECTION', 'SUCCESS']);
 
-    const failure = a.outcome === 'PERSISTENCE_FAILURE' ? a : b;
+    const failure = a.outcome === 'APPLICATION_REJECTION' ? a : b;
     const success = a.outcome === 'SUCCESS' ? a : b;
     expect(success.outcome).toBe('SUCCESS');
-    expect(failure.outcome).toBe('PERSISTENCE_FAILURE');
-    if (failure.outcome !== 'PERSISTENCE_FAILURE') return;
+    expect(failure.outcome).toBe('APPLICATION_REJECTION');
+    if (failure.outcome !== 'APPLICATION_REJECTION') return;
     expect(failure.error.type).toBe('ApplicationError');
-    expect(failure.error.code).toBe('PERSISTENCE_FAILURE');
-    expect(failure.error.persistenceKind).toBe('APPEND_VERSION_CONFLICT');
+    expect(failure.error.code).toBe('FUNDING_RECEIPT_CONFLICT');
     expect(failure.error.message).not.toMatch(/SELECT|INSERT|pg_|password|postgresql/i);
   });
 });

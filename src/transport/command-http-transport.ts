@@ -6,13 +6,14 @@ import {
   makeActorId, makeAmount, makeCellId, makeCommandId, makeTimestamp,
 } from '../core/types';
 import type { HandleCommandResult } from '../application/types';
-import type { ExternalCommandRequest } from '../security/trusted-ingress';
+import type { ExternalCommandRequest, FundingConfirmationRequest } from '../security/trusted-ingress';
 import type { RateLimiter } from '../security/rate-limiter';
 import { noOpSecurityTelemetry, serverCorrelationId } from '../security/security-observability';
 import type { SecurityTelemetry } from '../security/security-observability';
 
 export interface CommandDispatcher {
   handleCommand(request: ExternalCommandRequest): Promise<HandleCommandResult>;
+  handleFundingConfirmation?(request: FundingConfirmationRequest): Promise<HandleCommandResult>;
 }
 
 export interface TransportAuditRecord {
@@ -133,7 +134,9 @@ export class CommandHttpTransport {
         this.respond(response, ready ? 200 : 503, { status: ready ? 'ok' : 'unavailable' });
         return;
       }
-      if (request.method !== 'POST' || request.url !== '/commands') {
+      const commandRoute = request.method === 'POST' && request.url === '/commands';
+      const fundingRoute = request.method === 'POST' && request.url === '/funding-confirmations';
+      if (!commandRoute && !fundingRoute) {
         outcome = 'NOT_FOUND'; this.respond(response, 404, { error: { code: 'NOT_FOUND' } }); return;
       }
       const maximumConcurrent = this.config.maxConcurrentRequests ?? Number.MAX_SAFE_INTEGER;
@@ -177,13 +180,22 @@ export class CommandHttpTransport {
         outcome = 'UNAUTHENTICATED'; this.respond(response, 401, { error: { code: 'UNAUTHENTICATED' } }); return;
       }
       const raw = await readBody(request, this.config.maxBodyBytes);
-      const decoded = decodeRequest(raw);
+      const decoded = commandRoute ? decodeRequest(raw) : decodeFundingRequest(raw);
       if (!decoded.ok) {
         outcome = decoded.code; this.respond(response, decoded.status, { error: { code: decoded.code } }); return;
       }
-      commandId = decoded.command.commandId;
-      commandType = decoded.command.type;
-      const result = await this.dispatcher.handleCommand({ credential, command: decoded.command, correlationId });
+      const result = commandRoute
+        ? await (async () => {
+          const command = (decoded as DecodeCommandSuccess).command;
+          commandId = String(command.commandId); commandType = command.type;
+          return this.dispatcher.handleCommand({ credential, command, correlationId });
+        })()
+        : await (async () => {
+          const funding = decoded as DecodeFundingSuccess;
+          commandId = String(funding.commandId); commandType = 'FundCell';
+          return this.dispatchFundingConfirmation({ credential, commandId: funding.commandId,
+            cellId: funding.cellId, evidence: funding.evidence, correlationId });
+        })();
       outcome = result.outcome === 'SUCCESS' ? 'SUCCESS' : result.error.code;
       const mapped = mapResult(result);
       if (mapped.retryAfterSeconds !== undefined) this.retryAfter(response, mapped.retryAfterSeconds);
@@ -247,6 +259,15 @@ export class CommandHttpTransport {
     response.statusCode = status;
     response.end(JSON.stringify(body, jsonReplacer));
   }
+
+  private dispatchFundingConfirmation(request: FundingConfirmationRequest): Promise<HandleCommandResult> {
+    if (this.dispatcher.handleFundingConfirmation === undefined) {
+      return Promise.resolve({ outcome: 'APPLICATION_REJECTION', error: {
+        type: 'ApplicationError', code: 'FUNDING_EVIDENCE_INVALID', message: 'Funding confirmation is unavailable',
+      } });
+    }
+    return this.dispatcher.handleFundingConfirmation(request);
+  }
 }
 
 class BodyTooLargeError extends Error {}
@@ -265,9 +286,13 @@ async function readBody(request: IncomingMessage, limit: number): Promise<string
   return Buffer.concat(chunks).toString('utf8');
 }
 
+type DecodeFailure = { readonly ok: false; readonly status: number; readonly code: string };
 type DecodeResult =
   | { readonly ok: true; readonly command: Command }
-  | { readonly ok: false; readonly status: number; readonly code: string };
+  | DecodeFailure;
+type DecodeCommandSuccess = Extract<DecodeResult, { readonly ok: true }>;
+type DecodeFundingSuccess = { readonly ok: true; readonly commandId: ReturnType<typeof makeCommandId>;
+  readonly cellId: ReturnType<typeof makeCellId>; readonly evidence: import('../funding/types').FundingEvidence };
 
 function decodeRequest(raw: string): DecodeResult {
   let value: unknown;
@@ -284,6 +309,7 @@ function decodeRequest(raw: string): DecodeResult {
     'ApproveRefund','ForceRefund','ExpireCell','OpenDispute','ResolveDispute',
   ]);
   if (!supported.has(input.type)) return bad('UNSUPPORTED_COMMAND');
+  if (input.type === 'FundCell') return { ok: false, status: 403, code: 'COMMAND_NOT_PERMITTED' };
   if (!safeTree(input.payload, 0)) return bad('INVALID_COMMAND');
   try {
     const payload = decodePayload(input.type, input.payload);
@@ -292,6 +318,25 @@ function decodeRequest(raw: string): DecodeResult {
       type: input.type as Command['type'], payload: payload as unknown as Command['payload'],
     } };
   } catch { return bad('INVALID_COMMAND'); }
+}
+
+function decodeFundingRequest(raw: string): DecodeFundingSuccess | DecodeFailure {
+  let value: unknown;
+  try { value = JSON.parse(raw); } catch { return bad('MALFORMED_JSON'); }
+  if (!plainObject(value) || Object.keys(value).some((key) => !['commandId', 'cellId', 'evidence'].includes(key))
+    || !boundedString(value.commandId, 128) || !boundedString(value.cellId, 128) || !plainObject(value.evidence)) {
+    return bad('INVALID_REQUEST');
+  }
+
+  const evidence = value.evidence;
+  if (Object.keys(evidence).some((key) => !['provider', 'providerTransactionId', 'opaqueEvidence'].includes(key))
+    || !boundedString(evidence.provider, 128) || !boundedString(evidence.providerTransactionId, 256)
+    || ('opaqueEvidence' in evidence && !safeTree(evidence.opaqueEvidence, 0))) return bad('INVALID_REQUEST');
+  try {
+    return { ok: true, commandId: makeCommandId(value.commandId), cellId: makeCellId(value.cellId),
+      evidence: { provider: evidence.provider, providerTransactionId: evidence.providerTransactionId,
+        ...(!('opaqueEvidence' in evidence) ? {} : { opaqueEvidence: evidence.opaqueEvidence }) } };
+  } catch { return bad('INVALID_REQUEST'); }
 }
 
 function decodePayload(type: string, payload: Record<string, unknown>): Record<string, unknown> {
@@ -325,15 +370,18 @@ function mapResult(result: HandleCommandResult): { status: number; body: unknown
   const code = result.error.code;
   const status = code === 'UNAUTHENTICATED' ? 401
     : code === 'IDEMPOTENCY_CONFLICT' ? 409
+    : code === 'FUNDING_RECEIPT_CONFLICT' ? 409
     : code === 'RATE_LIMITED' ? 429
-    : code === 'RATE_LIMIT_UNAVAILABLE' ? 503
+    : code === 'RATE_LIMIT_UNAVAILABLE' || code === 'FUNDING_DEPENDENCY_UNAVAILABLE' ? 503
+    : code === 'CELL_NOT_FOUND' ? 404
+    : code === 'FUNDING_NOT_FINAL' ? 422
     : code === 'INVALID_INPUT' ? 400
     : result.outcome === 'PERSISTENCE_FAILURE' ? 503 : 403;
   return { status, body: { outcome: result.outcome, error: { code } },
     ...(result.error.retryAfterSeconds === undefined ? {} : { retryAfterSeconds: result.error.retryAfterSeconds }) };
 }
 
-function bad(code: string): DecodeResult { return { ok: false, status: 400, code }; }
+function bad(code: string): DecodeFailure { return { ok: false, status: 400, code }; }
 function plainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
