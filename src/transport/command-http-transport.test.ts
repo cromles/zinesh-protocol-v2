@@ -3,7 +3,7 @@ import type { KeyObject } from 'crypto';
 import { CommandHttpTransport } from './command-http-transport';
 import type { TransportAuditRecord, TransportAuditSink } from './command-http-transport';
 import { CachedJwksProvider, JwtAuthenticationAdapter } from '../security/jwt-authentication';
-import { TrustedCommandIngress, rejectAllFundingEvidence } from '../security/trusted-ingress';
+import { TrustedCommandIngress } from '../security/trusted-ingress';
 import type { PrincipalRecord } from '../security/trusted-ingress';
 import { CellApplication } from '../application/cell-application';
 import { InMemoryPersistenceAdapter } from '../adapters/in-memory-persistence-adapter';
@@ -80,6 +80,8 @@ async function harness(options: { providerFailure?: boolean } = {}): Promise<Har
       actorId: PAYER, capabilities: ['ACT_AS_SELF'], mappingVersion: 1 }],
     ['other-subject', { principalId: 'principal-other', type: 'ACTOR', enabled: true,
       actorId: PAYER, capabilities: ['ACT_AS_SELF'], mappingVersion: 1 }],
+    ['gateway-subject', { principalId: 'principal-gateway', type: 'GATEWAY', enabled: true,
+      capabilities: ['CONFIRM_FUNDING'], mappingVersion: 1 }],
   ]);
   const securityEvents: SecurityEvent[] = [];
   const telemetry = new SecurityTelemetry({
@@ -88,10 +90,15 @@ async function harness(options: { providerFailure?: boolean } = {}): Promise<Har
   });
   const ingress = new TrustedCommandIngress(app, authentication, {
     async resolve(identity) { return identity.issuer === ISSUER ? records.get(identity.subject) ?? null : null; },
-  }, rejectAllFundingEvidence, undefined, telemetry);
+  }, { async verify(evidence, expected) { return { outcome: 'VERIFIED', context: {
+    provider: evidence.provider, providerTransactionId: evidence.providerTransactionId, ...expected,
+    confirmedAt: makeTimestamp(900_000), finality: 'SETTLED', evidenceDigest: 'b'.repeat(64),
+    verifiedAt: makeTimestamp(950_000),
+  } }; } }, undefined, telemetry, { async resolve() { return 'transport-custody'; } });
   const audit = new Audit();
   const transport = new CommandHttpTransport(
-    { handleCommand: (request) => ingress.handle(request) },
+    { handleCommand: (request) => ingress.handle(request),
+      handleFundingConfirmation: (request) => ingress.handleFundingConfirmation(request) },
     { host: '127.0.0.1', port: 0, maxBodyBytes: 2048, maxHeaderBytes: 4096,
       requestTimeoutMs: 2_000, headersTimeoutMs: 1_000 },
     audit, () => 'generated-correlation', undefined, undefined, undefined, telemetry,
@@ -102,7 +109,11 @@ async function harness(options: { providerFailure?: boolean } = {}): Promise<Har
 }
 
 async function post(h: Harness, body: unknown, tokenValue = h.token, correlation?: string) {
-  const response = await fetch(h.url, { method: 'POST', headers: {
+  return postUrl(h, h.url, body, tokenValue, correlation);
+}
+
+async function postUrl(h: Harness, url: string, body: unknown, tokenValue = h.token, correlation?: string) {
+  const response = await fetch(url, { method: 'POST', headers: {
     authorization: `Bearer ${tokenValue}`, 'content-type': 'application/json',
     ...(correlation === undefined ? {} : { 'x-correlation-id': correlation }),
   }, body: typeof body === 'string' ? body : JSON.stringify(body) });
@@ -126,6 +137,23 @@ describe('Phase 7E real HTTP trusted command transport', () => {
     expect((await h.persistence.eventStore.getEvents('cell-transport-command' as never))[0]?.payload).toMatchObject({ amount: 900719925474099312345n });
     expect(new Set(h.securityEvents.map((event) => event.correlationId))).toEqual(new Set(['generated-correlation']));
     expect(JSON.stringify(h.securityEvents)).not.toContain('client-correlation-1');
+  });
+
+  test('dedicated funding route verifies and funds while generic FundCell is blocked', async () => {
+    const h = await setup();
+    await post(h, { command: command('funding-route', '4200') });
+    const gatewayToken = jwt(h.key.privateKey, { sub: 'gateway-subject' });
+    const generic = await post(h, { command: { commandId: 'generic-fund', cellId: 'cell-funding-route',
+      type: 'FundCell', payload: { funderId: PAYER, amount: '4200' } } }, gatewayToken);
+    expect(generic.response.status).toBe(403);
+    const dedicated = await postUrl(h, h.url.replace('/commands', '/funding-confirmations'), {
+      commandId: 'dedicated-fund', cellId: 'cell-funding-route',
+      evidence: { provider: 'test-provider', providerTransactionId: 'transport-provider-tx' },
+    }, gatewayToken);
+    expect(dedicated.response.status).toBe(200);
+    expect(dedicated.json.outcome).toBe('SUCCESS');
+    expect((await h.persistence.eventStore.getEvents('cell-funding-route' as never)).map((event) => event.type))
+      .toEqual(['CellCreated', 'CellFunded']);
   });
 
   test('invalid credential, issuer, audience, unmapped and disabled principal fail closed', async () => {
