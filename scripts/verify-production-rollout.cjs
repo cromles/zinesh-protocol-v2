@@ -171,7 +171,7 @@ async function execute() {
   const unsignedRef = `promote.registry.test:5000/zinesh/unsigned@${expectedDigest}`;
   materializeSubjectLayout(layout, subjectLayout, expectedDigest);
   assertReleasable(sourceRef, handoff.trust.publicKeyPath, expectedDigest);
-  process.stdout.write('STEP 7 SIGNATURE HANDOFF:\nPASS\nVERIFY DIGEST:\nPASS\n');
+  process.stdout.write(`STEP 7 SIGNATURE HANDOFF:\nPASS\nVERIFY DIGEST:\nPASS\nVERIFIED MANIFEST DIGEST:\n${expectedDigest}\nVERIFIED RUNTIME CONFIG:\n${expectedConfigDigest}\n`);
 
   cosign(['copy', '--allow-http-registry', '--allow-insecure-registry', '--force', sourceRef, destRef]);
   const promotedDigest = inspectDigest(destRef);
@@ -231,7 +231,7 @@ async function execute() {
   assert.equal(migrated.stderr, '');
   assert.equal((migrated.stderr || '').includes(password), false, 'password leaked in migrate logs');
   assert.equal(migrated.imageId, expectedConfigDigest, 'migration runtime identity differs from verified D');
-  process.stdout.write('MIGRATE FROM DIGEST:\nPASS\n');
+  process.stdout.write(`MIGRATE FROM DIGEST:\nPASS\nMIGRATION RUNTIME IDENTITY:\n${migrated.imageId}\n`);
 
   const schema = await schemaVersions(applyDatabase);
   assert.deepEqual(schema, [{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }]);
@@ -241,7 +241,7 @@ async function execute() {
   process.stdout.write('SERVE FROM SAME DIGEST:\n');
   const servingIdentity = await serveReady(serveContainer, applyDatabase, expectedConfigDigest);
   assert.equal(servingIdentity, expectedConfigDigest, 'serving runtime identity differs from verified D');
-  process.stdout.write('PASS\nMIGRATE/SERVE DIGEST EQUALITY:\nPASS\nREADY:\nPASS\n');
+  process.stdout.write(`PASS\nSERVING RUNTIME IDENTITY:\n${servingIdentity}\nMIGRATE/SERVE DIGEST EQUALITY:\nPASS\nREADY:\nPASS\n`);
 
   skopeo([
     'copy', '--preserve-digests', '--format', 'oci', '--dest-tls-verify=false',
@@ -261,7 +261,7 @@ async function execute() {
   assert.deepEqual(await schemaVersions(recoveredDatabase), schema);
   const rollbackIdentity = await serveReady(recoveredContainer, recoveredDatabase, expectedConfigDigest);
   assert.equal(rollbackIdentity, expectedConfigDigest, 'rollback runtime identity differs from verified D');
-  process.stdout.write('ROLLBACK RESTORE:\nPASS\n');
+  process.stdout.write(`ROLLBACK RESTORE:\nPASS\nROLLBACK RUNTIME IDENTITY:\n${rollbackIdentity}\n`);
 
   assert.equal(existsSync(join(layout, 'cosign.key')), false);
   assert.equal(existsSync(join(layout, 'pg_dump')), false);
