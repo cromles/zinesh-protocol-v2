@@ -7,6 +7,8 @@ import type {
 } from './command-execution-store';
 import type { EventStore } from './event-store';
 import { PostgresEventStore } from './postgres-event-store';
+import { PostgresFundingReceiptStore } from './postgres-funding-receipt-store';
+import type { FundingReceiptStore } from './funding-receipt-store';
 
 interface ExecutionRow { fingerprint: string; result: string | null }
 
@@ -16,7 +18,7 @@ export class PostgresCommandExecutionStore implements CommandExecutionStore {
   async execute(
     commandId: CommandId,
     fingerprint: string,
-    work: (eventStore: EventStore) => Promise<CommandWorkResult>,
+    work: (eventStore: EventStore, fundingReceiptStore: FundingReceiptStore) => Promise<CommandWorkResult>,
   ): Promise<CommandExecutionResult> {
     const client = await this.pool.connect();
     try {
@@ -42,7 +44,10 @@ export class PostgresCommandExecutionStore implements CommandExecutionStore {
         return { kind: 'REPLAYED', encodedResult: row.result };
       }
 
-      const completed = await work(new PostgresEventStore(this.pool, client));
+      const completed = await work(
+        new PostgresEventStore(this.pool, client),
+        new PostgresFundingReceiptStore(this.pool, client),
+      );
       await client.query(
         `UPDATE command_executions SET result = $2 WHERE command_id = $1`,
         [commandId, completed.encodedResult],

@@ -229,8 +229,8 @@ maybeDescribe('one-shot schema apply against PostgreSQL', () => {
     });
     try {
       expect((await pool.query('SELECT version FROM schema_migrations ORDER BY version')).rows)
-        .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }]);
-      expect(EXPECTED_SCHEMA_VERSION).toBe(4);
+        .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }]);
+      expect(EXPECTED_SCHEMA_VERSION).toBe(5);
     } finally {
       await pool.end();
     }

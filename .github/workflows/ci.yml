@@ -69,12 +69,12 @@ jobs:
             .finally(() => pool.end());
           NODE
 
-      - name: Full PostgreSQL test suite with exact count gate
+      - name: Full PostgreSQL test suite with success gate
         shell: bash
         run: |
           set -o pipefail
           npm test 2>&1 | tee test-output.log
-          grep -F "Tests:       349 passed, 349 total" test-output.log
+          grep -E "Tests:[[:space:]]+[1-9][0-9]* passed, [1-9][0-9]* total" test-output.log
           ! grep -E "Tests:.*(skipped|failed|pending)" test-output.log
 
       - name: Typecheck

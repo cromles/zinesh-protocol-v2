@@ -76,6 +76,8 @@ import {
 import type { CellId, Event, Version } from '../core/types';
 import { cellKernel } from '../kernel';
 import { PostgresMigrator } from './postgres-migrator';
+import type { FundingReceipt } from '../funding/types';
+import { PostgresFundingReceiptStore } from './postgres-funding-receipt-store';
 
 // ---------------------------------------------------------------------------
 // Skip guard — tests require a real PostgreSQL instance
@@ -233,6 +235,33 @@ function makeFundedEvent(cellId: CellId, version: Version, ts = T2): Event {
   };
 }
 
+function makeFundingReceipt(
+  cellId: CellId,
+  commandId: ReturnType<typeof makeCommandId>,
+  fundingEvent: Event,
+  overrides: Partial<FundingReceipt> = {},
+): FundingReceipt {
+  return {
+    receiptId: `receipt-pg-${++evtCounter}`,
+    provider: 'provider-pg',
+    providerTransactionId: `transaction-pg-${evtCounter}`,
+    cellId,
+    commandId,
+    fundingEventId: fundingEvent.eventId,
+    gatewayPrincipalId: 'gateway-pg',
+    payer: PAYER,
+    amount: AMOUNT,
+    currency: 'TRY',
+    destinationId: 'custody-pg',
+    confirmedAt: T1,
+    finality: 'SETTLED',
+    evidenceDigest: 'a'.repeat(64),
+    verifiedAt: T2,
+    createdAt: T3,
+    ...overrides,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Test suite
 // ---------------------------------------------------------------------------
@@ -245,6 +274,7 @@ maybeDescribe('PostgreSQL Persistence', () => {
     await adapter.connect();
     const pool = (adapter as unknown as { pool: Pool }).pool;
     await applySchema(pool);
+    await new PostgresMigrator(pool).migrate();
   });
 
   beforeEach(async () => {
@@ -836,6 +866,160 @@ maybeDescribe('PostgreSQL Persistence', () => {
     await extra.connect();
     await extra.disconnect();
     await expect(extra.readyCheck()).resolves.toBe(false);
+  });
+
+  test('38. funding receipt, CellFunded event and command result commit atomically', async () => {
+    const cellId = freshCellId();
+    await adapter.eventStore.append(cellId, [makeEvent(cellId, V1)]);
+    const commandId = makeCommandId(`funding-command-${cellCounter}`);
+    const fundedEvent = makeFundedEvent(cellId, V2);
+    const receipt = makeFundingReceipt(cellId, commandId, fundedEvent);
+
+    const execution = await adapter.commandExecutionStore.execute(
+      commandId,
+      'funding-atomic-fingerprint',
+      async (eventStore, receiptStore) => {
+        expect(await receiptStore.claim(receipt)).toEqual({ kind: 'CLAIMED' });
+        expect((await eventStore.append(cellId, [fundedEvent])).ok).toBe(true);
+        return { encodedResult: '{"outcome":"SUCCESS"}' };
+      },
+    );
+    expect(execution.kind).toBe('EXECUTED');
+
+    const pool = (adapter as unknown as { pool: Pool }).pool;
+    const persisted = await pool.query(
+      `SELECT receipt_id, command_id, funding_event_id, amount::text AS amount,
+              evidence_digest, finality
+       FROM funding_receipts WHERE receipt_id = $1`,
+      [receipt.receiptId],
+    );
+    expect(persisted.rows).toEqual([{
+      receipt_id: receipt.receiptId,
+      command_id: commandId,
+      funding_event_id: fundedEvent.eventId,
+      amount: AMOUNT.toString(),
+      evidence_digest: receipt.evidenceDigest,
+      finality: 'SETTLED',
+    }]);
+    expect((await adapter.eventStore.getEvents(cellId)).map((event) => event.type))
+      .toEqual(['CellCreated', 'CellFunded']);
+  });
+
+  test('39. PostgreSQL preserves a 31-digit integer funding amount exactly', async () => {
+    const cellId = freshCellId();
+    const exact = makeAmount(1234567890123456789012345678901n);
+    await adapter.eventStore.append(cellId, [makeEvent(cellId, V1)]);
+    const commandId = makeCommandId(`funding-exact-${cellCounter}`);
+    const fundedEvent: Event = {
+      ...makeFundedEvent(cellId, V2),
+      payload: { fundedBy: PAYER, amount: exact },
+    };
+    const receipt = makeFundingReceipt(cellId, commandId, fundedEvent, { amount: exact });
+    await adapter.commandExecutionStore.execute(commandId, 'funding-exact-fingerprint', async (events, receipts) => {
+      expect((await receipts.claim(receipt)).kind).toBe('CLAIMED');
+      expect((await events.append(cellId, [fundedEvent])).ok).toBe(true);
+      return { encodedResult: '{"outcome":"SUCCESS"}' };
+    });
+    const pool = (adapter as unknown as { pool: Pool }).pool;
+    expect((await pool.query('SELECT amount::text AS amount FROM funding_receipts WHERE receipt_id=$1', [receipt.receiptId])).rows)
+      .toEqual([{ amount: exact.toString() }]);
+  });
+
+  test('40. an injected PostgreSQL transaction failure rolls back receipt, event and command', async () => {
+    const cellId = freshCellId();
+    await adapter.eventStore.append(cellId, [makeEvent(cellId, V1)]);
+    const commandId = makeCommandId(`funding-rollback-${cellCounter}`);
+    const fundedEvent = makeFundedEvent(cellId, V2);
+    const receipt = makeFundingReceipt(cellId, commandId, fundedEvent);
+    await expect(adapter.commandExecutionStore.execute(commandId, 'funding-rollback-fingerprint', async (events, receipts) => {
+      expect((await receipts.claim(receipt)).kind).toBe('CLAIMED');
+      expect((await events.append(cellId, [fundedEvent])).ok).toBe(true);
+      throw new Error('injected funding transaction failure');
+    })).rejects.toThrow('injected funding transaction failure');
+    const pool = (adapter as unknown as { pool: Pool }).pool;
+    expect((await pool.query('SELECT count(*)::int AS count FROM funding_receipts WHERE receipt_id=$1', [receipt.receiptId])).rows[0])
+      .toEqual({ count: 0 });
+    expect((await pool.query('SELECT count(*)::int AS count FROM command_executions WHERE command_id=$1', [commandId])).rows[0])
+      .toEqual({ count: 0 });
+    expect((await adapter.eventStore.getEvents(cellId)).map((event) => event.type)).toEqual(['CellCreated']);
+  });
+
+  test('41. receipt uniqueness conflict leaves no CellFunded event behind', async () => {
+    const firstCell = freshCellId();
+    const secondCell = freshCellId();
+    await adapter.eventStore.append(firstCell, [makeEvent(firstCell, V1)]);
+    await adapter.eventStore.append(secondCell, [makeEvent(secondCell, V1)]);
+    const firstCommand = makeCommandId(`funding-first-${cellCounter}`);
+    const firstEvent = makeFundedEvent(firstCell, V2);
+    const firstReceipt = makeFundingReceipt(firstCell, firstCommand, firstEvent);
+    await adapter.commandExecutionStore.execute(firstCommand, 'funding-first-fingerprint', async (events, receipts) => {
+      expect((await receipts.claim(firstReceipt)).kind).toBe('CLAIMED');
+      expect((await events.append(firstCell, [firstEvent])).ok).toBe(true);
+      return { encodedResult: '{"outcome":"SUCCESS"}' };
+    });
+
+    const secondCommand = makeCommandId(`funding-second-${cellCounter}`);
+    const secondEvent = makeFundedEvent(secondCell, V2);
+    const conflicting = makeFundingReceipt(secondCell, secondCommand, secondEvent, {
+      provider: firstReceipt.provider,
+      providerTransactionId: firstReceipt.providerTransactionId,
+    });
+    await adapter.commandExecutionStore.execute(secondCommand, 'funding-second-fingerprint', async (events, receipts) => {
+      const claim = await receipts.claim(conflicting);
+      expect(claim).toEqual({ kind: 'CONFLICT', conflict: 'PROVIDER_TRANSACTION' });
+      return { encodedResult: '{"outcome":"APPLICATION_REJECTION"}' };
+    });
+    expect((await adapter.eventStore.getEvents(secondCell)).map((event) => event.type)).toEqual(['CellCreated']);
+  });
+
+  test('42. event version conflict rolls back the uncommitted receipt', async () => {
+    const cellId = freshCellId();
+    await adapter.eventStore.append(cellId, [makeEvent(cellId, V1), makeFundedEvent(cellId, V2)]);
+    const commandId = makeCommandId(`funding-version-conflict-${cellCounter}`);
+    const conflictingEvent = makeFundedEvent(cellId, V2);
+    const receipt = makeFundingReceipt(cellId, commandId, conflictingEvent);
+    await expect(adapter.commandExecutionStore.execute(commandId, 'funding-version-conflict', async (events, receipts) => {
+      expect((await receipts.claim(receipt)).kind).toBe('CLAIMED');
+      expect((await events.append(cellId, [conflictingEvent])).ok).toBe(false);
+      return { encodedResult: '{"outcome":"PERSISTENCE_FAILURE"}' };
+    })).rejects.toThrow();
+    const pool = (adapter as unknown as { pool: Pool }).pool;
+    expect((await pool.query('SELECT count(*)::int AS count FROM funding_receipts WHERE receipt_id=$1', [receipt.receiptId])).rows[0])
+      .toEqual({ count: 0 });
+  });
+
+  test('43. concurrent funding attempts allow one receipt and one CellFunded event', async () => {
+    const cellId = freshCellId();
+    await adapter.eventStore.append(cellId, [makeEvent(cellId, V1)]);
+    const execute = (suffix: string) => {
+      const commandId = makeCommandId(`funding-race-${suffix}-${cellCounter}`);
+      const fundedEvent = makeFundedEvent(cellId, V2);
+      const receipt = makeFundingReceipt(cellId, commandId, fundedEvent);
+      return adapter.commandExecutionStore.execute(commandId, `funding-race-${suffix}`, async (events, receipts) => {
+        const claim = await receipts.claim(receipt);
+        if (claim.kind !== 'CLAIMED') return { encodedResult: `{"claim":"${claim.kind}"}` };
+        const append = await events.append(cellId, [fundedEvent]);
+        if (!append.ok) throw new Error('unexpected event conflict after receipt claim');
+        return { encodedResult: '{"claim":"CLAIMED"}' };
+      });
+    };
+    const outcomes = await Promise.all([execute('a'), execute('b')]);
+    expect(outcomes.map((result) => result.kind === 'CONFLICT' ? 'COMMAND_CONFLICT' : result.encodedResult).sort())
+      .toEqual(['{"claim":"CLAIMED"}', '{"claim":"CONFLICT"}']);
+    const pool = (adapter as unknown as { pool: Pool }).pool;
+    expect((await pool.query('SELECT count(*)::int AS count FROM funding_receipts WHERE cell_id=$1', [cellId])).rows[0])
+      .toEqual({ count: 1 });
+    expect((await adapter.eventStore.getEvents(cellId)).filter((event) => event.type === 'CellFunded')).toHaveLength(1);
+  });
+
+  test('44. historical CellFunded without a receipt remains foldable', async () => {
+    const cellId = freshCellId();
+    await adapter.eventStore.append(cellId, [makeEvent(cellId, V1), makeFundedEvent(cellId, V2)]);
+    const state = cellKernel.evolve(cellId, await adapter.eventStore.getEvents(cellId));
+    expect('status' in state && state.status).toBe('FUNDED');
+    const pool = (adapter as unknown as { pool: Pool }).pool;
+    expect((await pool.query('SELECT count(*)::int AS count FROM funding_receipts WHERE cell_id=$1', [cellId])).rows[0])
+      .toEqual({ count: 0 });
   });
 });
 

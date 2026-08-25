@@ -234,7 +234,7 @@ async function execute() {
   process.stdout.write(`MIGRATE FROM DIGEST:\nPASS\nMIGRATION RUNTIME IDENTITY:\n${migrated.imageId}\n`);
 
   const schema = await schemaVersions(applyDatabase);
-  assert.deepEqual(schema, [{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }]);
+  assert.deepEqual(schema, [{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }]);
   dumpDatabase(applyDatabase, recoveredDumpPath);
   assertBackupFile(recoveredDumpPath);
 

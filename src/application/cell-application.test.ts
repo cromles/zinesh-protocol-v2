@@ -176,11 +176,15 @@ function makeApp(now: Timestamp = T0): AppHarness {
             credential: input.gateway?.authorizedGateway === true ? 'test-gateway-credential' : 'invalid',
             command: input.command,
             fundingEvidence: {
+              provider: 'test-provider',
               providerTransactionId: `provider-${input.command.commandId}`,
               gatewayPrincipalId: 'gateway-1', cellId: input.command.cellId,
               payer: (input.command.payload as { funderId: ActorId }).funderId,
               amount: (input.command.payload as { amount: Amount }).amount,
               currency: 'TRY',
+              destinationId: 'test-custody', confirmedAt: makeTimestamp(900_000),
+              finality: 'SETTLED', evidenceDigest: 'a'.repeat(64),
+              verifiedAt: makeTimestamp(950_000),
             },
           }
         : {

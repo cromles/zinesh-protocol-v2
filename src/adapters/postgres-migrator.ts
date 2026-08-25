@@ -1,6 +1,6 @@
 import type { Pool, PoolClient } from 'pg';
 
-export const EXPECTED_SCHEMA_VERSION = 4;
+export const EXPECTED_SCHEMA_VERSION = 5;
 
 const CORE_SCHEMA = `
 CREATE TABLE IF NOT EXISTS events (
@@ -101,6 +101,54 @@ CREATE TABLE rate_limit_windows (
 );
 CREATE INDEX rate_limit_windows_expiry ON rate_limit_windows(expires_at);`;
 
+const FUNDING_RECEIPT_SCHEMA = `
+CREATE TABLE funding_receipts (
+  receipt_id TEXT PRIMARY KEY CHECK (length(receipt_id) > 0),
+  provider TEXT NOT NULL CHECK (length(provider) > 0),
+  provider_transaction_id TEXT NOT NULL CHECK (length(provider_transaction_id) > 0),
+  cell_id TEXT NOT NULL CHECK (length(cell_id) > 0),
+  command_id TEXT NOT NULL CHECK (length(command_id) > 0),
+  funding_event_id TEXT NOT NULL CHECK (length(funding_event_id) > 0),
+  gateway_principal_id TEXT NOT NULL CHECK (length(gateway_principal_id) > 0),
+  payer TEXT NOT NULL CHECK (length(payer) > 0),
+  amount NUMERIC(31,0) NOT NULL CHECK (amount > 0),
+  currency TEXT NOT NULL CHECK (length(currency) > 0),
+  destination_id TEXT NOT NULL CHECK (length(destination_id) > 0),
+  confirmed_at BIGINT NOT NULL CHECK (confirmed_at >= 0),
+  finality TEXT NOT NULL CHECK (finality = 'SETTLED'),
+  evidence_digest TEXT NOT NULL CHECK (evidence_digest ~ '^[0-9a-f]{64}$'),
+  verified_at BIGINT NOT NULL CHECK (verified_at >= 0),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  CONSTRAINT funding_receipts_provider_tx_unique UNIQUE (provider, provider_transaction_id),
+  CONSTRAINT funding_receipts_cell_unique UNIQUE (cell_id),
+  CONSTRAINT funding_receipts_command_unique UNIQUE (command_id),
+  CONSTRAINT funding_receipts_event_unique UNIQUE (funding_event_id),
+  CONSTRAINT funding_receipts_command_fk FOREIGN KEY (command_id)
+    REFERENCES command_executions(command_id) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+  CONSTRAINT funding_receipts_event_fk FOREIGN KEY (funding_event_id)
+    REFERENCES events(event_id) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED
+);
+
+CREATE OR REPLACE FUNCTION prevent_funding_receipt_mutation() RETURNS trigger AS $$
+BEGIN
+  RAISE EXCEPTION 'funding receipts are immutable' USING ERRCODE = '23514';
+END; $$ LANGUAGE plpgsql;
+CREATE TRIGGER funding_receipts_immutable BEFORE UPDATE OR DELETE ON funding_receipts
+FOR EACH ROW EXECUTE FUNCTION prevent_funding_receipt_mutation();
+
+CREATE OR REPLACE FUNCTION verify_funding_receipt_event_link() RETURNS trigger AS $$
+DECLARE linked_cell TEXT; linked_type TEXT;
+BEGIN
+  SELECT cell_id, type INTO linked_cell, linked_type FROM events WHERE event_id = NEW.funding_event_id;
+  IF linked_cell IS NULL OR linked_cell <> NEW.cell_id OR linked_type <> 'CellFunded' THEN
+    RAISE EXCEPTION 'funding receipt must link to CellFunded for the same cell' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END; $$ LANGUAGE plpgsql;
+CREATE CONSTRAINT TRIGGER funding_receipts_event_link
+AFTER INSERT ON funding_receipts DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION verify_funding_receipt_event_link();`;
+
 export class SchemaVersionError extends Error {
   constructor(message: string) { super(message); this.name = 'SchemaVersionError'; }
 }
@@ -134,6 +182,10 @@ export class PostgresMigrator {
       if (!applied.has(4)) {
         await client.query(RATE_LIMIT_SCHEMA);
         await client.query('INSERT INTO schema_migrations(version,name) VALUES (4,$1)', ['distributed-rate-limits']);
+      }
+      if (!applied.has(5)) {
+        await client.query(FUNDING_RECEIPT_SCHEMA);
+        await client.query('INSERT INTO schema_migrations(version,name) VALUES (5,$1)', ['immutable-funding-receipts']);
       }
       await client.query('COMMIT');
     } catch (error) {
