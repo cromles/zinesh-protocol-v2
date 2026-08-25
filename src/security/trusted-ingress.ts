@@ -1,4 +1,6 @@
-import type { ActorId, Amount, CellId, Command, Currency } from '../core/types';
+import type { ActorId, Command } from '../core/types';
+import type { VerifiedFundingContext } from '../funding/types';
+export type { VerifiedFundingContext } from '../funding/types';
 import type { CellApplication } from '../application/cell-application';
 import type { HandleCommandResult, TrustedHandleCommandRequest } from '../application/types';
 import { rateLimitRejection, rateLimitUnavailable, securityRejection } from '../application/errors';
@@ -46,15 +48,6 @@ export interface ExternalIdentity {
 
 export interface PrincipalAuthority {
   resolve(identity: ExternalIdentity): Promise<PrincipalRecord | null>;
-}
-
-export interface VerifiedFundingContext {
-  readonly providerTransactionId: string;
-  readonly gatewayPrincipalId: string;
-  readonly cellId: CellId;
-  readonly payer: ActorId;
-  readonly amount: Amount;
-  readonly currency: Currency;
 }
 
 export interface FundingEvidencePort {

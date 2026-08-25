@@ -50,8 +50,10 @@ const gateway: PrincipalRecord = {
 
 function funding(overrides: Partial<VerifiedFundingContext> = {}): VerifiedFundingContext {
   return {
-    providerTransactionId: 'provider-tx-1', gatewayPrincipalId: gateway.principalId,
-    cellId: CELL, payer: PAYER, amount: AMOUNT, currency: 'TRY', ...overrides,
+    provider: 'test-provider', providerTransactionId: 'provider-tx-1', gatewayPrincipalId: gateway.principalId,
+    cellId: CELL, payer: PAYER, amount: AMOUNT, currency: 'TRY',
+    destinationId: 'test-custody', confirmedAt: makeTimestamp(900_000), finality: 'SETTLED',
+    evidenceDigest: 'a'.repeat(64), verifiedAt: makeTimestamp(950_000), ...overrides,
   };
 }
 
@@ -128,6 +130,34 @@ describe('Phase 7B trusted principal boundary', () => {
     }
     current = funding();
     expect((await ingress.handle(base)).outcome).toBe('SUCCESS');
+  });
+
+  test('funding idempotency fingerprint covers all provider provenance fields', async () => {
+    const persistence = new InMemoryPersistenceAdapter();
+    const app = application(persistence);
+    const actor = actorIdentity(PAYER);
+    await createTestIngress(app, [actor]).handle({ credential: actor.credential, command: createCommand('fingerprint-create') });
+    const gatewayIdentity = { credential: 'fingerprint-gateway', subject: 'fingerprint-subject', principal: gateway };
+    let current = funding();
+    const ingress = createTestIngress(app, [gatewayIdentity], { async verify() { return current; } });
+    const request = {
+      credential: gatewayIdentity.credential,
+      command: fundCommand('fingerprint-fund'),
+      fundingEvidence: 'opaque-evidence',
+    };
+    expect((await ingress.handle(request)).outcome).toBe('SUCCESS');
+
+    for (const changed of [
+      funding({ provider: 'other-provider' }),
+      funding({ destinationId: 'other-custody' }),
+      funding({ confirmedAt: makeTimestamp(899_999) }),
+      funding({ evidenceDigest: 'b'.repeat(64) }),
+    ]) {
+      current = changed;
+      const result = await ingress.handle(request);
+      expect(result.outcome).toBe('APPLICATION_REJECTION');
+      if (result.outcome === 'APPLICATION_REJECTION') expect(result.error.code).toBe('IDEMPOTENCY_CONFLICT');
+    }
   });
 
   test('disabled principal cannot execute or receive an old replay', async () => {

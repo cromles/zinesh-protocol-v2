@@ -121,7 +121,7 @@ export class CellApplication {
       principalId: request.principal.principalId,
       principalType: request.principal.type,
       actorId: request.principal.actorId,
-      fundingTransaction: request.fundingContext?.providerTransactionId,
+      funding: request.fundingContext,
       command,
     });
 

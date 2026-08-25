@@ -422,7 +422,7 @@ maybeDescribe('Phase 7C migrations', () => {
     await migrator.migrate();
     await expect(migrator.verifyExpectedVersion()).resolves.toBeUndefined();
     expect((await db.pool.query('SELECT version FROM schema_migrations ORDER BY version')).rows)
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }]);
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }]);
     await db.pool.end();
   });
 

@@ -1,5 +1,6 @@
 import type { CommandId } from '../core/types';
 import type { EventStore } from './event-store';
+import type { FundingReceiptStore } from './funding-receipt-store';
 
 export interface CommandWorkResult {
   readonly encodedResult: string;
@@ -12,12 +13,13 @@ export type CommandExecutionResult =
 
 /**
  * Durable command boundary. Implementations must commit the command result and
- * every event appended through the supplied EventStore in one atomic unit.
+ * every event and funding receipt written through the supplied transaction in
+ * one atomic unit.
  */
 export interface CommandExecutionStore {
   execute(
     commandId: CommandId,
     fingerprint: string,
-    work: (eventStore: EventStore) => Promise<CommandWorkResult>,
+    work: (eventStore: EventStore, fundingReceiptStore: FundingReceiptStore) => Promise<CommandWorkResult>,
   ): Promise<CommandExecutionResult>;
 }
