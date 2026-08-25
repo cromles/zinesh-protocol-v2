@@ -114,7 +114,10 @@ An empty, unmigrated database must still fail-close serving startup.
 | Successful schema apply must be undone | Restore a **pre-apply** backup onto a fresh database, then run the **previous signed digest**. There are no down migrations. |
 | Corrupt or lost database | Fresh PostgreSQL 16 cluster plus restore of the last good dump, then the matching **signed** serving digest |
 
-Image rollout is orchestration. This contract defines the database half.
+Image rollout (verify → promote → migrate/serve the signed digest, including
+rollback to previous signed `D_prev`) is defined in
+[production-rollout.md](production-rollout.md). This contract defines the
+database half.
 
 ## Security
 

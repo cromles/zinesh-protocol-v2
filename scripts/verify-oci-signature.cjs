@@ -15,8 +15,10 @@ const SKOPEO_IMAGE = 'quay.io/skopeo/stable:v1.17.0@sha256:a5032a59f55ac82e2b5c9
 
 const archive = process.argv[2];
 const expectedDigest = process.argv[3];
+const handoffArgument = process.argv.find((argument) => argument.startsWith('--handoff-output='));
+const handoffOutput = handoffArgument?.slice('--handoff-output='.length);
 assert.ok(archive && expectedDigest,
-  'usage: node scripts/verify-oci-signature.cjs <oci-tar> <sha256:digest>');
+  'usage: node scripts/verify-oci-signature.cjs <oci-tar> <sha256:digest> [--handoff-output=<json>]');
 assert.match(expectedDigest, /^sha256:[0-9a-f]{64}$/, 'expected digest must be sha256:<hex>');
 
 const suffix = `${process.pid}-${Date.now()}`;
@@ -34,6 +36,7 @@ let trustedPassword = '';
 let wrongPassword = '';
 let startedRegistry = false;
 let createdNetwork = false;
+let handoffReady = false;
 
 try {
   execute();
@@ -41,7 +44,7 @@ try {
   process.stderr.write(`${redact(error.stack ?? error.message ?? error)}\n`);
   process.exitCode = 1;
 } finally {
-  cleanup();
+  if (!handoffReady) cleanup();
 }
 
 function execute() {
@@ -70,6 +73,7 @@ function execute() {
 
   const runtimeRef = `registry.test:5000/zinesh/runtime@${expectedDigest}`;
   const unsignedRef = `registry.test:5000/zinesh/unsigned@${expectedDigest}`;
+  const untrustedRef = `registry.test:5000/zinesh/untrusted@${expectedDigest}`;
 
   trustedPassword = newPassword();
   wrongPassword = newPassword();
@@ -111,6 +115,13 @@ function execute() {
   ]);
   expectVerifyFailure('UNSIGNED', unsignedRef, trustedKeys);
   expectVerifyFailure('WRONG KEY', runtimeRef, wrongKeys);
+  skopeo([
+    'copy', '--preserve-digests', '--format', 'oci', '--dest-tls-verify=false',
+    `oci:${subjectLayout}`, `docker://${untrustedRef}`,
+  ]);
+  cosign(['sign', '--key', '/work/cosign.key', '--tlog-upload=false',
+    '--allow-http-registry', '--allow-insecure-registry', '--yes', untrustedRef], wrongKeys);
+  expectVerifyFailure('UNTRUSTED SIGNATURE', untrustedRef, trustedKeys);
 
   const mutatedDigest = mutateRuntimeSubject(layout, expectedDigest);
   assert.notEqual(mutatedDigest, expectedDigest, 'mutated manifest digest must differ from the signed digest');
@@ -135,6 +146,38 @@ function execute() {
 
   assert.equal(existsSync(join(layout, 'cosign.key')), false);
   assert.equal(existsSync(join(layout, 'cosign.pub')), false);
+
+  if (handoffOutput) {
+    const manifest = blob(layout, expectedDigest);
+    const signatureTag = `sha256-${expectedDigest.slice('sha256:'.length)}.sig`;
+    for (const directory of [trustedKeys, wrongKeys]) {
+      rmSync(join(directory, 'cosign.key'), { force: true });
+      rmSync(join(directory, '.cosign-env'), { force: true });
+    }
+    const handoff = {
+      version: 1,
+      verification: 'cosign-key-verified',
+      artifact: {
+        archiveSha256: `sha256:${createHash('sha256').update(readFileSync(archive)).digest('hex')}`,
+        reference: runtimeRef,
+        untrustedReference: untrustedRef,
+        digest: expectedDigest,
+        configDigest: manifest.config.digest,
+        signatureReference: `registry.test:5000/zinesh/runtime:${signatureTag}`,
+      },
+      trust: {
+        type: 'cosign-public-key',
+        publicKeyPath: join(trustedKeys, 'cosign.pub'),
+        untrustedPublicKeyPath: join(wrongKeys, 'cosign.pub'),
+        cosignImage: COSIGN_IMAGE,
+      },
+      transport: { networkName, registryName },
+      cleanup: { workDirectory: work },
+    };
+    writeFileSync(handoffOutput, `${JSON.stringify(handoff, null, 2)}\n`, { mode: 0o600 });
+    handoffReady = true;
+    process.stdout.write('VERIFICATION HANDOFF:\nPASS\n');
+  }
 }
 
 function runtimeSubjectDigest(directory) {

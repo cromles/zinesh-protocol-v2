@@ -51,11 +51,19 @@ These tools are CI-only. They are not copied into the scratch serving image.
 6. Cosign signature of **that subject digest** (not a tag)
 7. Push to an OCI registry **by digest**
 8. Pull **by digest** and require equality with the signed digest
-9. Logical backup ([production-backup.md](production-backup.md))
-10. Schema apply with `node dist/composition/migrate.js` from **the same digest**
+9. **Promote** D by copying it (not rebuilding). See
+   [production-rollout.md](production-rollout.md)
+10. Logical **pre-apply** backup ([production-backup.md](production-backup.md))
+11. Schema apply with `node dist/composition/migrate.js` from **the same digest D**
     ([production-runtime.md](production-runtime.md))
-11. Serving replicas of **the same digest** (`node dist/composition/main.js`)
-12. `GET /ready` `200`
+12. Serving replicas of **the same digest D** (`node dist/composition/main.js`)
+13. `GET /ready` `200`
+
+Digest is authority. Tags are not. Promotion is copy, not rebuild. Migrate and
+serve must use the same D (`MIGRATE_IMAGE_DIGEST === SERVE_IMAGE_DIGEST`).
+Backup is taken before schema apply. Rollback uses previous signed digest
+`D_prev`. If schema changed, restore the pre-apply backup before serving
+`D_prev`. There are no down migrations.
 
 Unsigned, wrong-key, mutated, or digest-mismatched artifacts are not releasable.
 
@@ -78,10 +86,11 @@ private keys, registry credentials, or connection strings.
 | Run / migrate | `verified-registry/image@sha256:D` only |
 | Promote | copy digest D to another registry or repository |
 | Rollback (code) | previous **signed** digest D_prev |
-| Rollback (schema after a successful apply) | D_prev plus restore of a pre-apply backup. No down migrations. |
+| Rollback (schema after a successful apply) | restore the pre-apply backup, then D_prev. No down migrations. |
 
 Migration and serving of a release use the same signed digest. A local mutable
-tag is not a production run model.
+tag is not a production run model. The ordered verify → promote → backup →
+migrate → serve → ready procedure is [production-rollout.md](production-rollout.md).
 
 ## Out of scope
 
