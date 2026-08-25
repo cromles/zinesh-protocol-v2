@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import type { Pool, PoolClient } from 'pg';
 import { makeAmount, makeCellId, makeTimestamp } from '../core/types';
 import type { Currency } from '../core/types';
@@ -39,7 +40,7 @@ export class PostgresFundingDisputeStore implements FundingDisputeStore {
     client: PoolClient, observation: FundingDisputeObservation,
   ): Promise<FundingDisputeRecordResult> {
     await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',
-      [`${observation.provider}\u0000${observation.providerDisputeId}`]);
+      [fundingDisputeAdvisoryLockKey(observation.provider, observation.providerDisputeId)]);
     await client.query('SELECT receipt_id FROM funding_receipts WHERE receipt_id=$1 FOR UPDATE',
       [observation.receiptId]);
     const prior = await client.query<DisputeRow>(
@@ -97,6 +98,18 @@ export class PostgresFundingDisputeStore implements FundingDisputeStore {
     );
     return result.rows[0]?.blocked === true;
   }
+}
+
+export function fundingDisputeAdvisoryLockKey(provider: string, providerDisputeId: string): string {
+  const hash = createHash('sha256');
+  for (const value of [provider, providerDisputeId]) {
+    const encoded = Buffer.from(value, 'utf8');
+    const length = Buffer.allocUnsafe(4);
+    length.writeUInt32BE(encoded.length);
+    hash.update(length);
+    hash.update(encoded);
+  }
+  return hash.digest('hex');
 }
 
 function rowToObservation(row: DisputeRow): FundingDisputeObservation {

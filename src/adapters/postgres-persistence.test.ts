@@ -274,6 +274,13 @@ function intentForReceipt(receipt: FundingReceipt): FundingIntent {
   });
 }
 
+function rebindIntent(
+  intent: FundingIntent, change: Partial<Omit<FundingIntent, 'intentId' | 'bindingDigest'>>,
+): FundingIntent {
+  const { bindingDigest: _bindingDigest, ...draft } = intent;
+  return createFundingIntent({ ...draft, ...change });
+}
+
 async function createIntent(adapter: PostgresPersistenceAdapter, receipt: FundingReceipt): Promise<void> {
   const result = await adapter.fundingIntentStore.create(intentForReceipt(receipt));
   expect(['CREATED', 'DUPLICATE']).toContain(result.kind);
@@ -1056,8 +1063,21 @@ maybeDescribe('PostgreSQL Persistence', () => {
     await expect(adapter.fundingIntentStore.create(candidate)).resolves.toEqual({ kind: 'CREATED' });
     await expect(adapter.fundingIntentStore.create({ ...candidate })).resolves
       .toEqual({ kind: 'DUPLICATE', intent: candidate });
-    await expect(adapter.fundingIntentStore.create({ ...candidate, payee: makeActorId('rebound-payee') }))
-      .resolves.toEqual({ kind: 'CONFLICT' });
+    const rebindings: Array<Partial<Omit<FundingIntent, 'intentId' | 'bindingDigest'>>> = [
+      { payer: makeActorId('rebound-payer') },
+      { payee: makeActorId('rebound-payee') },
+      { amount: makeAmount(candidate.amount + 1n) },
+      { currency: 'EUR' as never },
+      { destinationId: 'rebound-custody' },
+    ];
+    for (const change of rebindings) {
+      await expect(adapter.fundingIntentStore.create(rebindIntent(candidate, change)))
+        .resolves.toEqual({ kind: 'CONFLICT' });
+      await expect(adapter.fundingIntentStore.get(candidate.intentId)).resolves.toEqual(candidate);
+    }
+    await expect(adapter.fundingIntentStore.create({
+      ...candidate, payee: makeActorId('invalid-rebound-payee'),
+    })).resolves.toEqual({ kind: 'INVALID' });
     await expect(adapter.fundingIntentStore.get(candidate.intentId)).resolves.toEqual(candidate);
 
     const pool = (adapter as unknown as { pool: Pool }).pool;

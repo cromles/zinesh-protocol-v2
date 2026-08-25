@@ -1,6 +1,7 @@
 import { makeAmount, makeCellId, makeTimestamp } from '../core/types';
 import type { FundingDisputeObservation } from '../funding/types';
 import { InMemoryFundingDisputeStore } from './in-memory-funding-dispute-store';
+import { fundingDisputeAdvisoryLockKey } from './postgres-funding-dispute-store';
 
 function observation(overrides: Partial<FundingDisputeObservation> = {}): FundingDisputeObservation {
   return {
@@ -13,6 +14,16 @@ function observation(overrides: Partial<FundingDisputeObservation> = {}): Fundin
 }
 
 describe('provider funding dispute observation store contract', () => {
+  test('derives a PostgreSQL-safe deterministic lock key without collapsing distinct identities', () => {
+    const key = fundingDisputeAdvisoryLockKey('provider-a', 'dispute-a');
+    expect(key).toMatch(/^[0-9a-f]{64}$/);
+    expect(key).not.toContain('\u0000');
+    expect(fundingDisputeAdvisoryLockKey('provider-a', 'dispute-a')).toBe(key);
+    expect(fundingDisputeAdvisoryLockKey('provider-a', 'dispute-b')).not.toBe(key);
+    expect(fundingDisputeAdvisoryLockKey('ab', 'c'))
+      .not.toBe(fundingDisputeAdvisoryLockKey('a', 'bc'));
+  });
+
   test('is append-only and treats an identical provider observation as an idempotent duplicate', async () => {
     const store = new InMemoryFundingDisputeStore();
     const first = observation();
