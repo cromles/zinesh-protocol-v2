@@ -7,6 +7,14 @@ start the scratch image by digest satisfies it.
 
 CI proves the chain with two ephemeral local registries.
 
+Step 7 hands Step 8 the still-running signed registry reference, the trusted
+public key, digest D, the config digest C read from D's manifest, and the hash of
+the verified OCI archive. Step 8 verifies that same signature again before
+promotion; it never creates a signing key. After importing D into the local
+Docker daemon, CI executes containers by immutable image ID C, not by the
+temporary import tag. Container inspection must report C before execution. This
+is the daemon-level proof of the mapping `verified manifest D -> runtime C`.
+
 ## Release identity
 
 The only production identity is:
@@ -20,6 +28,9 @@ handle. Promotion is copying digest D. Promotion is not a rebuild.
 
 Migrate and serve of one release MUST use the same verified digest D.
 `MIGRATE_IMAGE_DIGEST === SERVE_IMAGE_DIGEST`. Inequality fails the release.
+Where Docker represents the runnable image by its immutable config digest C,
+both containers MUST report C obtained from the verified manifest D. A mutable
+tag is never accepted as runtime evidence.
 
 ## Ownership
 
@@ -33,6 +44,7 @@ Migrate and serve of one release MUST use the same verified digest D.
 | READY | public HTTPS | `GET /ready` → `200` | treat unsigned/mismatched D as ready |
 
 The scratch image does not contain Cosign, `pg_dump`, or `pg_restore`.
+The CI PostgreSQL 16 Alpine client is pinned to its linux/amd64 manifest digest.
 
 ## Chain
 

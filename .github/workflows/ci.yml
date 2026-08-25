@@ -178,11 +178,15 @@ jobs:
 
       - name: Sign and verify digest-pinned artifact trust chain
         shell: bash
-        run: node scripts/verify-oci-signature.cjs zinesh-build-1.oci.tar "$RUNTIME_DIGEST"
+        run: |
+          node scripts/verify-oci-signature.cjs zinesh-build-1.oci.tar "$RUNTIME_DIGEST" \
+            --handoff-output="$RUNNER_TEMP/zinesh-step7-verification.json"
 
       - name: Roll out verified signed digest
         shell: bash
-        run: node scripts/verify-production-rollout.cjs zinesh-build-1.oci.tar "$RUNTIME_DIGEST"
+        run: |
+          node scripts/verify-production-rollout.cjs zinesh-build-1.oci.tar \
+            "$RUNNER_TEMP/zinesh-step7-verification.json"
 
       - name: Remove isolated PostgreSQL TLS environment
         if: always()

@@ -1,12 +1,12 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const { createHash, randomBytes } = require('node:crypto');
+const { createHash } = require('node:crypto');
 const {
   chmodSync, closeSync, cpSync, existsSync, mkdirSync, mkdtempSync, openSync,
   readFileSync, rmSync, writeFileSync,
 } = require('node:fs');
-const { dirname, join } = require('node:path');
+const { basename, dirname, join } = require('node:path');
 const { tmpdir } = require('node:os');
 const { request } = require('node:https');
 const { spawnSync } = require('node:child_process');
@@ -18,13 +18,16 @@ const COSIGN_IMAGE = 'gcr.io/projectsigstore/cosign:v2.4.3@sha256:203f193bc86591
 const REGISTRY_IMAGE = 'registry:2.8.3@sha256:46faa9a1ae6813194b53921a370f2f4f8c5e1aae228a89bceafef5847a6a3278';
 const SKOPEO_IMAGE = 'quay.io/skopeo/stable:v1.17.0@sha256:a5032a59f55ac82e2b5c9e9a8223a5249a31e82ae51f74d63ff356ccbed1adee';
 const PINNED_BASE = 'node:24.18.1-alpine3.23@sha256:ba63d8e0b5d4cbc6db9da12ea77ddb35a4783ad653a092ef115cc383526d4369';
-const POSTGRES_CLIENT = 'postgres:16-alpine';
+const POSTGRES_CLIENT = 'postgres:16-alpine@sha256:075f7ba66bc9b3ce7d6b8b635208ff61cd7cf1a67d71ec530eec5d7ae0cbe571';
 
 const archive = process.argv[2];
-const expectedDigest = process.argv[3];
-assert.ok(archive && expectedDigest,
-  'usage: node scripts/verify-production-rollout.cjs <oci-tar> <sha256:digest>');
-assert.match(expectedDigest, /^sha256:[0-9a-f]{64}$/, 'expected digest must be sha256:<hex>');
+const handoffPath = process.argv[3];
+assert.ok(archive && handoffPath,
+  'usage: node scripts/verify-production-rollout.cjs <oci-tar> <step-7-handoff.json>');
+const handoff = JSON.parse(readFileSync(handoffPath, 'utf8'));
+validateHandoff(handoff, archive);
+const expectedDigest = handoff.artifact.digest;
+const expectedConfigDigest = handoff.artifact.configDigest;
 assert.equal(process.env.PGPASSWORD, undefined, 'PGPASSWORD is not accepted for rollout');
 assert.equal(process.env.PG_TLS_MODE ?? 'verify-full', 'verify-full');
 for (const name of ['PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER', 'PG_PASSWORD_FILE', 'PG_TLS_CA_PATH',
@@ -38,15 +41,13 @@ const layout = join(work, 'layout');
 const subjectLayout = join(work, 'subject');
 const mutatedLayout = join(work, 'mutated');
 const pulled = join(work, 'pulled');
-const trustedKeys = join(work, 'trusted-keys');
-const wrongKeys = join(work, 'wrong-keys');
 const tlsDir = join(work, 'tls');
 const dumpPath = join(work, 'pre-apply.dump');
 const recoveredDumpPath = join(work, 'recovered.dump');
 const pgpassPath = join(work, 'pgpass');
 const caPath = join(work, 'database-ca.pem');
-const networkName = `zinesh-rollout-net-${suffix}`;
-const sourceRegistry = `zinesh-rollout-src-${suffix}`;
+const networkName = handoff.transport.networkName;
+const sourceRegistry = handoff.transport.registryName;
 const destRegistry = `zinesh-rollout-dst-${suffix}`;
 const volume = `zinesh-rollout-tls-${suffix}`;
 const applyDatabase = `zinesh_rollout_apply_${process.pid}_${Date.now()}`;
@@ -56,12 +57,9 @@ const migrateContainer = `zinesh-rollout-migrate-${suffix}`;
 const serveContainer = `zinesh-rollout-serve-${suffix}`;
 const recoveredContainer = `zinesh-rollout-recovered-${suffix}`;
 const daemonHandle = 'localhost/zinesh/runtime:rollout';
-let runImage = daemonHandle;
+const runImage = expectedConfigDigest;
 const password = readFileSync(process.env.PG_PASSWORD_FILE, 'utf8').replace(/\n$/, '').replace(/\r$/, '');
 const secrets = [password];
-let trustedPassword = '';
-let createdNetwork = false;
-let startedSource = false;
 let startedDest = false;
 let createdVolume = false;
 let createdApply = false;
@@ -79,58 +77,103 @@ void (async () => {
   }
 })();
 
+function validateHandoff(candidate, archivePath) {
+  assert.equal(candidate?.version, 1, 'Step 7 verification handoff version is missing or unsupported');
+  assert.equal(candidate?.verification, 'cosign-key-verified', 'Step 7 verification result is missing');
+  assert.match(candidate?.artifact?.digest ?? '', /^sha256:[0-9a-f]{64}$/, 'Step 7 digest is invalid');
+  assert.match(candidate?.artifact?.configDigest ?? '', /^sha256:[0-9a-f]{64}$/, 'Step 7 config digest is invalid');
+  assert.match(candidate?.artifact?.archiveSha256 ?? '', /^sha256:[0-9a-f]{64}$/, 'Step 7 archive hash is invalid');
+  const digest = candidate.artifact.digest;
+  assert.equal(candidate.artifact.reference, `registry.test:5000/zinesh/runtime@${digest}`,
+    'Step 7 signed artifact reference is inconsistent');
+  assert.equal(candidate.artifact.untrustedReference, `registry.test:5000/zinesh/untrusted@${digest}`,
+    'Step 7 untrusted signature fixture is inconsistent');
+  assert.equal(candidate.artifact.signatureReference,
+    `registry.test:5000/zinesh/runtime:sha256-${digest.slice('sha256:'.length)}.sig`,
+    'Step 7 signature reference is inconsistent');
+  assert.equal(candidate?.trust?.type, 'cosign-public-key', 'Step 7 trust identity is unsupported');
+  assert.equal(candidate?.trust?.cosignImage, COSIGN_IMAGE, 'Step 7 Cosign verifier identity changed');
+  for (const path of [candidate?.trust?.publicKeyPath, candidate?.trust?.untrustedPublicKeyPath]) {
+    assert.ok(path && existsSync(path), 'Step 7 public key handoff is missing');
+    const publicKey = readFileSync(path, 'utf8');
+    assert.match(publicKey, /BEGIN PUBLIC KEY/, 'Step 7 handoff key is not a public key');
+    assert.equal(/PRIVATE KEY/.test(publicKey), false, 'Step 7 handoff contains private signing material');
+  }
+  assert.match(candidate?.transport?.networkName ?? '', /^zinesh-oci-trust-\d+-\d+$/,
+    'Step 7 network handoff is invalid');
+  assert.match(candidate?.transport?.registryName ?? '', /^zinesh-oci-registry-\d+-\d+$/,
+    'Step 7 registry handoff is invalid');
+  const retainedWork = candidate?.cleanup?.workDirectory;
+  assert.ok(retainedWork && dirname(retainedWork) === tmpdir() && basename(retainedWork).startsWith('zinesh-oci-trust-'),
+    'Step 7 cleanup scope is invalid');
+  assert.equal(dirname(dirname(candidate.trust.publicKeyPath)), retainedWork,
+    'trusted public key is outside the Step 7 handoff directory');
+  assert.equal(dirname(dirname(candidate.trust.untrustedPublicKeyPath)), retainedWork,
+    'untrusted public key is outside the Step 7 handoff directory');
+  const actualArchiveHash = `sha256:${createHash('sha256').update(readFileSync(archivePath)).digest('hex')}`;
+  assert.equal(actualArchiveHash, candidate.artifact.archiveSha256,
+    'rollout OCI archive differs from the artifact verified by Step 7');
+}
+
+function assertHandoffNegativeCases() {
+  const mutate = (fn) => {
+    const candidate = JSON.parse(JSON.stringify(handoff));
+    fn(candidate);
+    return candidate;
+  };
+  expectReleaseRejected('MISSING STEP 7 VERIFICATION', () =>
+    validateHandoff(mutate((candidate) => { delete candidate.verification; }), archive));
+  expectReleaseRejected('INCONSISTENT STEP 7 DIGEST', () =>
+    validateHandoff(mutate((candidate) => { candidate.artifact.digest = `sha256:${'0'.repeat(64)}`; }), archive));
+  expectReleaseRejected('REPLACED STEP 7 ARCHIVE', () =>
+    validateHandoff(mutate((candidate) => { candidate.artifact.archiveSha256 = `sha256:${'0'.repeat(64)}`; }), archive));
+  expectReleaseRejected('INCONSISTENT STEP 7 RUNTIME IDENTITY', () => {
+    const candidate = mutate((value) => { value.artifact.configDigest = `sha256:${'0'.repeat(64)}`; });
+    validateHandoff(candidate, archive);
+    assert.equal(blob(layout, candidate.artifact.digest).config.digest, candidate.artifact.configDigest,
+      'Step 7 runtime identity does not match the verified manifest');
+  });
+}
+
+function assertInheritedStep7Resources() {
+  const inspect = JSON.parse(docker(['inspect', sourceRegistry]).stdout)[0];
+  assert.equal(inspect?.State?.Running, true, 'Step 7 signed registry is not running');
+  assert.ok(inspect?.NetworkSettings?.Networks?.[networkName], 'Step 7 registry is not on the handed-off network');
+  waitForRegistry(sourceRegistry);
+}
+
 async function execute() {
   mkdirSync(layout);
   mkdirSync(tlsDir, { mode: 0o700 });
-  mkdirSync(trustedKeys, { mode: 0o700 });
-  mkdirSync(wrongKeys, { mode: 0o700 });
   const extract = spawnSync('tar', ['-xf', archive, '-C', layout], { encoding: 'utf8' });
   assert.equal(extract.status, 0, `cannot extract OCI archive: ${redact(extract.stderr)}`);
-  assert.equal(runtimeSubjectDigest(layout), expectedDigest, 'OCI archive subject digest does not match expected digest');
+  assert.equal(runtimeSubjectDigest(layout), expectedDigest, 'OCI archive subject digest does not match Step 7 digest');
+  assert.equal(blob(layout, expectedDigest).config.digest, expectedConfigDigest,
+    'OCI archive config digest does not match Step 7 verified manifest');
+  assertHandoffNegativeCases();
 
   docker(['pull', '--platform', 'linux/amd64', COSIGN_IMAGE]);
   docker(['pull', '--platform', 'linux/amd64', REGISTRY_IMAGE]);
   docker(['pull', '--platform', 'linux/amd64', SKOPEO_IMAGE]);
+  docker(['pull', '--platform', 'linux/amd64', POSTGRES_CLIENT]);
 
-  docker(['network', 'create', networkName]);
-  createdNetwork = true;
-  docker([
-    'run', '-d', '--name', sourceRegistry, '--network', networkName,
-    '--network-alias', 'source.registry.test', '-p', '127.0.0.1:0:5000',
-    '--platform', 'linux/amd64', REGISTRY_IMAGE,
-  ]);
-  startedSource = true;
+  assertInheritedStep7Resources();
   docker([
     'run', '-d', '--name', destRegistry, '--network', networkName,
     '--network-alias', 'promote.registry.test', '-p', '127.0.0.1:0:5000',
     '--platform', 'linux/amd64', REGISTRY_IMAGE,
   ]);
   startedDest = true;
-  waitForRegistry(sourceRegistry);
   waitForRegistry(destRegistry);
 
-  trustedPassword = newPassword();
-  const wrongPassword = newPassword();
-  secrets.push(trustedPassword, wrongPassword);
-  generateKeyPair(trustedKeys, trustedPassword);
-  generateKeyPair(wrongKeys, wrongPassword);
-  secrets.push(readFileSync(join(trustedKeys, 'cosign.key'), 'utf8'));
-  secrets.push(readFileSync(join(wrongKeys, 'cosign.key'), 'utf8'));
-
-  const sourceRef = `source.registry.test:5000/zinesh/runtime@${expectedDigest}`;
+  const sourceRef = handoff.artifact.reference;
   const destRef = `promote.registry.test:5000/zinesh/runtime@${expectedDigest}`;
   const unsignedRef = `promote.registry.test:5000/zinesh/unsigned@${expectedDigest}`;
   materializeSubjectLayout(layout, subjectLayout, expectedDigest);
-  skopeo([
-    'copy', '--preserve-digests', '--format', 'oci', '--dest-tls-verify=false',
-    `oci:${subjectLayout}`, `docker://${sourceRef}`,
-  ]);
-  cosign(['sign', '--key', '/work/cosign.key', '--tlog-upload=false',
-    '--allow-http-registry', '--allow-insecure-registry', '--yes', sourceRef], trustedKeys);
-  assertReleasable(sourceRef, trustedKeys, expectedDigest);
-  process.stdout.write('VERIFY DIGEST:\nPASS\n');
+  assertReleasable(sourceRef, handoff.trust.publicKeyPath, expectedDigest);
+  process.stdout.write('STEP 7 SIGNATURE HANDOFF:\nPASS\nVERIFY DIGEST:\nPASS\n');
 
-  cosign(['copy', '--allow-http-registry', '--allow-insecure-registry', '--force', sourceRef, destRef], trustedKeys);
+  cosign(['copy', '--allow-http-registry', '--allow-insecure-registry', '--force', sourceRef, destRef]);
   const promotedDigest = inspectDigest(destRef);
   process.stdout.write(`PROMOTION:\nPASS\nPROMOTED DIGEST:\n${promotedDigest}\n`);
   assertDigestEqual(promotedDigest, expectedDigest);
@@ -139,20 +182,30 @@ async function execute() {
     `docker://${destRef}`, `oci:${pulled}`,
   ]);
   assertDigestEqual(ociLayoutDigest(pulled), expectedDigest);
-  assertReleasable(destRef, trustedKeys, expectedDigest);
+  assertReleasable(destRef, handoff.trust.publicKeyPath, expectedDigest);
   process.stdout.write('DIGEST MATCH:\nPASS\n');
 
   copyToDockerDaemon(destRef);
-  runImage = daemonHandle;
-  const subjectConfig = blob(layout, expectedDigest).config.digest;
   const localId = dockerImageId(daemonHandle);
-  assert.ok(localId === subjectConfig || localId.includes(subjectConfig.replace(/^sha256:/, '')),
-    `docker image ${localId} does not match subject config ${subjectConfig}`);
-  const migrateDigest = expectedDigest;
-  const serveDigest = expectedDigest;
-  assertDigestEqual(migrateDigest, expectedDigest);
-  assertDigestEqual(serveDigest, expectedDigest);
-  assert.equal(runImage.includes('zinesh-phase-b'), false, 'release must not run IMAGE_TAG');
+  assert.equal(localId, expectedConfigDigest,
+    `Docker import ${localId} does not match config identity ${expectedConfigDigest} bound to D`);
+
+  const mutatedDigest = mutateRuntimeSubject(layout, expectedDigest);
+  assert.notEqual(mutatedDigest, expectedDigest);
+  const mutatedRef = `promote.registry.test:5000/zinesh/mutated@${mutatedDigest}`;
+  materializeSubjectLayout(layout, mutatedLayout, mutatedDigest);
+  skopeo([
+    'copy', '--preserve-digests', '--format', 'oci', '--dest-tls-verify=false',
+    `oci:${mutatedLayout}`, `docker://${mutatedRef}`,
+  ]);
+  expectReleaseRejected('MUTATED', () =>
+    assertReleasable(mutatedRef, handoff.trust.publicKeyPath, expectedDigest));
+  copyToDockerDaemon(mutatedRef);
+  assert.notEqual(dockerImageId(daemonHandle), expectedConfigDigest, 'tag rebound fixture must differ from D');
+  expectRuntimeRejected('MUTABLE TAG REBOUND', daemonHandle, expectedConfigDigest);
+  expectRuntimeRejected('MIGRATION IMAGE MISMATCH', daemonHandle, expectedConfigDigest);
+  expectRuntimeRejected('SERVING IMAGE MISMATCH', daemonHandle, expectedConfigDigest);
+  expectRuntimeRejected('ROLLBACK IMAGE MISMATCH', daemonHandle, expectedConfigDigest);
 
   const admin = new Pool(postgresConfig(process.env.PGDATABASE));
   try {
@@ -171,14 +224,13 @@ async function execute() {
   assertBackupFile(dumpPath);
   process.stdout.write('PRE-APPLY BACKUP:\nPASS\n');
 
-  const migrated = runPinned('migrate', migrateContainer, applyDatabase, ['--entrypoint', 'node', runImage, 'dist/composition/migrate.js']);
+  const migrated = runPinned('migrate', migrateContainer, applyDatabase,
+    ['--entrypoint', 'node', runImage, 'dist/composition/migrate.js'], expectedConfigDigest);
   assert.equal(migrated.status, 0, `migrate from digest failed: ${redact(migrated.stderr)}`);
   assert.equal(migrated.stdout, '');
   assert.equal(migrated.stderr, '');
   assert.equal((migrated.stderr || '').includes(password), false, 'password leaked in migrate logs');
-  assert.ok(dockerImageId(daemonHandle).includes(subjectConfig.replace(/^sha256:/, '')),
-    'migrate image config drifted from subject digest D');
-  const migrateImage = runImage;
+  assert.equal(migrated.imageId, expectedConfigDigest, 'migration runtime identity differs from verified D');
   process.stdout.write('MIGRATE FROM DIGEST:\nPASS\n');
 
   const schema = await schemaVersions(applyDatabase);
@@ -186,30 +238,20 @@ async function execute() {
   dumpDatabase(applyDatabase, recoveredDumpPath);
   assertBackupFile(recoveredDumpPath);
 
-  const serveImage = runImage;
-  assert.equal(migrateImage, serveImage, 'migrate and serve must use the same digest-pinned image');
-  assert.equal(migrateDigest, serveDigest, 'MIGRATE_IMAGE_DIGEST !== SERVE_IMAGE_DIGEST');
   process.stdout.write('SERVE FROM SAME DIGEST:\n');
-  await serveReady(serveContainer, applyDatabase);
+  const servingIdentity = await serveReady(serveContainer, applyDatabase, expectedConfigDigest);
+  assert.equal(servingIdentity, expectedConfigDigest, 'serving runtime identity differs from verified D');
   process.stdout.write('PASS\nMIGRATE/SERVE DIGEST EQUALITY:\nPASS\nREADY:\nPASS\n');
 
   skopeo([
     'copy', '--preserve-digests', '--format', 'oci', '--dest-tls-verify=false',
     `oci:${subjectLayout}`, `docker://${unsignedRef}`,
   ]);
-  expectReleaseRejected('UNSIGNED', () => assertReleasable(unsignedRef, trustedKeys, expectedDigest));
-  expectReleaseRejected('WRONG DIGEST', () => assertReleasable(destRef, trustedKeys, `sha256:${'0'.repeat(64)}`));
-  expectReleaseRejected('WRONG SIGNATURE', () => assertReleasable(destRef, wrongKeys, expectedDigest));
-
-  const mutatedDigest = mutateRuntimeSubject(layout, expectedDigest);
-  assert.notEqual(mutatedDigest, expectedDigest);
-  const mutatedRef = `promote.registry.test:5000/zinesh/mutated@${mutatedDigest}`;
-  materializeSubjectLayout(layout, mutatedLayout, mutatedDigest);
-  skopeo([
-    'copy', '--preserve-digests', '--format', 'oci', '--dest-tls-verify=false',
-    `oci:${mutatedLayout}`, `docker://${mutatedRef}`,
-  ]);
-  expectReleaseRejected('MUTATED', () => assertReleasable(mutatedRef, trustedKeys, expectedDigest));
+  expectReleaseRejected('UNSIGNED', () => assertReleasable(unsignedRef, handoff.trust.publicKeyPath, expectedDigest));
+  expectReleaseRejected('WRONG DIGEST', () => assertReleasable(destRef, handoff.trust.publicKeyPath, `sha256:${'0'.repeat(64)}`));
+  expectReleaseRejected('WRONG SIGNATURE', () => assertReleasable(destRef, handoff.trust.untrustedPublicKeyPath, expectedDigest));
+  expectReleaseRejected('UNTRUSTED SIGNATURE', () =>
+    assertReleasable(handoff.artifact.untrustedReference, handoff.trust.publicKeyPath, expectedDigest));
 
   restoreDatabase(undoDatabase, dumpPath);
   const undoSchema = await schemaVersionsOrEmpty(undoDatabase);
@@ -217,16 +259,16 @@ async function execute() {
 
   restoreDatabase(recoveredDatabase, recoveredDumpPath);
   assert.deepEqual(await schemaVersions(recoveredDatabase), schema);
-  await serveReady(recoveredContainer, recoveredDatabase);
+  const rollbackIdentity = await serveReady(recoveredContainer, recoveredDatabase, expectedConfigDigest);
+  assert.equal(rollbackIdentity, expectedConfigDigest, 'rollback runtime identity differs from verified D');
   process.stdout.write('ROLLBACK RESTORE:\nPASS\n');
 
   assert.equal(existsSync(join(layout, 'cosign.key')), false);
   assert.equal(existsSync(join(layout, 'pg_dump')), false);
 }
 
-function assertReleasable(imageRef, keyDir, digest) {
-  cosign(['verify', '--key', '/work/cosign.pub', '--insecure-ignore-tlog',
-    '--allow-http-registry', '--allow-insecure-registry', imageRef], keyDir);
+function assertReleasable(imageRef, publicKeyPath, digest) {
+  cosignVerify(imageRef, publicKeyPath);
   assertDigestEqual(inspectDigest(imageRef), digest);
 }
 
@@ -245,13 +287,6 @@ function expectReleaseRejected(label, fn) {
   process.stdout.write(`${label}:\nEXPECTED FAIL\n`);
 }
 
-function containerImageRef(name) {
-  const inspect = JSON.parse(docker(['inspect', name]).stdout)[0];
-  const used = inspect.Config?.Image ?? '';
-  const repoDigests = inspect.RepoDigests ?? [];
-  return [used, ...repoDigests].join(' ');
-}
-
 function copyToDockerDaemon(imageRef) {
   skopeo([
     'copy', '--src-tls-verify=false', '--format', 'v2s2',
@@ -265,22 +300,44 @@ function dockerImageId(name) {
   return id;
 }
 
-function runPinned(role, name, databaseName, extra) {
+function containerImageId(name) {
+  const inspect = JSON.parse(docker(['inspect', name]).stdout)[0];
+  const id = inspect?.Image ?? '';
+  assert.match(id, /^sha256:[0-9a-f]{64}$/, `container image id missing for ${name}`);
+  return id;
+}
+
+function assertRuntimeIdentity(name, expectedId) {
+  const actualId = containerImageId(name);
+  assert.equal(actualId, expectedId,
+    `runtime identity mismatch: container ${name} uses ${actualId}, expected ${expectedId} bound to D`);
+  return actualId;
+}
+
+function runPinned(role, name, databaseName, extra, expectedId) {
   const env = role === 'migrate' ? migrateEnv(databaseName) : servingEnv(databaseName);
-  return spawnSync('docker', [
-    'run', '--rm', '--name', name, '--read-only', '--cap-drop=ALL',
+  docker([
+    'create', '--name', name, '--read-only', '--cap-drop=ALL',
     '--security-opt=no-new-privileges:true', '--pull=never',
     '--network', process.env.PG_TLS_DOCKER_NETWORK,
     '--mount', `type=volume,source=${volume},target=/run/zinesh-tls,readonly`,
     ...Object.entries(env).flatMap(([key, value]) => ['--env', `${key}=${value}`]),
     ...extra,
-  ], { encoding: 'utf8', timeout: 30_000 });
+  ]);
+  try {
+    const imageId = assertRuntimeIdentity(name, expectedId);
+    const result = spawnSync('docker', ['start', '--attach', name], { encoding: 'utf8', timeout: 30_000 });
+    assert.equal(containerImageId(name), imageId, 'migration runtime identity changed during execution');
+    return { ...result, imageId };
+  } finally {
+    spawnSync('docker', ['rm', '-f', name], { encoding: 'utf8' });
+  }
 }
 
-async function serveReady(name, databaseName) {
+async function serveReady(name, databaseName, expectedId) {
   const env = servingEnv(databaseName);
   docker([
-    'run', '--detach', '--name', name, '--read-only', '--cap-drop=ALL',
+    'create', '--name', name, '--read-only', '--cap-drop=ALL',
     '--security-opt=no-new-privileges:true', '--pull=never',
     '--network', process.env.PG_TLS_DOCKER_NETWORK,
     '--publish', '127.0.0.1::8443',
@@ -289,13 +346,9 @@ async function serveReady(name, databaseName) {
     runImage,
   ]);
   try {
-    const used = containerImageRef(name);
-    assert.equal(used.includes('zinesh-phase-b'), false, `serve used IMAGE_TAG: ${used}`);
-    assert.ok(used.includes('localhost/zinesh/runtime') || used.includes(expectedDigest),
-      `serve container image must be the promoted digest D, got ${used}`);
-    const imageId = JSON.parse(docker(['inspect', name]).stdout)[0]?.Image ?? '';
-    assert.ok(imageId.includes(blob(layout, expectedDigest).config.digest.replace(/^sha256:/, '')),
-      `serve image id ${imageId} does not match subject config of D`);
+    const imageId = assertRuntimeIdentity(name, expectedId);
+    docker(['start', name]);
+    assert.equal(containerImageId(name), imageId, 'serving runtime identity changed during execution');
     const address = docker(['port', name, '8443/tcp']).stdout.trim();
     const port = Number(address.slice(address.lastIndexOf(':') + 1));
     const ready = await waitForReady(port, name);
@@ -304,6 +357,19 @@ async function serveReady(name, databaseName) {
     const logs = docker(['logs', name], { allowFailure: true });
     const combined = `${logs.stdout || ''}\n${logs.stderr || ''}`;
     assert.equal(combined.includes(password), false, 'password leaked in serving logs');
+    return imageId;
+  } finally {
+    spawnSync('docker', ['rm', '-f', name], { encoding: 'utf8' });
+  }
+}
+
+function expectRuntimeRejected(label, imageRef, expectedId) {
+  const name = `zinesh-rollout-reject-${label.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${suffix}`;
+  docker(['create', '--name', name, '--pull=never', imageRef]);
+  try {
+    const state = JSON.parse(docker(['inspect', name]).stdout)[0]?.State?.Status;
+    assert.equal(state, 'created', `${label} fixture executed before identity verification`);
+    expectReleaseRejected(label, () => assertRuntimeIdentity(name, expectedId));
   } finally {
     spawnSync('docker', ['rm', '-f', name], { encoding: 'utf8' });
   }
@@ -527,15 +593,6 @@ function mutateRuntimeSubject(directory, subjectDigest) {
   return newManifestDigest;
 }
 
-function generateKeyPair(directory, keyPassword) {
-  chmodSync(directory, 0o700);
-  writeFileSync(join(directory, '.cosign-env'),
-    `COSIGN_PASSWORD=${keyPassword}\nCOSIGN_YES=true\n`, { mode: 0o600 });
-  cosign(['generate-key-pair'], directory);
-  chmodSync(join(directory, 'cosign.key'), 0o600);
-  chmodSync(join(directory, 'cosign.pub'), 0o600);
-}
-
 function inspectDigest(imageRef) {
   const result = skopeo(['inspect', '--tls-verify=false', '--format', '{{.Digest}}', `docker://${imageRef}`]);
   const digest = String(result.stdout || '').trim();
@@ -560,17 +617,17 @@ function waitForRegistry(name) {
   throw new Error(`ephemeral registry ${name} did not become ready`);
 }
 
-function newPassword() {
-  return randomBytes(32).toString('hex');
-}
-
-function cosign(args, keyDir) {
+function cosign(args) {
   return dockerRun(COSIGN_IMAGE, args, {
-    workdir: '/work',
-    binds: [[keyDir, '/work']],
-    envFile: join(keyDir, '.cosign-env'),
     network: networkName,
   });
+}
+
+function cosignVerify(imageRef, publicKeyPath) {
+  return dockerRun(COSIGN_IMAGE, [
+    'verify', '--key', `/trust/${basename(publicKeyPath)}`, '--insecure-ignore-tlog',
+    '--allow-http-registry', '--allow-insecure-registry', imageRef,
+  ], { binds: [[dirname(publicKeyPath), '/trust:ro']], network: networkName });
 }
 
 function skopeo(args, options = {}) {
@@ -675,8 +732,10 @@ async function cleanup() {
     spawnSync('docker', ['rm', '-f', name], { encoding: 'utf8' });
   }
   if (createdVolume) spawnSync('docker', ['volume', 'rm', '-f', volume], { encoding: 'utf8' });
-  if (createdNetwork) spawnSync('docker', ['network', 'rm', networkName], { encoding: 'utf8' });
+  spawnSync('docker', ['network', 'rm', networkName], { encoding: 'utf8' });
   rmSync(work, { recursive: true, force: true });
+  rmSync(handoff.cleanup.workDirectory, { recursive: true, force: true });
+  rmSync(handoffPath, { force: true });
   if (createdApply) { createdApply = false; await dropDatabase(applyDatabase); }
   if (createdUndo) { createdUndo = false; await dropDatabase(undoDatabase); }
   if (createdRecovered) { createdRecovered = false; await dropDatabase(recoveredDatabase); }
