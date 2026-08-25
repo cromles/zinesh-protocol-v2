@@ -76,8 +76,9 @@ import {
 import type { CellId, Event, Version } from '../core/types';
 import { cellKernel } from '../kernel';
 import { PostgresMigrator } from './postgres-migrator';
-import type { FundingReceipt } from '../funding/types';
+import type { FundingDisputeObservation, FundingIntent, FundingReceipt } from '../funding/types';
 import { PostgresFundingReceiptStore } from './postgres-funding-receipt-store';
+import { createFundingIntent } from '../funding/funding-intent';
 
 // ---------------------------------------------------------------------------
 // Skip guard — tests require a real PostgreSQL instance
@@ -126,7 +127,7 @@ async function applySchema(pool: Pool): Promise<void> {
 async function truncateTables(pool: Pool): Promise<void> {
   // Only allowed in tests — not in production code.
   // events is append-only in production; we truncate here only to reset test state.
-  await pool.query('TRUNCATE TABLE events, snapshots, command_executions RESTART IDENTITY CASCADE');
+  await pool.query('TRUNCATE TABLE funding_intents, events, snapshots, command_executions RESTART IDENTITY CASCADE');
 }
 
 async function expectTlsConnectionFailure(config: PostgresConfig, expected: RegExp): Promise<void> {
@@ -242,6 +243,7 @@ function makeFundingReceipt(
   overrides: Partial<FundingReceipt> = {},
 ): FundingReceipt {
   return {
+    intentId: `intent-pg-${evtCounter}`,
     receiptId: `receipt-pg-${++evtCounter}`,
     provider: 'provider-pg',
     providerTransactionId: `transaction-pg-${evtCounter}`,
@@ -250,16 +252,31 @@ function makeFundingReceipt(
     fundingEventId: fundingEvent.eventId,
     gatewayPrincipalId: 'gateway-pg',
     payer: PAYER,
+    payee: PAYEE,
     amount: AMOUNT,
     currency: 'TRY',
     destinationId: 'custody-pg',
     confirmedAt: T1,
-    finality: 'SETTLED',
+    finality: 'FUNDS_HELD',
     evidenceDigest: 'a'.repeat(64),
     verifiedAt: T2,
     createdAt: T3,
     ...overrides,
   };
+}
+
+function intentForReceipt(receipt: FundingReceipt): FundingIntent {
+  return createFundingIntent({
+    intentId: receipt.intentId, provider: receipt.provider, cellId: receipt.cellId,
+    payer: receipt.payer, payee: receipt.payee, amount: receipt.amount, currency: receipt.currency,
+    destinationId: receipt.destinationId,
+    createdAt: makeTimestamp(500_000), expiresAt: makeTimestamp(1_500_000),
+  });
+}
+
+async function createIntent(adapter: PostgresPersistenceAdapter, receipt: FundingReceipt): Promise<void> {
+  const result = await adapter.fundingIntentStore.create(intentForReceipt(receipt));
+  expect(['CREATED', 'DUPLICATE']).toContain(result.kind);
 }
 
 // ---------------------------------------------------------------------------
@@ -874,6 +891,7 @@ maybeDescribe('PostgreSQL Persistence', () => {
     const commandId = makeCommandId(`funding-command-${cellCounter}`);
     const fundedEvent = makeFundedEvent(cellId, V2);
     const receipt = makeFundingReceipt(cellId, commandId, fundedEvent);
+    await createIntent(adapter, receipt);
 
     const execution = await adapter.commandExecutionStore.execute(
       commandId,
@@ -888,18 +906,20 @@ maybeDescribe('PostgreSQL Persistence', () => {
 
     const pool = (adapter as unknown as { pool: Pool }).pool;
     const persisted = await pool.query(
-      `SELECT receipt_id, command_id, funding_event_id, amount::text AS amount,
+      `SELECT receipt_id, intent_id, command_id, funding_event_id, payee, amount::text AS amount,
               evidence_digest, finality
        FROM funding_receipts WHERE receipt_id = $1`,
       [receipt.receiptId],
     );
     expect(persisted.rows).toEqual([{
       receipt_id: receipt.receiptId,
+      intent_id: receipt.intentId,
       command_id: commandId,
       funding_event_id: fundedEvent.eventId,
+      payee: PAYEE,
       amount: AMOUNT.toString(),
       evidence_digest: receipt.evidenceDigest,
-      finality: 'SETTLED',
+      finality: 'FUNDS_HELD',
     }]);
     expect((await adapter.eventStore.getEvents(cellId)).map((event) => event.type))
       .toEqual(['CellCreated', 'CellFunded']);
@@ -915,6 +935,7 @@ maybeDescribe('PostgreSQL Persistence', () => {
       payload: { fundedBy: PAYER, amount: exact },
     };
     const receipt = makeFundingReceipt(cellId, commandId, fundedEvent, { amount: exact });
+    await createIntent(adapter, receipt);
     await adapter.commandExecutionStore.execute(commandId, 'funding-exact-fingerprint', async (events, receipts) => {
       expect((await receipts.claim(receipt)).kind).toBe('CLAIMED');
       expect((await events.append(cellId, [fundedEvent])).ok).toBe(true);
@@ -931,6 +952,7 @@ maybeDescribe('PostgreSQL Persistence', () => {
     const commandId = makeCommandId(`funding-rollback-${cellCounter}`);
     const fundedEvent = makeFundedEvent(cellId, V2);
     const receipt = makeFundingReceipt(cellId, commandId, fundedEvent);
+    await createIntent(adapter, receipt);
     await expect(adapter.commandExecutionStore.execute(commandId, 'funding-rollback-fingerprint', async (events, receipts) => {
       expect((await receipts.claim(receipt)).kind).toBe('CLAIMED');
       expect((await events.append(cellId, [fundedEvent])).ok).toBe(true);
@@ -952,6 +974,7 @@ maybeDescribe('PostgreSQL Persistence', () => {
     const firstCommand = makeCommandId(`funding-first-${cellCounter}`);
     const firstEvent = makeFundedEvent(firstCell, V2);
     const firstReceipt = makeFundingReceipt(firstCell, firstCommand, firstEvent);
+    await createIntent(adapter, firstReceipt);
     await adapter.commandExecutionStore.execute(firstCommand, 'funding-first-fingerprint', async (events, receipts) => {
       expect((await receipts.claim(firstReceipt)).kind).toBe('CLAIMED');
       expect((await events.append(firstCell, [firstEvent])).ok).toBe(true);
@@ -964,6 +987,7 @@ maybeDescribe('PostgreSQL Persistence', () => {
       provider: firstReceipt.provider,
       providerTransactionId: firstReceipt.providerTransactionId,
     });
+    await createIntent(adapter, conflicting);
     await adapter.commandExecutionStore.execute(secondCommand, 'funding-second-fingerprint', async (events, receipts) => {
       const claim = await receipts.claim(conflicting);
       expect(claim).toEqual({ kind: 'CONFLICT', conflict: 'PROVIDER_TRANSACTION' });
@@ -978,6 +1002,7 @@ maybeDescribe('PostgreSQL Persistence', () => {
     const commandId = makeCommandId(`funding-version-conflict-${cellCounter}`);
     const conflictingEvent = makeFundedEvent(cellId, V2);
     const receipt = makeFundingReceipt(cellId, commandId, conflictingEvent);
+    await createIntent(adapter, receipt);
     await expect(adapter.commandExecutionStore.execute(commandId, 'funding-version-conflict', async (events, receipts) => {
       expect((await receipts.claim(receipt)).kind).toBe('CLAIMED');
       expect((await events.append(cellId, [conflictingEvent])).ok).toBe(false);
@@ -991,10 +1016,11 @@ maybeDescribe('PostgreSQL Persistence', () => {
   test('43. concurrent funding attempts allow one receipt and one CellFunded event', async () => {
     const cellId = freshCellId();
     await adapter.eventStore.append(cellId, [makeEvent(cellId, V1)]);
-    const execute = (suffix: string) => {
+    const execute = async (suffix: string) => {
       const commandId = makeCommandId(`funding-race-${suffix}-${cellCounter}`);
       const fundedEvent = makeFundedEvent(cellId, V2);
       const receipt = makeFundingReceipt(cellId, commandId, fundedEvent);
+      await createIntent(adapter, receipt);
       return adapter.commandExecutionStore.execute(commandId, `funding-race-${suffix}`, async (events, receipts) => {
         const claim = await receipts.claim(receipt);
         if (claim.kind !== 'CLAIMED') return { encodedResult: `{"claim":"${claim.kind}"}` };
@@ -1020,6 +1046,94 @@ maybeDescribe('PostgreSQL Persistence', () => {
     const pool = (adapter as unknown as { pool: Pool }).pool;
     expect((await pool.query('SELECT count(*)::int AS count FROM funding_receipts WHERE cell_id=$1', [cellId])).rows[0])
       .toEqual({ count: 0 });
+  });
+
+  test('45. funding intents preserve the exact payee-aware binding and reject mutation or rebinding', async () => {
+    const cellId = freshCellId();
+    const receipt = makeFundingReceipt(cellId, makeCommandId(`intent-command-${cellCounter}`),
+      makeFundedEvent(cellId, V2));
+    const candidate = intentForReceipt(receipt);
+    await expect(adapter.fundingIntentStore.create(candidate)).resolves.toEqual({ kind: 'CREATED' });
+    await expect(adapter.fundingIntentStore.create({ ...candidate })).resolves
+      .toEqual({ kind: 'DUPLICATE', intent: candidate });
+    await expect(adapter.fundingIntentStore.create({ ...candidate, payee: makeActorId('rebound-payee') }))
+      .resolves.toEqual({ kind: 'CONFLICT' });
+    await expect(adapter.fundingIntentStore.get(candidate.intentId)).resolves.toEqual(candidate);
+
+    const pool = (adapter as unknown as { pool: Pool }).pool;
+    await expect(pool.query('UPDATE funding_intents SET destination_id=$2 WHERE intent_id=$1',
+      [candidate.intentId, 'rebound-custody'])).rejects.toThrow(/immutable/i);
+    await expect(pool.query('DELETE FROM funding_intents WHERE intent_id=$1', [candidate.intentId]))
+      .rejects.toThrow(/immutable/i);
+  });
+
+  test('46. a funding receipt must match its immutable intent including payee and held finality', async () => {
+    const cellId = freshCellId();
+    await adapter.eventStore.append(cellId, [makeEvent(cellId, V1)]);
+    const commandId = makeCommandId(`intent-link-${cellCounter}`);
+    const fundedEvent = makeFundedEvent(cellId, V2);
+    const receipt = makeFundingReceipt(cellId, commandId, fundedEvent);
+    await createIntent(adapter, receipt);
+    const mismatched = { ...receipt, payee: makeActorId('wrong-receipt-payee') };
+
+    await expect(adapter.commandExecutionStore.execute(commandId, 'intent-link-fingerprint',
+      async (events, receipts) => {
+        expect((await receipts.claim(mismatched)).kind).toBe('CLAIMED');
+        expect((await events.append(cellId, [fundedEvent])).ok).toBe(true);
+        return { encodedResult: '{"outcome":"SUCCESS"}' };
+      })).rejects.toThrow(/match.*intent/i);
+    expect((await adapter.eventStore.getEvents(cellId)).map((event) => event.type)).toEqual(['CellCreated']);
+    const pool = (adapter as unknown as { pool: Pool }).pool;
+    expect((await pool.query('SELECT count(*)::int AS count FROM funding_receipts WHERE intent_id=$1',
+      [receipt.intentId])).rows[0]).toEqual({ count: 0 });
+  });
+
+  test('47. provider dispute observations are linked, append-only, versioned and settlement-blocking', async () => {
+    const cellId = freshCellId();
+    await adapter.eventStore.append(cellId, [makeEvent(cellId, V1)]);
+    const commandId = makeCommandId(`dispute-funding-${cellCounter}`);
+    const fundedEvent = makeFundedEvent(cellId, V2);
+    const receipt = makeFundingReceipt(cellId, commandId, fundedEvent);
+    await createIntent(adapter, receipt);
+    await adapter.commandExecutionStore.execute(commandId, 'dispute-funding-fingerprint', async (events, receipts) => {
+      expect((await receipts.claim(receipt)).kind).toBe('CLAIMED');
+      expect((await events.append(cellId, [fundedEvent])).ok).toBe(true);
+      return { encodedResult: '{"outcome":"SUCCESS"}' };
+    });
+    const opened: FundingDisputeObservation = {
+      observationId: 'pg-dispute-open', provider: receipt.provider, providerDisputeId: 'pg-dispute-1',
+      providerTransactionId: receipt.providerTransactionId, observationVersion: 1n,
+      receiptId: receipt.receiptId, cellId, kind: 'CHARGEBACK', status: 'OPEN', outcome: 'PENDING',
+      amount: receipt.amount,
+      currency: receipt.currency, evidenceDigest: 'c'.repeat(64), observedAt: T2, recordedAt: T3,
+    };
+    await expect(adapter.fundingDisputeStore.record(opened)).resolves.toEqual({ kind: 'RECORDED' });
+    await expect(adapter.fundingDisputeStore.record({ ...opened, recordedAt: makeTimestamp(3_000_001) }))
+      .resolves.toEqual({ kind: 'DUPLICATE', observation: opened });
+    await expect(adapter.fundingDisputeStore.hasBlockingDispute(cellId)).resolves.toBe(true);
+
+    const retained = { ...opened, observationId: 'pg-dispute-retained', observationVersion: 2n as const,
+      status: 'RESOLVED' as const, outcome: 'FUNDS_RETAINED' as const,
+      evidenceDigest: 'd'.repeat(64), recordedAt: makeTimestamp(3_000_001) };
+    await expect(adapter.fundingDisputeStore.record(retained)).resolves.toEqual({ kind: 'RECORDED' });
+    await expect(adapter.fundingDisputeStore.hasBlockingDispute(cellId)).resolves.toBe(false);
+    await expect(adapter.fundingDisputeStore.record({ ...retained,
+      observationId: 'pg-dispute-rebound', observationVersion: 3n, receiptId: 'other-receipt',
+      cellId: makeCellId('other-cell'), evidenceDigest: 'f'.repeat(64) }))
+      .resolves.toEqual({ kind: 'CONFLICT' });
+    await expect(adapter.fundingDisputeStore.record({ ...retained,
+      observationId: 'pg-dispute-invalid-lifecycle', observationVersion: 3n,
+      status: 'OPEN', evidenceDigest: '0'.repeat(64) }))
+      .resolves.toEqual({ kind: 'CONFLICT' });
+
+    const pool = (adapter as unknown as { pool: Pool }).pool;
+    await expect(pool.query('UPDATE funding_dispute_observations SET status=$2 WHERE observation_id=$1',
+      [opened.observationId, 'CLOSED'])).rejects.toThrow(/append-only/i);
+    await expect(pool.query('DELETE FROM funding_dispute_observations WHERE observation_id=$1',
+      [opened.observationId])).rejects.toThrow(/append-only/i);
+    await expect(adapter.fundingDisputeStore.record({ ...opened, observationId: 'pg-dispute-invalid-link',
+      providerDisputeId: 'pg-dispute-invalid', provider: 'wrong-provider', evidenceDigest: 'e'.repeat(64) }))
+      .rejects.toThrow(/match.*receipt/i);
   });
 });
 

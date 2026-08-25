@@ -13,6 +13,7 @@ let sequence = 0;
 function receipt(overrides: Partial<FundingReceipt> = {}): FundingReceipt {
   const id = ++sequence;
   return {
+    intentId: `intent-${id}`,
     receiptId: `receipt-${id}`,
     provider: 'provider-a',
     providerTransactionId: `transaction-${id}`,
@@ -21,11 +22,12 @@ function receipt(overrides: Partial<FundingReceipt> = {}): FundingReceipt {
     fundingEventId: makeEventId(`funded-event-${id}`),
     gatewayPrincipalId: 'gateway-a',
     payer: makeActorId('payer-a'),
+    payee: makeActorId('payee-a'),
     amount: makeAmount(1234567890123456789012345678901n),
     currency: 'TRY',
     destinationId: 'custody-a',
     confirmedAt: makeTimestamp(1_000_000),
-    finality: 'SETTLED',
+    finality: 'FUNDS_HELD',
     evidenceDigest: 'a'.repeat(64),
     verifiedAt: makeTimestamp(1_000_100),
     createdAt: makeTimestamp(1_000_200),
@@ -57,6 +59,7 @@ describe('provider-neutral funding receipt store contract', () => {
     ['different cell', (base: FundingReceipt) => ({ ...base, cellId: makeCellId('other-cell') })],
     ['different amount', (base: FundingReceipt) => ({ ...base, amount: makeAmount(base.amount + 1n) })],
     ['different payer', (base: FundingReceipt) => ({ ...base, payer: makeActorId('other-payer') })],
+    ['different payee', (base: FundingReceipt) => ({ ...base, payee: makeActorId('other-payee') })],
     ['different destination', (base: FundingReceipt) => ({ ...base, destinationId: 'other-custody' })],
     ['different evidence digest', (base: FundingReceipt) => ({ ...base, evidenceDigest: 'b'.repeat(64) })],
   ])('same provider transaction with %s is a security conflict', async (_name, mutate) => {
@@ -89,6 +92,14 @@ describe('provider-neutral funding receipt store contract', () => {
     expect((await store.claim(original)).kind).toBe('CLAIMED');
     const result = await store.claim(receipt({ fundingEventId: original.fundingEventId }));
     expect(result).toEqual({ kind: 'CONFLICT', conflict: 'EVENT' });
+  });
+
+  test('same immutable intent cannot fund twice', async () => {
+    const store = new InMemoryFundingReceiptStore();
+    const original = receipt();
+    expect((await store.claim(original)).kind).toBe('CLAIMED');
+    const result = await store.claim(receipt({ intentId: original.intentId }));
+    expect(result).toEqual({ kind: 'CONFLICT', conflict: 'INTENT' });
   });
 
   test('receipt identifier cannot be rebound', async () => {

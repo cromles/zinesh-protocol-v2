@@ -2,6 +2,7 @@ import type { FundingReceipt } from '../funding/types';
 
 export type FundingReceiptConflict =
   | 'RECEIPT'
+  | 'INTENT'
   | 'PROVIDER_TRANSACTION'
   | 'CELL'
   | 'COMMAND'
@@ -24,13 +25,15 @@ export function sameFundingReceiptIdentity(
   left: FundingReceipt,
   right: FundingReceipt,
 ): boolean {
-  return left.provider === right.provider
+  return left.intentId === right.intentId
+    && left.provider === right.provider
     && left.providerTransactionId === right.providerTransactionId
     && left.cellId === right.cellId
     && left.commandId === right.commandId
     && left.fundingEventId === right.fundingEventId
     && left.gatewayPrincipalId === right.gatewayPrincipalId
     && left.payer === right.payer
+    && left.payee === right.payee
     && left.amount === right.amount
     && left.currency === right.currency
     && left.destinationId === right.destinationId

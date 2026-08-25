@@ -24,6 +24,7 @@ export class InMemoryFundingReceiptStore implements FundingReceiptStore {
 
 function conflictsWith(left: FundingReceipt, right: FundingReceipt): boolean {
   return left.receiptId === right.receiptId
+    || left.intentId === right.intentId
     || (left.provider === right.provider && left.providerTransactionId === right.providerTransactionId)
     || left.cellId === right.cellId
     || left.commandId === right.commandId
@@ -35,6 +36,7 @@ function conflictKind(left: FundingReceipt, right: FundingReceipt): FundingRecei
     return 'PROVIDER_TRANSACTION';
   }
   if (left.receiptId === right.receiptId) return 'RECEIPT';
+  if (left.intentId === right.intentId) return 'INTENT';
   if (left.cellId === right.cellId) return 'CELL';
   if (left.commandId === right.commandId) return 'COMMAND';
   return 'EVENT';

@@ -7,6 +7,7 @@ import type {
 import type { EventStore } from './event-store';
 import { InMemoryFundingReceiptStore } from './in-memory-funding-receipt-store';
 import type { FundingReceiptStore } from './funding-receipt-store';
+import type { FundingDisputeStore } from './funding-dispute-store';
 
 interface RecordEntry { readonly fingerprint: string; readonly encodedResult: string }
 
@@ -16,12 +17,13 @@ export class InMemoryCommandExecutionStore implements CommandExecutionStore {
 
   private readonly fundingReceiptStore = new InMemoryFundingReceiptStore();
 
-  constructor(private readonly eventStore: EventStore) {}
+  constructor(private readonly eventStore: EventStore, private readonly fundingDisputeStore: FundingDisputeStore) {}
 
   execute(
     commandId: CommandId,
     fingerprint: string,
-    work: (eventStore: EventStore, fundingReceiptStore: FundingReceiptStore) => Promise<CommandWorkResult>,
+    work: (eventStore: EventStore, fundingReceiptStore: FundingReceiptStore,
+      fundingDisputeStore: FundingDisputeStore) => Promise<CommandWorkResult>,
   ): Promise<CommandExecutionResult> {
     const previous = this.tails.get(commandId) ?? Promise.resolve();
     const run = previous.then(async (): Promise<CommandExecutionResult> => {
@@ -31,7 +33,7 @@ export class InMemoryCommandExecutionStore implements CommandExecutionStore {
           ? { kind: 'REPLAYED', encodedResult: existing.encodedResult }
           : { kind: 'CONFLICT' };
       }
-      const completed = await work(this.eventStore, this.fundingReceiptStore);
+      const completed = await work(this.eventStore, this.fundingReceiptStore, this.fundingDisputeStore);
       this.records.set(commandId, { fingerprint, encodedResult: completed.encodedResult });
       return { kind: 'EXECUTED', encodedResult: completed.encodedResult };
     });

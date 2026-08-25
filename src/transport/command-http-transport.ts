@@ -329,12 +329,14 @@ function decodeFundingRequest(raw: string): DecodeFundingSuccess | DecodeFailure
   }
 
   const evidence = value.evidence;
-  if (Object.keys(evidence).some((key) => !['provider', 'providerTransactionId', 'opaqueEvidence'].includes(key))
+  if (Object.keys(evidence).some((key) => !['provider', 'providerTransactionId', 'intentId', 'opaqueEvidence'].includes(key))
     || !boundedString(evidence.provider, 128) || !boundedString(evidence.providerTransactionId, 256)
+    || !boundedString(evidence.intentId, 128)
     || ('opaqueEvidence' in evidence && !safeTree(evidence.opaqueEvidence, 0))) return bad('INVALID_REQUEST');
   try {
     return { ok: true, commandId: makeCommandId(value.commandId), cellId: makeCellId(value.cellId),
       evidence: { provider: evidence.provider, providerTransactionId: evidence.providerTransactionId,
+        intentId: evidence.intentId,
         ...(!('opaqueEvidence' in evidence) ? {} : { opaqueEvidence: evidence.opaqueEvidence }) } };
   } catch { return bad('INVALID_REQUEST'); }
 }
@@ -371,6 +373,7 @@ function mapResult(result: HandleCommandResult): { status: number; body: unknown
   const status = code === 'UNAUTHENTICATED' ? 401
     : code === 'IDEMPOTENCY_CONFLICT' ? 409
     : code === 'FUNDING_RECEIPT_CONFLICT' ? 409
+    : code === 'FUNDING_DISPUTE_BLOCKED' ? 409
     : code === 'RATE_LIMITED' ? 429
     : code === 'RATE_LIMIT_UNAVAILABLE' || code === 'FUNDING_DEPENDENCY_UNAVAILABLE' ? 503
     : code === 'CELL_NOT_FOUND' ? 404

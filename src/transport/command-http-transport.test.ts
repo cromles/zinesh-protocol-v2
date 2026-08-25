@@ -10,9 +10,10 @@ import { InMemoryPersistenceAdapter } from '../adapters/in-memory-persistence-ad
 import { fixedClock } from '../application/clock';
 import { createEventIdFactory } from '../application/event-id-factory';
 import { cellKernel } from '../kernel';
-import { makeActorId, makeTimestamp } from '../core/types';
+import { makeActorId, makeAmount, makeCellId, makeTimestamp } from '../core/types';
 import { SecurityTelemetry } from '../security/security-observability';
 import type { SecurityEvent } from '../security/security-observability';
+import { createFundingIntent } from '../funding/funding-intent';
 
 const ISSUER = 'https://transport-issuer.test';
 const AUDIENCE = 'zinesh-transport';
@@ -78,6 +79,8 @@ async function harness(options: { providerFailure?: boolean } = {}): Promise<Har
   const records = new Map<string, PrincipalRecord>([
     ['payer-subject', { principalId: 'principal-payer', type: 'ACTOR', enabled: true,
       actorId: PAYER, capabilities: ['ACT_AS_SELF'], mappingVersion: 1 }],
+    ['payee-subject', { principalId: 'principal-payee', type: 'ACTOR', enabled: true,
+      actorId: PAYEE, capabilities: ['ACT_AS_SELF'], mappingVersion: 1 }],
     ['other-subject', { principalId: 'principal-other', type: 'ACTOR', enabled: true,
       actorId: PAYER, capabilities: ['ACT_AS_SELF'], mappingVersion: 1 }],
     ['gateway-subject', { principalId: 'principal-gateway', type: 'GATEWAY', enabled: true,
@@ -92,7 +95,7 @@ async function harness(options: { providerFailure?: boolean } = {}): Promise<Har
     async resolve(identity) { return identity.issuer === ISSUER ? records.get(identity.subject) ?? null : null; },
   }, { async verify(evidence, expected) { return { outcome: 'VERIFIED', context: {
     provider: evidence.provider, providerTransactionId: evidence.providerTransactionId, ...expected,
-    confirmedAt: makeTimestamp(900_000), finality: 'SETTLED', evidenceDigest: 'b'.repeat(64),
+    confirmedAt: makeTimestamp(900_000), finality: 'FUNDS_HELD', evidenceDigest: 'b'.repeat(64),
     verifiedAt: makeTimestamp(950_000),
   } }; } }, undefined, telemetry, { async resolve() { return 'transport-custody'; } });
   const audit = new Audit();
@@ -142,18 +145,60 @@ describe('Phase 7E real HTTP trusted command transport', () => {
   test('dedicated funding route verifies and funds while generic FundCell is blocked', async () => {
     const h = await setup();
     await post(h, { command: command('funding-route', '4200') });
+    await h.persistence.fundingIntentStore.create(createFundingIntent({
+      intentId: 'transport-intent', provider: 'test-provider', cellId: makeCellId('cell-funding-route'),
+      payer: PAYER, payee: PAYEE, amount: makeAmount(4200n), currency: 'TRY',
+      destinationId: 'transport-custody',
+      createdAt: makeTimestamp(800_000), expiresAt: makeTimestamp(2_000_000),
+    }));
     const gatewayToken = jwt(h.key.privateKey, { sub: 'gateway-subject' });
     const generic = await post(h, { command: { commandId: 'generic-fund', cellId: 'cell-funding-route',
       type: 'FundCell', payload: { funderId: PAYER, amount: '4200' } } }, gatewayToken);
     expect(generic.response.status).toBe(403);
     const dedicated = await postUrl(h, h.url.replace('/commands', '/funding-confirmations'), {
       commandId: 'dedicated-fund', cellId: 'cell-funding-route',
-      evidence: { provider: 'test-provider', providerTransactionId: 'transport-provider-tx' },
+      evidence: { intentId: 'transport-intent', provider: 'test-provider', providerTransactionId: 'transport-provider-tx' },
     }, gatewayToken);
     expect(dedicated.response.status).toBe(200);
     expect(dedicated.json.outcome).toBe('SUCCESS');
     expect((await h.persistence.eventStore.getEvents('cell-funding-route' as never)).map((event) => event.type))
       .toEqual(['CellCreated', 'CellFunded']);
+  });
+
+  test('a provider dispute returns financial conflict and does not append settlement', async () => {
+    const h = await setup();
+    await post(h, { command: command('dispute-route', '4200') });
+    const cellId = makeCellId('cell-dispute-route');
+    await h.persistence.fundingIntentStore.create(createFundingIntent({
+      intentId: 'transport-dispute-intent', provider: 'test-provider', cellId, payer: PAYER, payee: PAYEE,
+      amount: makeAmount(4200n), currency: 'TRY', destinationId: 'transport-custody',
+      createdAt: makeTimestamp(800_000), expiresAt: makeTimestamp(2_000_000),
+    }));
+    const gatewayToken = jwt(h.key.privateKey, { sub: 'gateway-subject' });
+    const funded = await postUrl(h, h.url.replace('/commands', '/funding-confirmations'), {
+      commandId: 'dispute-fund', cellId,
+      evidence: { intentId: 'transport-dispute-intent', provider: 'test-provider',
+        providerTransactionId: 'transport-dispute-transaction' },
+    }, gatewayToken);
+    expect(funded.response.status).toBe(200);
+    expect((await post(h, { command: { commandId: 'request-dispute-release', cellId,
+      type: 'RequestRelease', payload: { requestedBy: PAYER } } })).response.status).toBe(200);
+    await h.persistence.fundingDisputeStore.record({
+      observationId: 'transport-dispute-open', provider: 'test-provider',
+      providerDisputeId: 'transport-dispute-id', providerTransactionId: 'transport-dispute-transaction',
+      observationVersion: 1n, receiptId: 'transport-receipt', cellId, kind: 'CHARGEBACK',
+      status: 'OPEN', outcome: 'PENDING', amount: makeAmount(4200n), currency: 'TRY',
+      evidenceDigest: 'e'.repeat(64), observedAt: makeTimestamp(1_000_000),
+      recordedAt: makeTimestamp(1_000_000),
+    });
+    const payeeToken = jwt(h.key.privateKey, { sub: 'payee-subject' });
+    const blocked = await post(h, { command: { commandId: 'approve-dispute-release', cellId,
+      type: 'ApproveRelease', payload: { approvedBy: PAYEE } } }, payeeToken);
+    expect(blocked.response.status).toBe(409);
+    expect(blocked.json).toMatchObject({ outcome: 'APPLICATION_REJECTION',
+      error: { code: 'FUNDING_DISPUTE_BLOCKED' } });
+    expect((await h.persistence.eventStore.getEvents(cellId)).map((event) => event.type))
+      .toEqual(['CellCreated', 'CellFunded', 'ReleaseRequested']);
   });
 
   test('invalid credential, issuer, audience, unmapped and disabled principal fail closed', async () => {
