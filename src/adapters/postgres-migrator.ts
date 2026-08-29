@@ -1,6 +1,6 @@
 import type { Pool, PoolClient } from 'pg';
 
-export const EXPECTED_SCHEMA_VERSION = 6;
+export const EXPECTED_SCHEMA_VERSION = 7;
 
 const CORE_SCHEMA = `
 CREATE TABLE IF NOT EXISTS events (
@@ -272,6 +272,114 @@ CREATE CONSTRAINT TRIGGER funding_disputes_receipt_link
 AFTER INSERT ON funding_dispute_observations DEFERRABLE INITIALLY DEFERRED
 FOR EACH ROW EXECUTE FUNCTION verify_funding_dispute_receipt_link();`;
 
+const PROVIDER_FOUNDATION_SCHEMA = `
+CREATE TABLE provider_event_inbox (
+  event_identity CHAR(64) PRIMARY KEY CHECK (event_identity ~ '^[0-9a-f]{64}$'),
+  replay_identity CHAR(64) NOT NULL CHECK (replay_identity ~ '^[0-9a-f]{64}$'),
+  provider TEXT NOT NULL CHECK (length(provider)>0),
+  environment TEXT NOT NULL CHECK (environment IN ('SANDBOX','LIVE')),
+  provider_event_id TEXT,
+  provider_payment_id TEXT NOT NULL CHECK (length(provider_payment_id)>0),
+  provider_transaction_id TEXT NOT NULL CHECK (length(provider_transaction_id)>0),
+  intent_id TEXT NOT NULL REFERENCES funding_intents(intent_id) ON DELETE RESTRICT,
+  receipt_id TEXT REFERENCES funding_receipts(receipt_id) ON DELETE RESTRICT,
+  cell_id TEXT,
+  event_type TEXT NOT NULL CHECK (length(event_type)>0),
+  payload_digest CHAR(64) NOT NULL CHECK (payload_digest ~ '^[0-9a-f]{64}$'),
+  normalized_evidence_digest CHAR(64) CHECK (normalized_evidence_digest ~ '^[0-9a-f]{64}$'),
+  received_at BIGINT NOT NULL CHECK (received_at>=0),
+  CONSTRAINT provider_event_replay_unique UNIQUE(provider,environment,replay_identity)
+);
+CREATE OR REPLACE FUNCTION prevent_provider_event_mutation() RETURNS trigger AS $$
+BEGIN RAISE EXCEPTION 'provider events are append-only' USING ERRCODE='23514'; END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER provider_events_immutable BEFORE UPDATE OR DELETE ON provider_event_inbox
+FOR EACH ROW EXECUTE FUNCTION prevent_provider_event_mutation();
+
+CREATE TABLE provider_transaction_correlations (
+  provider TEXT NOT NULL CHECK (length(provider)>0),
+  environment TEXT NOT NULL CHECK (environment IN ('SANDBOX','LIVE')),
+  provider_transaction_id TEXT NOT NULL CHECK (length(provider_transaction_id)>0),
+  provider_payment_id TEXT NOT NULL CHECK (length(provider_payment_id)>0),
+  intent_id TEXT NOT NULL REFERENCES funding_intents(intent_id) ON DELETE RESTRICT,
+  receipt_id TEXT REFERENCES funding_receipts(receipt_id) ON DELETE RESTRICT,
+  cell_id TEXT NOT NULL CHECK (length(cell_id)>0),
+  created_at BIGINT NOT NULL CHECK (created_at>=0),
+  PRIMARY KEY(provider,environment,provider_transaction_id),
+  CONSTRAINT provider_correlation_intent_unique UNIQUE(provider,environment,intent_id),
+  CONSTRAINT provider_correlation_full_unique
+    UNIQUE(provider,environment,provider_transaction_id,intent_id)
+);
+CREATE OR REPLACE FUNCTION prevent_provider_correlation_mutation() RETURNS trigger AS $$
+BEGIN RAISE EXCEPTION 'provider transaction correlations are immutable' USING ERRCODE='23514'; END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER provider_correlations_immutable BEFORE UPDATE OR DELETE ON provider_transaction_correlations
+FOR EACH ROW EXECUTE FUNCTION prevent_provider_correlation_mutation();
+CREATE OR REPLACE FUNCTION verify_provider_correlation_binding() RETURNS trigger AS $$
+DECLARE linked_intent funding_intents%ROWTYPE; linked_receipt funding_receipts%ROWTYPE;
+BEGIN
+  SELECT * INTO linked_intent FROM funding_intents WHERE intent_id=NEW.intent_id;
+  IF linked_intent.intent_id IS NULL OR linked_intent.provider<>NEW.provider OR
+     linked_intent.cell_id<>NEW.cell_id THEN
+    RAISE EXCEPTION 'provider correlation must match immutable funding intent' USING ERRCODE='23514';
+  END IF;
+  IF NEW.receipt_id IS NOT NULL THEN
+    SELECT * INTO linked_receipt FROM funding_receipts WHERE receipt_id=NEW.receipt_id;
+    IF linked_receipt.receipt_id IS NULL OR linked_receipt.intent_id<>NEW.intent_id OR
+       linked_receipt.provider<>NEW.provider OR linked_receipt.cell_id<>NEW.cell_id OR
+       linked_receipt.provider_transaction_id<>NEW.provider_transaction_id THEN
+      RAISE EXCEPTION 'provider correlation must match immutable funding receipt' USING ERRCODE='23514';
+    END IF;
+  END IF;
+  RETURN NEW;
+END; $$ LANGUAGE plpgsql;
+CREATE CONSTRAINT TRIGGER provider_correlation_binding
+AFTER INSERT ON provider_transaction_correlations DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION verify_provider_correlation_binding();
+
+CREATE TABLE provider_reconciliation_checkpoints (
+  provider TEXT NOT NULL, environment TEXT NOT NULL CHECK (environment IN ('SANDBOX','LIVE')),
+  provider_transaction_id TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('PENDING','FUNDS_HELD','FAILED','CANCELLED','REFUNDED',
+    'REVERSED','DISPUTED','UNKNOWN')),
+  normalized_evidence_digest CHAR(64) CHECK (normalized_evidence_digest ~ '^[0-9a-f]{64}$'),
+  last_event_identity CHAR(64) REFERENCES provider_event_inbox(event_identity) ON DELETE RESTRICT,
+  attempt_count INTEGER NOT NULL CHECK (attempt_count>=0),
+  checked_at BIGINT NOT NULL CHECK (checked_at>=0),
+  next_attempt_at BIGINT CHECK (next_attempt_at>=checked_at),
+  last_error_category TEXT,
+  PRIMARY KEY(provider,environment,provider_transaction_id),
+  FOREIGN KEY(provider,environment,provider_transaction_id)
+    REFERENCES provider_transaction_correlations(provider,environment,provider_transaction_id)
+    ON DELETE RESTRICT
+);
+
+CREATE TABLE provider_negative_observations (
+  observation_id CHAR(64) PRIMARY KEY CHECK (observation_id ~ '^[0-9a-f]{64}$'),
+  provider TEXT NOT NULL, environment TEXT NOT NULL CHECK (environment IN ('SANDBOX','LIVE')),
+  provider_observation_id TEXT NOT NULL CHECK (length(provider_observation_id)>0),
+  provider_transaction_id TEXT NOT NULL, intent_id TEXT NOT NULL,
+  receipt_id TEXT REFERENCES funding_receipts(receipt_id) ON DELETE RESTRICT,
+  cell_id TEXT, kind TEXT NOT NULL CHECK (kind IN ('REFUND','REVERSAL','DISPUTE')),
+  amount_minor NUMERIC(31,0) CHECK (amount_minor>0), currency TEXT,
+  payload_digest CHAR(64) NOT NULL CHECK (payload_digest ~ '^[0-9a-f]{64}$'),
+  observed_at BIGINT NOT NULL CHECK (observed_at>=0), recorded_at BIGINT NOT NULL CHECK (recorded_at>=0),
+  UNIQUE(provider,environment,provider_observation_id),
+  FOREIGN KEY(provider,environment,provider_transaction_id)
+    REFERENCES provider_transaction_correlations(provider,environment,provider_transaction_id)
+    ON DELETE RESTRICT,
+  FOREIGN KEY(provider,environment,provider_transaction_id,intent_id)
+    REFERENCES provider_transaction_correlations(provider,environment,provider_transaction_id,intent_id)
+    ON DELETE RESTRICT,
+  CONSTRAINT provider_negative_amount_currency CHECK
+    ((amount_minor IS NULL AND currency IS NULL) OR (amount_minor IS NOT NULL AND currency IS NOT NULL))
+);
+CREATE OR REPLACE FUNCTION prevent_provider_negative_mutation() RETURNS trigger AS $$
+BEGIN RAISE EXCEPTION 'provider negative observations are append-only' USING ERRCODE='23514'; END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER provider_negative_immutable BEFORE UPDATE OR DELETE ON provider_negative_observations
+FOR EACH ROW EXECUTE FUNCTION prevent_provider_negative_mutation();`;
+
 export class SchemaVersionError extends Error {
   constructor(message: string) { super(message); this.name = 'SchemaVersionError'; }
 }
@@ -314,6 +422,11 @@ export class PostgresMigrator {
         await client.query(FUNDING_SEMANTICS_SCHEMA);
         await client.query('INSERT INTO schema_migrations(version,name) VALUES (6,$1)',
           ['funding-intents-held-semantics-disputes']);
+      }
+      if (!applied.has(7)) {
+        await client.query(PROVIDER_FOUNDATION_SCHEMA);
+        await client.query('INSERT INTO schema_migrations(version,name) VALUES (7,$1)',
+          ['provider-neutral-evidence-reconciliation']);
       }
       await client.query('COMMIT');
     } catch (error) {

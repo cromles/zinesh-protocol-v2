@@ -28,6 +28,7 @@ import { noOpSecurityTelemetry } from '../security/security-observability';
 import type { SecurityTelemetry } from '../security/security-observability';
 import { PostgresFundingIntentStore } from './postgres-funding-intent-store';
 import { PostgresFundingDisputeStore } from './postgres-funding-dispute-store';
+import { PostgresProviderFoundationStore } from './postgres-provider-foundation-store';
 
 export interface PostgresConfig {
   readonly host: string;
@@ -58,6 +59,7 @@ export class PostgresPersistenceAdapter implements PersistenceAdapter {
   readonly rateLimitStore: PostgresRateLimitStore;
   readonly fundingIntentStore: PostgresFundingIntentStore;
   readonly fundingDisputeStore: PostgresFundingDisputeStore;
+  readonly providerFoundationStore: PostgresProviderFoundationStore;
 
   constructor(config: PostgresConfig, telemetry: SecurityTelemetry = noOpSecurityTelemetry) {
     this.pool = new Pool({
@@ -79,6 +81,7 @@ export class PostgresPersistenceAdapter implements PersistenceAdapter {
     this.rateLimitStore = new PostgresRateLimitStore(this.pool);
     this.fundingIntentStore = new PostgresFundingIntentStore(this.pool);
     this.fundingDisputeStore = new PostgresFundingDisputeStore(this.pool);
+    this.providerFoundationStore = new PostgresProviderFoundationStore(this.pool);
   }
 
   async connect(): Promise<void> {

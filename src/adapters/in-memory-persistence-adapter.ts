@@ -13,6 +13,7 @@ import { InMemoryEventStore } from './in-memory-event-store';
 import { InMemorySnapshotStore } from './in-memory-snapshot-store';
 import { InMemoryCommandExecutionStore } from './in-memory-command-execution-store';
 import { InMemoryFundingIntentStore } from './in-memory-funding-intent-store';
+import { InMemoryProviderFoundationStore } from './in-memory-provider-foundation-store';
 import { InMemoryFundingDisputeStore } from './in-memory-funding-dispute-store';
 
 export class InMemoryPersistenceAdapter implements PersistenceAdapter {
@@ -20,6 +21,7 @@ export class InMemoryPersistenceAdapter implements PersistenceAdapter {
   readonly snapshotStore: InMemorySnapshotStore;
   readonly commandExecutionStore: InMemoryCommandExecutionStore;
   readonly fundingIntentStore: InMemoryFundingIntentStore;
+  readonly providerFoundationStore = new InMemoryProviderFoundationStore();
   readonly fundingDisputeStore: InMemoryFundingDisputeStore;
 
   constructor() {
