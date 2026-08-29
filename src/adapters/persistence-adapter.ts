@@ -17,11 +17,15 @@
 import type { EventStore } from './event-store';
 import type { SnapshotStore } from './snapshot-store';
 import type { CommandExecutionStore } from './command-execution-store';
+import type { FundingIntentStore } from './funding-intent-store';
+import type { FundingDisputeStore } from './funding-dispute-store';
 
 export interface PersistenceAdapter {
   readonly eventStore: EventStore;
   readonly snapshotStore: SnapshotStore;
   readonly commandExecutionStore: CommandExecutionStore;
+  readonly fundingIntentStore: FundingIntentStore;
+  readonly fundingDisputeStore: FundingDisputeStore;
 
   /**
    * Open / initialise the underlying storage.

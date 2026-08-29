@@ -35,6 +35,7 @@ import type { HandleCommandResult } from './types';
 import { actorIdentity, createTestIngress } from '../security/testing';
 import type { TestIdentity } from '../security/testing';
 import type { ExternalCommandRequest } from '../security/trusted-ingress';
+import { createFundingIntent } from '../funding/funding-intent';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -170,20 +171,37 @@ function makeApp(now: Timestamp = T0): AppHarness {
     },
   });
   const app = {
-    handleCommand(input: LegacyTestRequest): Promise<HandleCommandResult> {
+    async handleCommand(input: LegacyTestRequest): Promise<HandleCommandResult> {
+      const intentId = `intent-${input.command.commandId}`;
+      if (input.command.type === 'FundCell') {
+        await persistence.fundingIntentStore.create(createFundingIntent({
+          intentId,
+          provider: 'test-provider',
+          cellId: input.command.cellId,
+          payer: (input.command.payload as { funderId: ActorId }).funderId,
+          payee: PAYEE,
+          amount: (input.command.payload as { amount: Amount }).amount,
+          currency: 'TRY',
+          destinationId: 'test-custody',
+          createdAt: makeTimestamp(800_000),
+          expiresAt: makeTimestamp(2_000_000),
+        }));
+      }
       const external: ExternalCommandRequest = input.command.type === 'FundCell'
         ? {
             credential: input.gateway?.authorizedGateway === true ? 'test-gateway-credential' : 'invalid',
             command: input.command,
             fundingEvidence: {
+              intentId,
               provider: 'test-provider',
               providerTransactionId: `provider-${input.command.commandId}`,
               gatewayPrincipalId: 'gateway-1', cellId: input.command.cellId,
               payer: (input.command.payload as { funderId: ActorId }).funderId,
+              payee: PAYEE,
               amount: (input.command.payload as { amount: Amount }).amount,
               currency: 'TRY',
               destinationId: 'test-custody', confirmedAt: makeTimestamp(900_000),
-              finality: 'SETTLED', evidenceDigest: 'a'.repeat(64),
+              finality: 'FUNDS_HELD', evidenceDigest: 'a'.repeat(64),
               verifiedAt: makeTimestamp(950_000),
             },
           }
@@ -440,6 +458,44 @@ describe('5. Application does not bypass Kernel authorization', () => {
 
     const stored = await harness.persistence.eventStore.getEvents(cellId);
     expect(stored).toHaveLength(2);
+  });
+});
+
+describe('5A. Provider funding disputes gate financial settlement outside the Kernel', () => {
+  test('an open chargeback blocks release atomically and a later won observation permits a new command', async () => {
+    const harness = makeApp();
+    const cellId = nextCellId();
+    await createCell(harness, cellId);
+    await fundCell(harness, cellId);
+    await expectSuccess(await harness.app.handleCommand(
+      request(cmd('RequestRelease', { requestedBy: PAYER }, cellId)),
+    ));
+
+    await harness.persistence.fundingDisputeStore.record({
+      observationId: 'chargeback-open', provider: 'test-provider', providerDisputeId: 'chargeback-1',
+      providerTransactionId: 'provider-transaction', observationVersion: 1n,
+      receiptId: 'funding-receipt', cellId, kind: 'CHARGEBACK', status: 'OPEN', outcome: 'PENDING', amount: AMOUNT,
+      currency: 'TRY', evidenceDigest: 'd'.repeat(64), observedAt: T0, recordedAt: T0,
+    });
+    const blocked = await harness.app.handleCommand(
+      request(cmd('ApproveRelease', { approvedBy: PAYEE }, cellId), { actor: PAYEE }),
+    );
+    expect(blocked).toMatchObject({ outcome: 'APPLICATION_REJECTION',
+      error: { code: 'FUNDING_DISPUTE_BLOCKED' } });
+    expect((await harness.persistence.eventStore.getEvents(cellId)).map((event) => event.type))
+      .toEqual(['CellCreated', 'CellFunded', 'ReleaseRequested']);
+
+    await harness.persistence.fundingDisputeStore.record({
+      observationId: 'chargeback-won', provider: 'test-provider', providerDisputeId: 'chargeback-1',
+      providerTransactionId: 'provider-transaction', observationVersion: 2n,
+      receiptId: 'funding-receipt', cellId, kind: 'CHARGEBACK', status: 'RESOLVED',
+      outcome: 'FUNDS_RETAINED', amount: AMOUNT,
+      currency: 'TRY', evidenceDigest: 'e'.repeat(64), observedAt: T0, recordedAt: T0,
+    });
+    const released = await harness.app.handleCommand(
+      request(cmd('ApproveRelease', { approvedBy: PAYEE }, cellId), { actor: PAYEE }),
+    );
+    expect(released).toMatchObject({ outcome: 'SUCCESS', nextState: { status: 'RELEASED' } });
   });
 });
 

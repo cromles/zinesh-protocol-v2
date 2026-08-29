@@ -15,12 +15,14 @@ import {
 } from './trusted-ingress';
 import type { PrincipalRecord, VerifiedFundingContext } from './trusted-ingress';
 import { actorIdentity, createTestIngress } from './testing';
+import { createFundingIntent } from '../funding/funding-intent';
 
 const PAYER = makeActorId('payer-security');
 const PAYEE = makeActorId('payee-security');
 const OTHER = makeActorId('other-security');
 const AMOUNT = makeAmount(10000n);
 const CELL = makeCellId('cell-security');
+const INTENT_ID = 'intent-cell-security';
 
 function createCommand(id = 'create-security', payer: ActorId = PAYER): Command {
   return {
@@ -50,11 +52,20 @@ const gateway: PrincipalRecord = {
 
 function funding(overrides: Partial<VerifiedFundingContext> = {}): VerifiedFundingContext {
   return {
-    provider: 'test-provider', providerTransactionId: 'provider-tx-1', gatewayPrincipalId: gateway.principalId,
-    cellId: CELL, payer: PAYER, amount: AMOUNT, currency: 'TRY',
-    destinationId: 'test-custody', confirmedAt: makeTimestamp(900_000), finality: 'SETTLED',
+    intentId: INTENT_ID, provider: 'test-provider', providerTransactionId: 'provider-tx-1',
+    gatewayPrincipalId: gateway.principalId, cellId: CELL, payer: PAYER, payee: PAYEE,
+    amount: AMOUNT, currency: 'TRY', destinationId: 'test-custody',
+    confirmedAt: makeTimestamp(900_000), finality: 'FUNDS_HELD',
     evidenceDigest: 'a'.repeat(64), verifiedAt: makeTimestamp(950_000), ...overrides,
   };
+}
+
+async function seedIntent(persistence: InMemoryPersistenceAdapter): Promise<void> {
+  await persistence.fundingIntentStore.create(createFundingIntent({
+    intentId: INTENT_ID, provider: 'test-provider', cellId: CELL, payer: PAYER, payee: PAYEE,
+    amount: AMOUNT, currency: 'TRY', destinationId: 'test-custody',
+    createdAt: makeTimestamp(800_000), expiresAt: makeTimestamp(2_000_000),
+  }));
 }
 
 describe('Phase 7B trusted principal boundary', () => {
@@ -115,16 +126,19 @@ describe('Phase 7B trusted principal boundary', () => {
     const app = application(persistence);
     const actor = actorIdentity(PAYER);
     await createTestIngress(app, [actor]).handle({ credential: actor.credential, command: createCommand() });
+    await seedIntent(persistence);
     const gatewayIdentity = { credential: 'gateway-credential', subject: 'gateway-subject', principal: gateway };
     let current: VerifiedFundingContext | null = null;
     const ingress = createTestIngress(app, [gatewayIdentity], { async verify() {
       return current === null ? { outcome: 'INVALID', reason: 'AUTHENTICITY_FAILED' } : { outcome: 'VERIFIED', context: current };
     } });
-    const base = { credential: gatewayIdentity.credential, command: fundCommand(), fundingEvidence: { provider: 'test-provider', providerTransactionId: 'provider-tx-1' } };
+    const base = { credential: gatewayIdentity.credential, command: fundCommand(),
+      fundingEvidence: { intentId: INTENT_ID, provider: 'test-provider', providerTransactionId: 'provider-tx-1' } };
     expect((await ingress.handle(base)).outcome).toBe('APPLICATION_REJECTION');
     for (const invalid of [
       funding({ gatewayPrincipalId: 'other-gateway' }), funding({ cellId: makeCellId('other-cell') }),
-      funding({ payer: OTHER }), funding({ amount: makeAmount(9999n) }), funding({ currency: 'EUR' as never }),
+      funding({ payer: OTHER }), funding({ payee: OTHER }), funding({ amount: makeAmount(9999n) }),
+      funding({ currency: 'EUR' as never }),
     ]) {
       current = invalid;
       const result = await ingress.handle(base);
@@ -139,13 +153,14 @@ describe('Phase 7B trusted principal boundary', () => {
     const app = application(persistence);
     const actor = actorIdentity(PAYER);
     await createTestIngress(app, [actor]).handle({ credential: actor.credential, command: createCommand('fingerprint-create') });
+    await seedIntent(persistence);
     const gatewayIdentity = { credential: 'fingerprint-gateway', subject: 'fingerprint-subject', principal: gateway };
     let current = funding();
     const ingress = createTestIngress(app, [gatewayIdentity], { async verify() { return { outcome: 'VERIFIED', context: current }; } });
     const request = {
       credential: gatewayIdentity.credential,
       command: fundCommand('fingerprint-fund'),
-      fundingEvidence: { provider: 'test-provider', providerTransactionId: 'provider-tx-1' },
+      fundingEvidence: { intentId: INTENT_ID, provider: 'test-provider', providerTransactionId: 'provider-tx-1' },
     };
     expect((await ingress.handle(request)).outcome).toBe('SUCCESS');
 

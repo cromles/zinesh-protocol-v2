@@ -1,6 +1,7 @@
 import type { CommandId } from '../core/types';
 import type { EventStore } from './event-store';
 import type { FundingReceiptStore } from './funding-receipt-store';
+import type { FundingDisputeStore } from './funding-dispute-store';
 
 export interface CommandWorkResult {
   readonly encodedResult: string;
@@ -20,6 +21,7 @@ export interface CommandExecutionStore {
   execute(
     commandId: CommandId,
     fingerprint: string,
-    work: (eventStore: EventStore, fundingReceiptStore: FundingReceiptStore) => Promise<CommandWorkResult>,
+    work: (eventStore: EventStore, fundingReceiptStore: FundingReceiptStore,
+      fundingDisputeStore: FundingDisputeStore) => Promise<CommandWorkResult>,
   ): Promise<CommandExecutionResult>;
 }

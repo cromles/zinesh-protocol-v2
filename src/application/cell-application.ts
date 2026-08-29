@@ -19,6 +19,7 @@ import type { PersistenceAdapter } from '../adapters/persistence-adapter';
 import type { EventStore } from '../adapters/event-store';
 import type { EventStoreError } from '../adapters/event-store';
 import type { FundingReceiptStore } from '../adapters/funding-receipt-store';
+import type { FundingDisputeStore } from '../adapters/funding-dispute-store';
 import { createHash } from 'crypto';
 import type {
   ActorId,
@@ -77,6 +78,10 @@ const CLOCK_ALIGNED_COMMANDS: ReadonlySet<DomainCommandType> = new Set([
   'OpenDispute',
 ]);
 
+const FINANCIAL_SETTLEMENT_COMMANDS: ReadonlySet<DomainCommandType> = new Set([
+  'ApproveRelease', 'ApproveRefund', 'ForceRefund', 'ResolveDispute',
+]);
+
 export interface CellApplicationDeps {
   readonly persistence: PersistenceAdapter;
   readonly kernel: Kernel;
@@ -133,9 +138,9 @@ export class CellApplication {
       execution = await this.persistence.commandExecutionStore.execute(
         command.commandId,
         fingerprint,
-        async (eventStore, fundingReceiptStore) => ({
+        async (eventStore, fundingReceiptStore, fundingDisputeStore) => ({
           encodedResult: canonicalEncode(await this.executeOnce(
-            command, now, eventStore, fundingReceiptStore, request.fundingContext,
+            command, now, eventStore, fundingReceiptStore, fundingDisputeStore, request.fundingContext,
           )),
         }),
       );
@@ -167,6 +172,7 @@ export class CellApplication {
     now: Timestamp,
     eventStore: EventStore,
     fundingReceiptStore: FundingReceiptStore,
+    fundingDisputeStore: FundingDisputeStore,
     fundingContext?: VerifiedFundingContext,
   ): Promise<HandleCommandResult> {
 
@@ -185,6 +191,12 @@ export class CellApplication {
     }
 
     const expectedNextVersion = expectedVersionFromStream(loaded);
+
+    if (FINANCIAL_SETTLEMENT_COMMANDS.has(command.type)
+      && await fundingDisputeStore.hasBlockingDispute(cellId)) {
+      return applicationRejection({ type: 'ApplicationError', code: 'FUNDING_DISPUTE_BLOCKED',
+        message: 'Financial settlement is blocked by a provider funding dispute' });
+    }
 
     const context: DeterministicContext = {
       now,
@@ -248,6 +260,10 @@ export class CellApplication {
     if (isKernelError(evolved)) throw new Error('Invalid authoritative cell stream');
     return evolved;
   }
+
+  getFundingIntent(intentId: string) {
+    return this.persistence.fundingIntentStore.get(intentId);
+  }
 }
 
 function createFundingReceipt(
@@ -256,9 +272,11 @@ function createFundingReceipt(
   const receiptId = `funding-${createHash('sha256')
     .update(`${context.provider}\u0000${context.providerTransactionId}`).digest('hex')}`;
   return {
-    receiptId, provider: context.provider, providerTransactionId: context.providerTransactionId,
+    receiptId, intentId: context.intentId, provider: context.provider,
+    providerTransactionId: context.providerTransactionId,
     cellId: command.cellId, commandId: command.commandId, fundingEventId: event.eventId,
-    gatewayPrincipalId: context.gatewayPrincipalId, payer: context.payer, amount: context.amount,
+    gatewayPrincipalId: context.gatewayPrincipalId, payer: context.payer, payee: context.payee,
+    amount: context.amount,
     currency: context.currency, destinationId: context.destinationId, confirmedAt: context.confirmedAt,
     finality: context.finality, evidenceDigest: context.evidenceDigest, verifiedAt: context.verifiedAt,
     createdAt: now,

@@ -1,6 +1,7 @@
 import type { ActorId, CellId, Command, CommandId } from '../core/types';
 import { makeActorId, makeAmount } from '../core/types';
-import type { ExpectedFundingBinding, FundingEvidence, FundingVerificationResult, VerifiedFundingContext } from '../funding/types';
+import type { ExpectedFundingBinding, FundingDestinationBinding, FundingEvidence, FundingIntent, FundingVerificationResult, VerifiedFundingContext } from '../funding/types';
+import { hasValidFundingIntentBinding } from '../funding/funding-intent';
 export type { VerifiedFundingContext } from '../funding/types';
 import type { CellApplication } from '../application/cell-application';
 import type { HandleCommandResult, TrustedHandleCommandRequest } from '../application/types';
@@ -56,7 +57,7 @@ export interface FundingEvidencePort {
 }
 
 export interface FundingDestinationResolver {
-  resolve(provider: string): Promise<string | null>;
+  resolve(binding: FundingDestinationBinding): Promise<string | null>;
 }
 
 export interface ExternalCommandRequest {
@@ -233,17 +234,29 @@ export class TrustedCommandIngress {
         catch { return fundingIngressRejection('FUNDING_DEPENDENCY_UNAVAILABLE'); }
         if (state === null) return fundingIngressRejection('CELL_NOT_FOUND');
         let destinationId: string | null;
-        try { destinationId = await this.fundingDestinations.resolve(request.fundingEvidence.provider); }
+        const destinationBinding: FundingDestinationBinding = {
+          provider: request.fundingEvidence.provider, cellId: command.cellId,
+          payer: state.payer, payee: state.payee, amount: state.amount, currency: state.currency,
+        };
+        try { destinationId = await this.fundingDestinations.resolve(destinationBinding); }
         catch { return fundingIngressRejection('FUNDING_DEPENDENCY_UNAVAILABLE'); }
         if (destinationId === null) return securityRejection('FUNDING_EVIDENCE_INVALID');
         fundingBoundary = { state, destinationId };
       }
       command = { commandId: command.commandId, cellId: command.cellId, type: 'FundCell',
         payload: { funderId: fundingBoundary.state.payer, amount: fundingBoundary.state.amount } };
+      let intent: FundingIntent | null;
+      try { intent = await this.application.getFundingIntent(request.fundingEvidence.intentId); }
+      catch { return fundingIngressRejection('FUNDING_DEPENDENCY_UNAVAILABLE'); }
+      if (intent === null || !matchesIntent(intent, request.fundingEvidence.provider, fundingBoundary)) {
+        return securityRejection('FUNDING_EVIDENCE_INVALID');
+      }
       const expected: ExpectedFundingBinding = {
+        intentId: intent.intentId,
         gatewayPrincipalId: principal.principalId, cellId: command.cellId,
         payer: fundingBoundary.state.payer, amount: fundingBoundary.state.amount,
-        currency: fundingBoundary.state.currency, destinationId: fundingBoundary.destinationId,
+        payee: fundingBoundary.state.payee, currency: fundingBoundary.state.currency,
+        destinationId: fundingBoundary.destinationId,
       };
       let verification: FundingVerificationResult;
       try { verification = await this.fundingEvidence.verify(request.fundingEvidence, expected); }
@@ -257,7 +270,11 @@ export class TrustedCommandIngress {
         if (verification.outcome === 'DEPENDENCY_UNAVAILABLE') return fundingIngressRejection('FUNDING_DEPENDENCY_UNAVAILABLE');
         return securityRejection('FUNDING_EVIDENCE_INVALID');
       }
-      if (!matchesExpectedBinding(verification.context, expected)) {
+      if (!matchesExpectedBinding(verification.context, expected, request.fundingEvidence)) {
+        return securityRejection('FUNDING_EVIDENCE_INVALID');
+      }
+      if (verification.context.confirmedAt < intent.createdAt
+        || verification.context.confirmedAt > intent.expiresAt) {
         return securityRejection('FUNDING_EVIDENCE_INVALID');
       }
       fundingContext = verifyFundingContext(verification.context);
@@ -330,14 +347,31 @@ export const rejectAllFundingDestinations: FundingDestinationResolver = {
 function isFundingEvidence(value: unknown): value is FundingEvidence {
   return typeof value === 'object' && value !== null
     && typeof (value as FundingEvidence).provider === 'string'
-    && typeof (value as FundingEvidence).providerTransactionId === 'string';
+    && typeof (value as FundingEvidence).providerTransactionId === 'string'
+    && typeof (value as FundingEvidence).intentId === 'string';
 }
 
-function matchesExpectedBinding(context: VerifiedFundingContext, expected: ExpectedFundingBinding): boolean {
-  return context.gatewayPrincipalId === expected.gatewayPrincipalId && context.cellId === expected.cellId
-    && context.payer === expected.payer && context.amount === expected.amount
+function matchesExpectedBinding(
+  context: VerifiedFundingContext, expected: ExpectedFundingBinding, evidence: FundingEvidence,
+): boolean {
+  return context.intentId === expected.intentId && context.provider === evidence.provider
+    && context.providerTransactionId === evidence.providerTransactionId
+    && context.gatewayPrincipalId === expected.gatewayPrincipalId
+    && context.cellId === expected.cellId && context.payer === expected.payer && context.payee === expected.payee
+    && context.amount === expected.amount
     && context.currency === expected.currency && context.destinationId === expected.destinationId
-    && context.finality === 'SETTLED';
+    && context.finality === 'FUNDS_HELD';
+}
+
+function matchesIntent(
+  intent: FundingIntent, provider: string,
+  boundary: { readonly state: Awaited<ReturnType<CellApplication['getCellState']>> & object; readonly destinationId: string },
+): boolean {
+  return hasValidFundingIntentBinding(intent)
+    && intent.provider === provider && intent.cellId === boundary.state.cellId
+    && intent.payer === boundary.state.payer && intent.payee === boundary.state.payee
+    && intent.amount === boundary.state.amount && intent.currency === boundary.state.currency
+    && intent.destinationId === boundary.destinationId;
 }
 
 function fundingIngressRejection(code: 'FUNDING_NOT_FINAL' | 'FUNDING_DEPENDENCY_UNAVAILABLE' | 'CELL_NOT_FOUND' | 'FUNDING_EVIDENCE_INVALID'): HandleCommandResult {
