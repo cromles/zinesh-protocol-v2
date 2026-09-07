@@ -79,6 +79,9 @@ import { PostgresMigrator } from './postgres-migrator';
 import type { FundingDisputeObservation, FundingIntent, FundingReceipt } from '../funding/types';
 import { PostgresFundingReceiptStore } from './postgres-funding-receipt-store';
 import { createFundingIntent } from '../funding/funding-intent';
+import type { ProviderEvent, ProviderNegativeObservation,
+  ProviderTransactionCorrelation } from '../funding/provider-evidence';
+import { providerIdentityHash } from '../funding/provider-identity';
 
 // ---------------------------------------------------------------------------
 // Skip guard — tests require a real PostgreSQL instance
@@ -1154,6 +1157,96 @@ maybeDescribe('PostgreSQL Persistence', () => {
     await expect(adapter.fundingDisputeStore.record({ ...opened, observationId: 'pg-dispute-invalid-link',
       providerDisputeId: 'pg-dispute-invalid', provider: 'wrong-provider', evidenceDigest: 'e'.repeat(64) }))
       .rejects.toThrow(/match.*receipt/i);
+  });
+
+  test('48. V7 provider event inbox distinguishes duplicate and conflicting replay', async () => {
+    const cellId=freshCellId();
+    const receipt=makeFundingReceipt(cellId,makeCommandId(`provider-event-${cellCounter}`),
+      makeFundedEvent(cellId,V2));
+    await createIntent(adapter,receipt);
+    const event:ProviderEvent={eventIdentity:providerIdentityHash('event','1'),
+      replayIdentity:providerIdentityHash('replay','1'),provider:receipt.provider,environment:'SANDBOX',
+      providerPaymentId:'provider-payment-1',providerTransactionId:receipt.providerTransactionId,
+      intentId:receipt.intentId,eventType:'PAYMENT',payloadDigest:'a'.repeat(64),receivedAt:T2};
+    await expect(adapter.providerFoundationStore.recordEvent(event)).resolves.toEqual({kind:'FIRST_SEEN'});
+    await expect(adapter.providerFoundationStore.recordEvent(event)).resolves.toMatchObject({kind:'DUPLICATE'});
+    await expect(adapter.providerFoundationStore.recordEvent({...event,eventIdentity:providerIdentityHash('event','2'),
+      payloadDigest:'b'.repeat(64)})).resolves.toEqual({kind:'REPLAY_PAYLOAD_CONFLICT'});
+    const pool=(adapter as unknown as {pool:Pool}).pool;
+    expect((await pool.query('SELECT count(*)::int AS count FROM funding_receipts WHERE intent_id=$1',
+      [event.intentId])).rows[0]).toEqual({count:0});
+    await expect(pool.query('UPDATE provider_event_inbox SET event_type=$2 WHERE event_identity=$1',
+      [event.eventIdentity,'MUTATED'])).rejects.toThrow(/append-only/i);
+  });
+
+  test('49. V7 transaction correlation is immutable and rejects intent or receipt rebinding', async () => {
+    const cellId=freshCellId();
+    await adapter.eventStore.append(cellId,[makeEvent(cellId,V1)]);
+    const commandId=makeCommandId(`provider-correlation-${cellCounter}`);
+    const fundedEvent=makeFundedEvent(cellId,V2);
+    const receipt=makeFundingReceipt(cellId,commandId,fundedEvent);
+    await createIntent(adapter,receipt);
+    await adapter.commandExecutionStore.execute(commandId,'provider-correlation',async(events,receipts)=>{
+      expect((await receipts.claim(receipt)).kind).toBe('CLAIMED');
+      expect((await events.append(cellId,[fundedEvent])).ok).toBe(true);
+      return {encodedResult:'{"outcome":"SUCCESS"}'};
+    });
+    const correlation:ProviderTransactionCorrelation={provider:receipt.provider,environment:'SANDBOX',
+      providerTransactionId:receipt.providerTransactionId,providerPaymentId:'provider-payment-2',
+      intentId:receipt.intentId,receiptId:receipt.receiptId,cellId,createdAt:T3};
+    await expect(adapter.providerFoundationStore.correlateTransaction(correlation))
+      .resolves.toEqual({kind:'RECORDED'});
+    await expect(adapter.providerFoundationStore.correlateTransaction(correlation))
+      .resolves.toMatchObject({kind:'DUPLICATE'});
+    await expect(adapter.providerFoundationStore.correlateTransaction({...correlation,intentId:'other'}))
+      .resolves.toEqual({kind:'CONFLICT'});
+    const pool=(adapter as unknown as {pool:Pool}).pool;
+    await expect(pool.query(`UPDATE provider_transaction_correlations SET cell_id='other'
+      WHERE provider=$1 AND environment=$2 AND provider_transaction_id=$3`,
+    [correlation.provider,correlation.environment,correlation.providerTransactionId]))
+      .rejects.toThrow(/immutable/i);
+  });
+
+  test('50. V7 negative observations append once and never mutate funding history', async () => {
+    const cellId=freshCellId();
+    expect((await adapter.eventStore.append(cellId,[makeEvent(cellId,V1)])).ok).toBe(true);
+    const commandId=makeCommandId(`provider-negative-${cellCounter}`);
+    const fundedEvent=makeFundedEvent(cellId,V2);
+    const receipt=makeFundingReceipt(cellId,commandId,fundedEvent);
+    await createIntent(adapter,receipt);
+    await adapter.commandExecutionStore.execute(commandId,'provider-negative',async(events,receipts)=>{
+      expect((await receipts.claim(receipt)).kind).toBe('CLAIMED');
+      expect((await events.append(cellId,[fundedEvent])).ok).toBe(true);
+      return {encodedResult:'{"outcome":"SUCCESS"}'};
+    });
+    const correlation:ProviderTransactionCorrelation={provider:receipt.provider,environment:'SANDBOX',
+      providerTransactionId:receipt.providerTransactionId,providerPaymentId:'provider-payment-negative',
+      intentId:receipt.intentId,receiptId:receipt.receiptId,cellId,createdAt:T3};
+    await expect(adapter.providerFoundationStore.correlateTransaction(correlation))
+      .resolves.toEqual({kind:'RECORDED'});
+    const pool=(adapter as unknown as {pool:Pool}).pool;
+    const observation:ProviderNegativeObservation={observationId:providerIdentityHash('negative','1'),
+      provider:receipt.provider,environment:'SANDBOX',providerObservationId:'refund-v7-1',
+      providerTransactionId:receipt.providerTransactionId,intentId:receipt.intentId,
+      receiptId:receipt.receiptId,cellId,kind:'REFUND',amountMinor:makeAmount(1n),
+      currency:'TRY',payloadDigest:'c'.repeat(64),observedAt:T2,recordedAt:T3};
+    await expect(adapter.providerFoundationStore.appendNegativeObservation(observation))
+      .resolves.toEqual({kind:'RECORDED'});
+    await expect(adapter.providerFoundationStore.appendNegativeObservation(observation))
+      .resolves.toMatchObject({kind:'DUPLICATE'});
+    const reordered = Object.fromEntries(Object.entries(observation).reverse()) as unknown as ProviderNegativeObservation;
+    await expect(adapter.providerFoundationStore.appendNegativeObservation(reordered))
+      .resolves.toEqual({kind:'DUPLICATE',observation});
+    await expect(adapter.providerFoundationStore.appendNegativeObservation({...reordered,amountMinor:makeAmount(2n)}))
+      .resolves.toEqual({kind:'CONFLICT'});
+    await expect(adapter.providerFoundationStore.appendNegativeObservation({...reordered,payloadDigest:'d'.repeat(64)}))
+      .resolves.toEqual({kind:'CONFLICT'});
+    expect((await pool.query('SELECT count(*)::int AS count FROM provider_negative_observations WHERE observation_id=$1',
+      [observation.observationId])).rows[0]).toEqual({count:1});
+    await expect(pool.query('DELETE FROM provider_negative_observations WHERE observation_id=$1',
+      [observation.observationId])).rejects.toThrow(/append-only/i);
+    expect((await pool.query('SELECT count(*)::int AS count FROM funding_receipts WHERE receipt_id=$1',
+      [receipt.receiptId])).rows[0]).toEqual({count:1});
   });
 });
 

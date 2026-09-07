@@ -235,7 +235,7 @@ async function execute() {
 
   const schema = await schemaVersions(applyDatabase);
   assert.deepEqual(schema, [
-    { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 },
+    { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 },
   ]);
   dumpDatabase(applyDatabase, recoveredDumpPath);
   assertBackupFile(recoveredDumpPath);
