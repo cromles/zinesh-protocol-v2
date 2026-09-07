@@ -1208,15 +1208,27 @@ maybeDescribe('PostgreSQL Persistence', () => {
   });
 
   test('50. V7 negative observations append once and never mutate funding history', async () => {
+    const cellId=freshCellId();
+    expect((await adapter.eventStore.append(cellId,[makeEvent(cellId,V1)])).ok).toBe(true);
+    const commandId=makeCommandId(`provider-negative-${cellCounter}`);
+    const fundedEvent=makeFundedEvent(cellId,V2);
+    const receipt=makeFundingReceipt(cellId,commandId,fundedEvent);
+    await createIntent(adapter,receipt);
+    await adapter.commandExecutionStore.execute(commandId,'provider-negative',async(events,receipts)=>{
+      expect((await receipts.claim(receipt)).kind).toBe('CLAIMED');
+      expect((await events.append(cellId,[fundedEvent])).ok).toBe(true);
+      return {encodedResult:'{"outcome":"SUCCESS"}'};
+    });
+    const correlation:ProviderTransactionCorrelation={provider:receipt.provider,environment:'SANDBOX',
+      providerTransactionId:receipt.providerTransactionId,providerPaymentId:'provider-payment-negative',
+      intentId:receipt.intentId,receiptId:receipt.receiptId,cellId,createdAt:T3};
+    await expect(adapter.providerFoundationStore.correlateTransaction(correlation))
+      .resolves.toEqual({kind:'RECORDED'});
     const pool=(adapter as unknown as {pool:Pool}).pool;
-    const row=await pool.query<{provider:string;provider_transaction_id:string;intent_id:string;
-      receipt_id:string;cell_id:string}>(`SELECT provider,provider_transaction_id,intent_id,receipt_id,cell_id
-      FROM provider_transaction_correlations WHERE receipt_id IS NOT NULL ORDER BY created_at DESC LIMIT 1`);
-    const linked=row.rows[0]!;
     const observation:ProviderNegativeObservation={observationId:providerIdentityHash('negative','1'),
-      provider:linked.provider,environment:'SANDBOX',providerObservationId:'refund-v7-1',
-      providerTransactionId:linked.provider_transaction_id,intentId:linked.intent_id,
-      receiptId:linked.receipt_id,cellId:linked.cell_id,kind:'REFUND',amountMinor:makeAmount(1n),
+      provider:receipt.provider,environment:'SANDBOX',providerObservationId:'refund-v7-1',
+      providerTransactionId:receipt.providerTransactionId,intentId:receipt.intentId,
+      receiptId:receipt.receiptId,cellId,kind:'REFUND',amountMinor:makeAmount(1n),
       currency:'TRY',payloadDigest:'c'.repeat(64),observedAt:T2,recordedAt:T3};
     await expect(adapter.providerFoundationStore.appendNegativeObservation(observation))
       .resolves.toEqual({kind:'RECORDED'});
@@ -1225,7 +1237,7 @@ maybeDescribe('PostgreSQL Persistence', () => {
     await expect(pool.query('DELETE FROM provider_negative_observations WHERE observation_id=$1',
       [observation.observationId])).rejects.toThrow(/append-only/i);
     expect((await pool.query('SELECT count(*)::int AS count FROM funding_receipts WHERE receipt_id=$1',
-      [linked.receipt_id])).rows[0]).toEqual({count:1});
+      [receipt.receiptId])).rows[0]).toEqual({count:1});
   });
 });
 
