@@ -1234,6 +1234,15 @@ maybeDescribe('PostgreSQL Persistence', () => {
       .resolves.toEqual({kind:'RECORDED'});
     await expect(adapter.providerFoundationStore.appendNegativeObservation(observation))
       .resolves.toMatchObject({kind:'DUPLICATE'});
+    const reordered = Object.fromEntries(Object.entries(observation).reverse()) as unknown as ProviderNegativeObservation;
+    await expect(adapter.providerFoundationStore.appendNegativeObservation(reordered))
+      .resolves.toEqual({kind:'DUPLICATE',observation});
+    await expect(adapter.providerFoundationStore.appendNegativeObservation({...reordered,amountMinor:makeAmount(2n)}))
+      .resolves.toEqual({kind:'CONFLICT'});
+    await expect(adapter.providerFoundationStore.appendNegativeObservation({...reordered,payloadDigest:'d'.repeat(64)}))
+      .resolves.toEqual({kind:'CONFLICT'});
+    expect((await pool.query('SELECT count(*)::int AS count FROM provider_negative_observations WHERE observation_id=$1',
+      [observation.observationId])).rows[0]).toEqual({count:1});
     await expect(pool.query('DELETE FROM provider_negative_observations WHERE observation_id=$1',
       [observation.observationId])).rejects.toThrow(/append-only/i);
     expect((await pool.query('SELECT count(*)::int AS count FROM funding_receipts WHERE receipt_id=$1',

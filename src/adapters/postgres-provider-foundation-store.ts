@@ -7,7 +7,7 @@ import type { ProviderEnvironment, ProviderEvent, ProviderNegativeObservation,
 import { providerIdentityHash } from '../funding/provider-identity';
 import type { ProviderCorrelationResult, ProviderEventRecordResult, ProviderFoundationStore,
   ProviderNegativeObservationResult } from './provider-foundation-store';
-import { sameProviderCorrelation, sameProviderEvent } from './provider-foundation-store';
+import { sameProviderCorrelation, sameProviderEvent, sameProviderNegativeObservation } from './provider-foundation-store';
 
 interface EventRow { event_identity: string; replay_identity: string; provider: string;
   environment: ProviderEnvironment; provider_event_id: string | null; provider_payment_id: string;
@@ -124,8 +124,7 @@ export class PostgresProviderFoundationStore implements ProviderFoundationStore 
       WHERE observation_id=$1 OR (provider=$2 AND environment=$3 AND provider_observation_id=$4)`,
     [value.observationId,value.provider,value.environment,value.providerObservationId]);
     const rows = existing.rows.map(rowToNegative);
-    const exact = rows.find((item) => JSON.stringify({...item,amountMinor:item.amountMinor?.toString()})
-      === JSON.stringify({...value,amountMinor:value.amountMinor?.toString()}));
+    const exact = rows.find((item) => sameProviderNegativeObservation(item,value));
     return exact === undefined ? { kind:'CONFLICT' } : { kind:'DUPLICATE',observation:exact };
   }
 }

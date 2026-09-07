@@ -44,3 +44,14 @@ export function sameProviderCorrelation(a: ProviderTransactionCorrelation,
     && a.providerPaymentId === b.providerPaymentId && a.intentId === b.intentId
     && a.receiptId === b.receiptId && a.cellId === b.cellId;
 }
+
+export function sameProviderNegativeObservation(a: ProviderNegativeObservation,
+  b: ProviderNegativeObservation): boolean {
+  return a.observationId === b.observationId && a.provider === b.provider
+    && a.environment === b.environment && a.providerObservationId === b.providerObservationId
+    && a.providerTransactionId === b.providerTransactionId && a.intentId === b.intentId
+    && a.receiptId === b.receiptId && a.cellId === b.cellId && a.kind === b.kind
+    && a.amountMinor === b.amountMinor && a.currency === b.currency
+    && a.payloadDigest === b.payloadDigest && a.observedAt === b.observedAt
+    && a.recordedAt === b.recordedAt;
+}

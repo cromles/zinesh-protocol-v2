@@ -47,4 +47,15 @@ describe('provider foundation security boundaries', () => {
     expect(providerIdentityHash('provider','dispute')).toMatch(/^[0-9a-f]{64}$/);
     expect(providerIdentityHash('provider','dispute')).not.toContain('\0');
   });
+  test('negative observation retries ignore property order and absent optional fields', async () => {
+    const store=new InMemoryProviderFoundationStore();
+    await expect(store.appendNegativeObservation(negative)).resolves.toEqual({kind:'RECORDED'});
+    const reordered = Object.fromEntries(Object.entries(negative).reverse()) as unknown as ProviderNegativeObservation;
+    await expect(store.appendNegativeObservation({...reordered,receiptId:undefined,cellId:undefined}))
+      .resolves.toEqual({kind:'DUPLICATE',observation:negative});
+    await expect(store.appendNegativeObservation({...reordered,amountMinor:makeAmount(21n)}))
+      .resolves.toEqual({kind:'CONFLICT'});
+    await expect(store.appendNegativeObservation({...reordered,payloadDigest:'f'.repeat(64)}))
+      .resolves.toEqual({kind:'CONFLICT'});
+  });
 });

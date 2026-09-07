@@ -2,7 +2,7 @@ import type { ProviderEvent, ProviderNegativeObservation, ProviderReconciliation
   ProviderTransactionCorrelation } from '../funding/provider-evidence';
 import type { ProviderCorrelationResult, ProviderEventRecordResult, ProviderFoundationStore,
   ProviderNegativeObservationResult } from './provider-foundation-store';
-import { sameProviderCorrelation, sameProviderEvent } from './provider-foundation-store';
+import { sameProviderCorrelation, sameProviderEvent, sameProviderNegativeObservation } from './provider-foundation-store';
 
 export class InMemoryProviderFoundationStore implements ProviderFoundationStore {
   private readonly events: ProviderEvent[] = [];
@@ -44,8 +44,7 @@ export class InMemoryProviderFoundationStore implements ProviderFoundationStore 
       || (item.provider === value.provider && item.environment === value.environment
         && item.providerObservationId === value.providerObservationId));
     if (matches.length === 0) { this.negatives.push(value); return { kind:'RECORDED' }; }
-    const exact = matches.find((item) => JSON.stringify({...item,amountMinor:item.amountMinor?.toString()})
-      === JSON.stringify({...value,amountMinor:value.amountMinor?.toString()}));
+    const exact = matches.find((item) => sameProviderNegativeObservation(item,value));
     return exact === undefined ? { kind:'CONFLICT' } : { kind:'DUPLICATE',observation:exact };
   }
 }
