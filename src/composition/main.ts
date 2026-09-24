@@ -25,6 +25,8 @@ import type {
   FundingDestinationResolver,
   PrincipalAuthority,
 } from '../security/trusted-ingress';
+import { TrustedNegativeResolutionIngress, rejectAllNegativeResolutionEvidence } from '../security/negative-resolution-ingress';
+import type { FundingNegativeResolutionRequest, NegativeResolutionEvidencePort, NegativeResolutionResult } from '../security/negative-resolution-ingress';
 import {
   CachedJwksProvider, HttpJwksFetcher, JwtAuthenticationAdapter,
 } from '../security/jwt-authentication';
@@ -37,6 +39,7 @@ import { isIP } from 'net';
 import { X509Certificate } from 'crypto';
 import { lstatSync, readFileSync } from 'fs';
 import { PostgresFixedWindowRateLimiter } from '../adapters/postgres-rate-limit-store';
+import { FundingReconciliationService } from '../funding/funding-reconciliation-service';
 import { allowAllRateLimiter } from '../security/rate-limiter';
 import type { RateLimiter, RateLimitPolicy } from '../security/rate-limiter';
 import {
@@ -422,8 +425,10 @@ export interface ComposedRuntime {
   readonly gate: CommandGate;
   readonly preAuthenticationRateLimiter: RateLimiter;
   readonly telemetry: SecurityTelemetry;
+  readonly fundingReconciliation: FundingReconciliationService;
   handleCommand(request: ExternalCommandRequest): Promise<HandleCommandResult>;
   handleFundingConfirmation(request: FundingConfirmationRequest): Promise<HandleCommandResult>;
+  resolveFundingNegative(request: FundingNegativeResolutionRequest): Promise<NegativeResolutionResult>;
 }
 
 export interface SecurityPorts {
@@ -432,6 +437,7 @@ export interface SecurityPorts {
   readonly fundingEvidence: FundingEvidencePort;
   readonly principalRateLimiter: RateLimiter;
   readonly fundingDestinations: FundingDestinationResolver;
+  readonly negativeResolutionEvidence: NegativeResolutionEvidencePort;
 }
 
 export function composeRuntime(
@@ -441,6 +447,15 @@ export function composeRuntime(
   telemetry: SecurityTelemetry = noOpSecurityTelemetry,
 ): ComposedRuntime {
   const persistence = new PostgresPersistenceAdapter(config, telemetry);
+  const fundingReconciliation = new FundingReconciliationService(
+    persistence.providerFoundationStore,persistence.fundingIntentStore,
+  );
+  const negativeResolution = new TrustedNegativeResolutionIngress(
+    security?.authentication ?? failClosedAuthentication,
+    security?.principals ?? persistence.principalAuthority,
+    security?.negativeResolutionEvidence ?? rejectAllNegativeResolutionEvidence,
+    persistence.providerFoundationStore,persistence.fundingReceiptStore,
+  );
   const clock = systemClock();
   const eventIds = createEventIdFactory(createProcessEventIdPrefix());
   const application = new CellApplication({
@@ -471,11 +486,15 @@ export function composeRuntime(
     gate,
     preAuthenticationRateLimiter,
     telemetry,
+    fundingReconciliation,
     handleCommand(request: ExternalCommandRequest): Promise<HandleCommandResult> {
       return gate.run(() => ingress.handle(request));
     },
     handleFundingConfirmation(request: FundingConfirmationRequest): Promise<HandleCommandResult> {
       return gate.run(() => ingress.handleFundingConfirmation(request));
+    },
+    resolveFundingNegative(request: FundingNegativeResolutionRequest): Promise<NegativeResolutionResult> {
+      return gate.run(() => negativeResolution.resolve(request));
     },
   };
 }

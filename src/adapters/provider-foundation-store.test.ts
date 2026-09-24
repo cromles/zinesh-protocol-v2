@@ -41,6 +41,23 @@ describe('provider foundation security boundaries', () => {
     await expect(store.appendNegativeObservation({...negative,intentId:'other'}))
       .resolves.toEqual({kind:'CONFLICT'});
   });
+  test('same transaction ID remains isolated by provider account scope', async () => {
+    const store=new InMemoryProviderFoundationStore();
+    const a={...correlation,providerAccountScope:'account-A'};
+    const b={...correlation,providerAccountScope:'account-B',intentId:'intent-B',cellId:'cell-B'};
+    expect(await store.correlateTransaction(a)).toEqual({kind:'RECORDED'});
+    expect(await store.correlateTransaction(b)).toEqual({kind:'RECORDED'});
+    expect(await store.getCorrelation('provider','SANDBOX','tx','account-A')).toMatchObject({intentId:'intent'});
+    expect(await store.getCorrelation('provider','SANDBOX','tx','account-B')).toMatchObject({intentId:'intent-B'});
+    const negativeA={...negative,providerAccountScope:'account-A',cellId:'cell'};
+    const negativeB={...negative,observationId:'f'.repeat(64),providerAccountScope:'account-B',
+      providerObservationId:'refund-B',intentId:'intent-B',cellId:'cell-B'};
+    expect(await store.appendNegativeObservation(negativeA)).toEqual({kind:'RECORDED'});
+    expect(await store.appendNegativeObservation(negativeA)).toMatchObject({kind:'DUPLICATE'});
+    expect(await store.appendNegativeObservation(negativeB)).toEqual({kind:'RECORDED'});
+    expect(store.hasBlockingNegativeForCell('cell')).toBe(true);
+    expect(store.hasBlockingNegativeForCell('cell-B')).toBe(true);
+  });
   test('length-prefixed SHA-256 identity is deterministic, unambiguous and PostgreSQL-safe', () => {
     expect(providerIdentityHash('ab','c')).toBe(providerIdentityHash('ab','c'));
     expect(providerIdentityHash('ab','c')).not.toBe(providerIdentityHash('a','bc'));

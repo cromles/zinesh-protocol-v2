@@ -9,6 +9,10 @@ import { sameFundingReceiptIdentity } from './funding-receipt-store';
 export class InMemoryFundingReceiptStore implements FundingReceiptStore {
   private readonly receipts: FundingReceipt[] = [];
 
+  async getById(receiptId: string): Promise<FundingReceipt | null> {
+    return this.receipts.find((item) => item.receiptId === receiptId) ?? null;
+  }
+
   async claim(receipt: FundingReceipt): Promise<FundingReceiptClaimResult> {
     const matches = this.receipts.filter((existing) => conflictsWith(existing, receipt));
     if (matches.length === 0) {
@@ -25,14 +29,18 @@ export class InMemoryFundingReceiptStore implements FundingReceiptStore {
 function conflictsWith(left: FundingReceipt, right: FundingReceipt): boolean {
   return left.receiptId === right.receiptId
     || left.intentId === right.intentId
-    || (left.provider === right.provider && left.providerTransactionId === right.providerTransactionId)
+    || (left.provider === right.provider && left.environment === right.environment
+      && left.providerAccountScope === right.providerAccountScope
+      && left.providerTransactionId === right.providerTransactionId)
     || left.cellId === right.cellId
     || left.commandId === right.commandId
     || left.fundingEventId === right.fundingEventId;
 }
 
 function conflictKind(left: FundingReceipt, right: FundingReceipt): FundingReceiptConflict {
-  if (left.provider === right.provider && left.providerTransactionId === right.providerTransactionId) {
+  if (left.provider === right.provider && left.environment === right.environment
+      && left.providerAccountScope === right.providerAccountScope
+      && left.providerTransactionId === right.providerTransactionId) {
     return 'PROVIDER_TRANSACTION';
   }
   if (left.receiptId === right.receiptId) return 'RECEIPT';

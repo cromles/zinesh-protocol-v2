@@ -94,6 +94,16 @@ export class PostgresFundingDisputeStore implements FundingDisputeStore {
           FROM funding_dispute_observations WHERE cell_id=$1
           ORDER BY provider,provider_dispute_id,observation_version DESC
         ) latest WHERE outcome <> 'FUNDS_RETAINED'
+      ) OR EXISTS (
+        SELECT 1 FROM provider_negative_observations
+        n WHERE n.cell_id=$1 AND n.kind IN ('REFUND','RETURNED','REVERSAL','DISPUTE')
+          AND NOT EXISTS (
+            SELECT 1 FROM provider_negative_dispositions d
+            WHERE d.source_negative_observation_id=n.observation_id
+              AND d.version=(SELECT MAX(d2.version) FROM provider_negative_dispositions d2
+                WHERE d2.source_negative_observation_id=n.observation_id)
+              AND d.disposition_status IN ('RESOLVED','CLOSED') AND d.outcome='FUNDS_RETAINED'
+          )
       ) AS blocked`, [cellId],
     );
     return result.rows[0]?.blocked === true;

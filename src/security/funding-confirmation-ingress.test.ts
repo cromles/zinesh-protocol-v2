@@ -48,7 +48,7 @@ async function setup(result?: FundingVerificationResult) {
       cellId, type: 'CreateCell', payload: { payer: PAYER, payee: PAYEE, amount: AMOUNT, currency: 'TRY',
         fundingDeadline: makeTimestamp(2_000_000), completionDeadline: makeTimestamp(3_000_000) } } });
     await persistence.fundingIntentStore.create(createFundingIntent({
-      intentId: intentIdFor(cellId), provider: 'test-provider', cellId, payer: PAYER, payee: PAYEE,
+      intentId: intentIdFor(cellId), provider: 'test-provider', environment: 'SANDBOX', providerAccountScope: 'account-test', cellId, payer: PAYER, payee: PAYEE,
       amount: AMOUNT, currency: 'TRY', destinationId: 'test-custody',
       createdAt: makeTimestamp(800_000), expiresAt: makeTimestamp(2_000_000),
     }));
@@ -67,6 +67,7 @@ describe('Funding Phase 2 verification and ingress', () => {
         opaqueEvidence: { amount: 'caller-value' } } });
     expect(result.outcome).toBe('SUCCESS');
     expect(h.captured()).toEqual({ intentId: intentIdFor(cellId), gatewayPrincipalId: gateway.principalId,
+      environment: 'SANDBOX', providerAccountScope: 'account-test',
       cellId, payer: PAYER, payee: PAYEE,
       amount: AMOUNT, currency: 'TRY', destinationId: 'test-custody' });
     expect(h.destinationBinding()).toEqual({ provider: 'test-provider', cellId, payer: PAYER,
@@ -82,7 +83,7 @@ describe('Funding Phase 2 verification and ingress', () => {
       ({ intentId: intentIdFor(cellId), provider: 'other-provider', providerTransactionId: 'provider-mismatch-tx' })],
     ['payee mismatch', async (h: Awaited<ReturnType<typeof setup>>, cellId: ReturnType<typeof makeCellId>) => {
       await h.persistence.fundingIntentStore.create(createFundingIntent({
-        intentId: 'wrong-payee-intent', provider: 'test-provider', cellId, payer: PAYER,
+        intentId: 'wrong-payee-intent', provider: 'test-provider', environment: 'SANDBOX', providerAccountScope: 'account-test', cellId, payer: PAYER,
         payee: makeActorId('wrong-payee'), amount: AMOUNT, currency: 'TRY', destinationId: 'test-custody',
         createdAt: makeTimestamp(800_000), expiresAt: makeTimestamp(2_000_000),
       }));
@@ -90,7 +91,7 @@ describe('Funding Phase 2 verification and ingress', () => {
     }],
     ['destination mismatch', async (h: Awaited<ReturnType<typeof setup>>, cellId: ReturnType<typeof makeCellId>) => {
       await h.persistence.fundingIntentStore.create(createFundingIntent({
-        intentId: 'wrong-destination-intent', provider: 'test-provider', cellId, payer: PAYER, payee: PAYEE,
+        intentId: 'wrong-destination-intent', provider: 'test-provider', environment: 'SANDBOX', providerAccountScope: 'account-test', cellId, payer: PAYER, payee: PAYEE,
         amount: AMOUNT, currency: 'TRY', destinationId: 'wrong-custody',
         createdAt: makeTimestamp(800_000), expiresAt: makeTimestamp(2_000_000),
       }));
@@ -99,7 +100,7 @@ describe('Funding Phase 2 verification and ingress', () => {
     }],
     ['invalid binding digest', async (h: Awaited<ReturnType<typeof setup>>, cellId: ReturnType<typeof makeCellId>) => {
       await expect(h.persistence.fundingIntentStore.create({
-        intentId: 'forged-digest-intent', provider: 'test-provider', cellId, payer: PAYER, payee: PAYEE,
+        intentId: 'forged-digest-intent', provider: 'test-provider', environment: 'SANDBOX', providerAccountScope: 'account-test', cellId, payer: PAYER, payee: PAYEE,
         amount: AMOUNT, currency: 'TRY', destinationId: 'test-custody', bindingDigest: 'f'.repeat(64),
         createdAt: makeTimestamp(800_000), expiresAt: makeTimestamp(2_000_000),
       })).resolves.toEqual({ kind: 'INVALID' });
@@ -118,7 +119,7 @@ describe('Funding Phase 2 verification and ingress', () => {
   test('confirmation timestamp must fall inside the immutable intent window', async () => {
     const h = await setup(); const cellId = await h.create('phase3a-expired');
     await h.persistence.fundingIntentStore.create(createFundingIntent({
-      intentId: 'expired-intent', provider: 'test-provider', cellId, payer: PAYER, payee: PAYEE,
+      intentId: 'expired-intent', provider: 'test-provider', environment: 'SANDBOX', providerAccountScope: 'account-test', cellId, payer: PAYER, payee: PAYEE,
       amount: AMOUNT, currency: 'TRY', destinationId: 'test-custody',
       createdAt: makeTimestamp(800_000), expiresAt: makeTimestamp(850_000),
     }));

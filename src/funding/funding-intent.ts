@@ -19,7 +19,8 @@ export function hasValidFundingIntentBinding(intent: FundingIntent): boolean {
 export function fundingIntentBindingDigest(intent: FundingIntentDraft): string {
   const hash = createHash('sha256');
   for (const value of [
-    intent.intentId, intent.provider, intent.cellId, intent.payer, intent.payee,
+    intent.intentId, intent.provider, intent.environment, intent.providerAccountScope,
+    intent.cellId, intent.payer, intent.payee,
     intent.amount.toString(), intent.currency, intent.destinationId,
     intent.createdAt.toString(), intent.expiresAt.toString(),
   ]) {
@@ -33,6 +34,7 @@ export function fundingIntentBindingDigest(intent: FundingIntentDraft): string {
 }
 
 function hasValidFundingIntentShape(intent: FundingIntentDraft): boolean {
-  return intent.intentId.length > 0 && intent.provider.length > 0 && intent.destinationId.length > 0
+  return intent.intentId.length > 0 && intent.provider.length > 0 && intent.providerAccountScope.length > 0
+    && intent.destinationId.length > 0
     && intent.expiresAt >= intent.createdAt;
 }

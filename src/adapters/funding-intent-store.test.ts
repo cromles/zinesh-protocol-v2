@@ -6,7 +6,7 @@ import { InMemoryFundingIntentStore } from './in-memory-funding-intent-store';
 function intent(overrides: Partial<FundingIntent> = {}): FundingIntent {
   const { bindingDigest, ...draftOverrides } = overrides;
   const candidate = createFundingIntent({
-    intentId: 'intent-1', provider: 'provider-a', cellId: makeCellId('cell-intent-1'),
+    intentId: 'intent-1', provider: 'provider-a', environment: 'SANDBOX', providerAccountScope: 'account-test', cellId: makeCellId('cell-intent-1'),
     payer: makeActorId('payer-intent'), payee: makeActorId('payee-intent'),
     amount: makeAmount(4200n), currency: 'TRY', destinationId: 'custody-payee-intent',
     createdAt: makeTimestamp(1_000), expiresAt: makeTimestamp(2_000), ...draftOverrides,

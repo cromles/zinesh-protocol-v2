@@ -199,7 +199,7 @@ export class PostgresPrincipalAuthority implements PrincipalAuthority, Principal
         !input.context.correlationId || input.context.occurredAt < 0) return false;
     if ((input.type === 'ACTOR') !== (input.actorId !== undefined)) return false;
     const allowed: Record<PrincipalType, ReadonlyArray<Capability>> = {
-      ACTOR: ['ACT_AS_SELF'], GATEWAY: ['CONFIRM_FUNDING'], SYSTEM: [],
+      ACTOR: ['ACT_AS_SELF'], GATEWAY: ['CONFIRM_FUNDING', 'RESOLVE_FUNDING_NEGATIVE'], SYSTEM: [],
     };
     return (input.capabilities ?? []).every((capability) => allowed[input.type].includes(capability));
   }

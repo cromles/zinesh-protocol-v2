@@ -8,9 +8,15 @@ import type {
   Timestamp,
 } from '../core/types';
 
+export type FundingEnvironment = 'SANDBOX' | 'LIVE';
+
 /** Untrusted provider-neutral input. Provider adapters own opaqueEvidence. */
 export interface FundingEvidence {
   readonly provider: string;
+  /** Untrusted claim, checked against the server-bound intent and verified evidence. */
+  readonly environment?: FundingEnvironment;
+  /** Untrusted claim only; canonical scope comes from server-side account configuration. */
+  readonly providerAccountScope?: string;
   readonly providerTransactionId: string;
   readonly intentId: string;
   readonly opaqueEvidence?: unknown;
@@ -29,6 +35,8 @@ export interface FundingDestinationBinding {
 /** Server-derived values against which provider evidence must be verified. */
 export interface ExpectedFundingBinding {
   readonly intentId: string;
+  readonly environment: FundingEnvironment;
+  readonly providerAccountScope: string;
   readonly gatewayPrincipalId: string;
   readonly cellId: CellId;
   readonly payer: ActorId;
@@ -50,6 +58,8 @@ export type FundingFinality =
 export interface VerifiedFundingContext {
   readonly intentId: string;
   readonly provider: string;
+  readonly environment: FundingEnvironment;
+  readonly providerAccountScope: string;
   readonly providerTransactionId: string;
   readonly gatewayPrincipalId: string;
   readonly cellId: CellId;
@@ -87,6 +97,8 @@ export interface FundingReceipt {
   readonly intentId: string;
   readonly receiptId: string;
   readonly provider: string;
+  readonly environment: FundingEnvironment;
+  readonly providerAccountScope: string;
   readonly providerTransactionId: string;
   readonly cellId: CellId;
   readonly commandId: CommandId;
@@ -108,6 +120,8 @@ export interface FundingReceipt {
 export interface FundingIntent {
   readonly intentId: string;
   readonly provider: string;
+  readonly environment: FundingEnvironment;
+  readonly providerAccountScope: string;
   readonly cellId: CellId;
   readonly payer: ActorId;
   readonly payee: ActorId;
@@ -140,4 +154,55 @@ export interface FundingDisputeObservation {
   readonly evidenceDigest: string;
   readonly observedAt: Timestamp;
   readonly recordedAt: Timestamp;
+}
+
+export type NegativeDispositionStatus = 'PENDING' | 'RESOLVED' | 'CLOSED';
+export type NegativeDispositionOutcome = 'PENDING' | 'FUNDS_RETAINED' | 'FUNDS_LOST';
+
+/** Normalized proof returned only by a trusted provider-evidence verifier. */
+export interface ProviderNegativeResolutionEvidence {
+  readonly schemaVersion: 1;
+  readonly provider: string;
+  readonly environment: FundingEnvironment;
+  readonly providerAccountScope: string;
+  readonly providerTransactionId: string;
+  readonly sourceNegativeObservationId: string;
+  readonly sourceProviderObservationId: string;
+  readonly intentId: string;
+  readonly receiptId: string;
+  readonly cellId: CellId;
+  readonly amount: Amount;
+  readonly currency: Currency;
+  readonly providerFinalState: 'FUNDS_HELD' | 'SETTLED' | 'FUNDS_LOST';
+  readonly status: NegativeDispositionStatus;
+  readonly outcome: NegativeDispositionOutcome;
+  readonly responseAuthenticity: 'VERIFIED' | 'FAILED' | 'NOT_AVAILABLE';
+  readonly evidenceReference: string;
+  readonly evidenceDigest: string;
+  readonly observedAt: Timestamp;
+}
+
+/** Immutable Zinesh disposition linked to one exact provider negative observation. */
+export interface ProviderNegativeDisposition {
+  readonly resolutionId: string;
+  readonly sourceNegativeObservationId: string;
+  readonly provider: string;
+  readonly environment: FundingEnvironment;
+  readonly providerAccountScope: string;
+  readonly providerObservationId: string;
+  readonly providerTransactionId: string;
+  readonly intentId: string;
+  readonly receiptId: string;
+  readonly cellId: CellId;
+  readonly amount: Amount;
+  readonly currency: Currency;
+  readonly status: NegativeDispositionStatus;
+  readonly outcome: NegativeDispositionOutcome;
+  readonly version: bigint;
+  readonly evidenceReference: string;
+  readonly evidenceDigest: string;
+  readonly observedAt: Timestamp;
+  readonly recordedAt: Timestamp;
+  readonly resolverPrincipalId: string;
+  readonly resolverCapability: 'RESOLVE_FUNDING_NEGATIVE';
 }

@@ -16,6 +16,8 @@ function receipt(overrides: Partial<FundingReceipt> = {}): FundingReceipt {
     intentId: `intent-${id}`,
     receiptId: `receipt-${id}`,
     provider: 'provider-a',
+    environment: 'SANDBOX',
+    providerAccountScope: 'account-test',
     providerTransactionId: `transaction-${id}`,
     cellId: makeCellId(`cell-${id}`),
     commandId: makeCommandId(`command-${id}`),
@@ -36,6 +38,25 @@ function receipt(overrides: Partial<FundingReceipt> = {}): FundingReceipt {
 }
 
 describe('provider-neutral funding receipt store contract', () => {
+  test('receipt identity is scoped by environment and provider account', async () => {
+    const store = new InMemoryFundingReceiptStore();
+    const base = receipt({ providerTransactionId: 'shared-provider-tx' });
+    expect(await store.claim(base)).toEqual({ kind: 'CLAIMED' });
+    expect(await store.claim(receipt({ providerTransactionId: 'shared-provider-tx',
+      environment: 'LIVE', cellId: makeCellId('cell-other-env') }))).toEqual({ kind: 'CLAIMED' });
+    expect(await store.claim(receipt({ providerTransactionId: 'shared-provider-tx',
+      providerAccountScope: 'account-other', cellId: makeCellId('cell-other-account') }))).toEqual({ kind: 'CLAIMED' });
+  });
+
+  test('same composite receipt is idempotent only for the same binding', async () => {
+    const store = new InMemoryFundingReceiptStore();
+    const candidate = receipt({ providerTransactionId: 'same-tx' });
+    expect(await store.claim(candidate)).toEqual({ kind: 'CLAIMED' });
+    expect(await store.claim({ ...candidate })).toMatchObject({ kind: 'DUPLICATE' });
+    expect(await store.claim({ ...candidate, amount: makeAmount(999n) }))
+      .toEqual({ kind: 'CONFLICT', conflict: 'PROVIDER_TRANSACTION' });
+  });
+
   test('new receipt is claimed and an identical financial identity is a duplicate', async () => {
     const store = new InMemoryFundingReceiptStore();
     const candidate = receipt();

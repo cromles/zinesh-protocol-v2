@@ -78,7 +78,9 @@ import { cellKernel } from '../kernel';
 import { PostgresMigrator } from './postgres-migrator';
 import type { FundingDisputeObservation, FundingIntent, FundingReceipt } from '../funding/types';
 import { PostgresFundingReceiptStore } from './postgres-funding-receipt-store';
+import { PostgresFundingDisputeStore } from './postgres-funding-dispute-store';
 import { createFundingIntent } from '../funding/funding-intent';
+import type { FundingObservation, FundingRoute } from '../funding/funding-foundation';
 import type { ProviderEvent, ProviderNegativeObservation,
   ProviderTransactionCorrelation } from '../funding/provider-evidence';
 import { providerIdentityHash } from '../funding/provider-identity';
@@ -249,6 +251,8 @@ function makeFundingReceipt(
     intentId: `intent-pg-${evtCounter}`,
     receiptId: `receipt-pg-${++evtCounter}`,
     provider: 'provider-pg',
+    environment: 'LIVE',
+    providerAccountScope: 'account-pg',
     providerTransactionId: `transaction-pg-${evtCounter}`,
     cellId,
     commandId,
@@ -270,7 +274,8 @@ function makeFundingReceipt(
 
 function intentForReceipt(receipt: FundingReceipt): FundingIntent {
   return createFundingIntent({
-    intentId: receipt.intentId, provider: receipt.provider, cellId: receipt.cellId,
+    intentId: receipt.intentId, provider: receipt.provider, environment: receipt.environment,
+    providerAccountScope: receipt.providerAccountScope, cellId: receipt.cellId,
     payer: receipt.payer, payee: receipt.payee, amount: receipt.amount, currency: receipt.currency,
     destinationId: receipt.destinationId,
     createdAt: makeTimestamp(500_000), expiresAt: makeTimestamp(1_500_000),
@@ -1232,21 +1237,284 @@ maybeDescribe('PostgreSQL Persistence', () => {
       currency:'TRY',payloadDigest:'c'.repeat(64),observedAt:T2,recordedAt:T3};
     await expect(adapter.providerFoundationStore.appendNegativeObservation(observation))
       .resolves.toEqual({kind:'RECORDED'});
+    expect(await adapter.fundingDisputeStore.hasBlockingDispute(cellId)).toBe(true);
     await expect(adapter.providerFoundationStore.appendNegativeObservation(observation))
       .resolves.toMatchObject({kind:'DUPLICATE'});
     const reordered = Object.fromEntries(Object.entries(observation).reverse()) as unknown as ProviderNegativeObservation;
     await expect(adapter.providerFoundationStore.appendNegativeObservation(reordered))
-      .resolves.toEqual({kind:'DUPLICATE',observation});
+      .resolves.toEqual({kind:'DUPLICATE',observation:{...observation,providerAccountScope:'DEFAULT'}});
     await expect(adapter.providerFoundationStore.appendNegativeObservation({...reordered,amountMinor:makeAmount(2n)}))
       .resolves.toEqual({kind:'CONFLICT'});
     await expect(adapter.providerFoundationStore.appendNegativeObservation({...reordered,payloadDigest:'d'.repeat(64)}))
       .resolves.toEqual({kind:'CONFLICT'});
     expect((await pool.query('SELECT count(*)::int AS count FROM provider_negative_observations WHERE observation_id=$1',
       [observation.observationId])).rows[0]).toEqual({count:1});
+    expect((await pool.query('SELECT provider_account_scope FROM provider_negative_observations WHERE observation_id=$1',
+      [observation.observationId])).rows[0]).toEqual({provider_account_scope:'DEFAULT'});
     await expect(pool.query('DELETE FROM provider_negative_observations WHERE observation_id=$1',
       [observation.observationId])).rejects.toThrow(/append-only/i);
     expect((await pool.query('SELECT count(*)::int AS count FROM funding_receipts WHERE receipt_id=$1',
       [receipt.receiptId])).rows[0]).toEqual({count:1});
+  });
+
+  test('V10 persists scoped receipt bindings and append-only negative dispositions idempotently', async () => {
+    await adapter.migrator.migrate();
+    await adapter.migrator.verifyExpectedVersion();
+    const cellId=freshCellId();
+    await adapter.eventStore.append(cellId,[makeEvent(cellId,V1)]);
+    const commandId=makeCommandId(`negative-disposition-${cellCounter}`);
+    const fundedEvent=makeFundedEvent(cellId,V2);
+    const receipt=makeFundingReceipt(cellId,commandId,fundedEvent,{environment:'LIVE',providerAccountScope:'account-v10'});
+    await createIntent(adapter,receipt);
+    await adapter.commandExecutionStore.execute(commandId,'negative-disposition-funding',async(events,receipts)=>{
+      expect((await receipts.claim(receipt)).kind).toBe('CLAIMED');
+      expect((await events.append(cellId,[fundedEvent])).ok).toBe(true);
+      return {encodedResult:'{"outcome":"SUCCESS"}'};
+    });
+    const otherCell=freshCellId(); await adapter.eventStore.append(otherCell,[makeEvent(otherCell,V1)]);
+    const otherCommand=makeCommandId(`scoped-same-tx-${cellCounter}`);
+    const otherEvent=makeFundedEvent(otherCell,V2);
+    const otherReceipt=makeFundingReceipt(otherCell,otherCommand,otherEvent,{environment:'LIVE',
+      providerAccountScope:'account-v10-other',providerTransactionId:receipt.providerTransactionId});
+    await createIntent(adapter,otherReceipt);
+    await adapter.commandExecutionStore.execute(otherCommand,'scoped-same-transaction',async(events,receipts)=>{
+      expect((await receipts.claim(otherReceipt)).kind).toBe('CLAIMED');
+      expect((await events.append(otherCell,[otherEvent])).ok).toBe(true);
+      return {encodedResult:'{"outcome":"SUCCESS"}'};
+    });
+    await adapter.providerFoundationStore.correlateTransaction({provider:receipt.provider,environment:receipt.environment,
+      providerAccountScope:receipt.providerAccountScope,providerTransactionId:receipt.providerTransactionId,
+      intentId:receipt.intentId,receiptId:receipt.receiptId,cellId,createdAt:T3});
+    const observation:ProviderNegativeObservation={observationId:providerIdentityHash('negative-v10',String(cellId)),
+      provider:receipt.provider,environment:receipt.environment,providerAccountScope:receipt.providerAccountScope,
+      providerObservationId:`negative-v10-${cellCounter}`,providerTransactionId:receipt.providerTransactionId,
+      intentId:receipt.intentId,receiptId:receipt.receiptId,cellId,kind:'RETURNED',amountMinor:receipt.amount,
+      currency:receipt.currency,payloadDigest:'f'.repeat(64),observedAt:T3,recordedAt:T3};
+    await expect(adapter.providerFoundationStore.appendNegativeObservation(observation)).resolves.toEqual({kind:'RECORDED'});
+    expect(await adapter.fundingDisputeStore.hasBlockingDispute(cellId)).toBe(true);
+    const pool=(adapter as unknown as {pool:Pool}).pool;
+    await pool.query(`INSERT INTO principals(principal_id,principal_type,actor_id,enabled,mapping_version)
+      VALUES($1,'GATEWAY',NULL,TRUE,1)`,[`resolver-v10-${cellCounter}`]);
+    await pool.query(`INSERT INTO principal_capabilities(principal_id,capability) VALUES($1,'RESOLVE_FUNDING_NEGATIVE')`,
+      [`resolver-v10-${cellCounter}`]);
+    const disposition={resolutionId:`resolution-v10-${cellCounter}`,sourceNegativeObservationId:observation.observationId,
+      provider:receipt.provider,environment:receipt.environment,providerAccountScope:receipt.providerAccountScope,
+      providerObservationId:observation.providerObservationId,providerTransactionId:receipt.providerTransactionId,
+      intentId:receipt.intentId,receiptId:receipt.receiptId,cellId,amount:receipt.amount,currency:receipt.currency,
+      status:'RESOLVED' as const,outcome:'FUNDS_RETAINED' as const,version:1n,evidenceReference:'provider/statement/v10',
+      evidenceDigest:'9'.repeat(64),observedAt:T3,recordedAt:T3,resolverPrincipalId:`resolver-v10-${cellCounter}`,
+      resolverCapability:'RESOLVE_FUNDING_NEGATIVE' as const};
+    await expect(adapter.providerFoundationStore.appendNegativeDisposition(disposition)).resolves.toBe('RECORDED');
+    await expect(adapter.providerFoundationStore.appendNegativeDisposition(disposition)).resolves.toBe('DUPLICATE');
+    expect(await adapter.fundingDisputeStore.hasBlockingDispute(cellId)).toBe(false);
+    await expect(pool.query('UPDATE provider_negative_dispositions SET outcome=$2 WHERE resolution_id=$1',
+      [disposition.resolutionId,'FUNDS_LOST'])).rejects.toThrow(/append-only/i);
+  });
+
+  test('51. V8 route and unmatched funding observations persist without intent fabrication', async () => {
+    const cellId=freshCellId();
+    const intentReceipt=makeFundingReceipt(cellId,makeCommandId(`route-v8-${cellCounter}`),makeFundedEvent(cellId,V2));
+    await createIntent(adapter,intentReceipt);
+    const route:FundingRoute={routeId:`route-${cellCounter}`,intentId:intentReceipt.intentId,provider:intentReceipt.provider,
+      environment:'LIVE',providerAccountScope:'account-a',destinationReference:intentReceipt.destinationId,
+      currency:intentReceipt.currency,expectedAmount:intentReceipt.amount,status:'ACTIVE',createdAt:T3};
+    await expect(adapter.providerFoundationStore.createRoute(route)).resolves.toEqual({kind:'CREATED'});
+    await expect(adapter.providerFoundationStore.createRoute(route)).resolves.toMatchObject({kind:'DUPLICATE'});
+    const observation:FundingObservation={observationId:'bank-observation-1',provider:route.provider,environment:route.environment,
+      providerAccountScope:route.providerAccountScope,providerTransactionId:'bank-transaction-unmatched',direction:'CREDIT',
+      amount:makeAmount(1n),currency:'TRY',observedAt:T3,destinationReference:'unknown-route',
+      rawPayloadDigest:'d'.repeat(64),state:'SETTLED'};
+    await expect(adapter.providerFoundationStore.recordObservation(observation)).resolves.toEqual({kind:'RECORDED'});
+    await expect(adapter.providerFoundationStore.recordObservation(observation)).resolves.toMatchObject({kind:'DUPLICATE',
+      observation:{correlationStatus:'UNMATCHED'}});
+    await expect(adapter.providerFoundationStore.listUnmatchedObservations(route.provider,route.environment,
+      route.providerAccountScope,10)).resolves.toHaveLength(1);
+    const unmatched=await adapter.providerFoundationStore.listUnmatchedObservations(route.provider,route.environment,
+      route.providerAccountScope,10);
+    expect(unmatched[0]).not.toHaveProperty('intentId');
+    const pool=(adapter as unknown as {pool:Pool}).pool;
+    expect((await pool.query('SELECT count(*)::int AS count FROM provider_funding_observations WHERE observation_id=$1',
+      [observation.observationId])).rows[0]).toEqual({count:1});
+  });
+
+  test('52. V8 inbox claims are concurrent, recoverable, and idempotently completed', async () => {
+    const event:ProviderEvent={eventIdentity:providerIdentityHash('event','unmatched'),
+      replayIdentity:providerIdentityHash('replay','unmatched'),provider:'bank-v8',environment:'LIVE',
+      providerTransactionId:'bank-tx-no-intent',eventType:'ACCOUNT_CREDIT',payloadDigest:'e'.repeat(64),receivedAt:T2};
+    await expect(adapter.providerFoundationStore.recordEvent(event)).resolves.toEqual({kind:'FIRST_SEEN'});
+    const claims=await Promise.all([
+      adapter.providerFoundationStore.claimEvent(event.eventIdentity,'worker-a',1000,100),
+      adapter.providerFoundationStore.claimEvent(event.eventIdentity,'worker-b',1000,100),
+    ]);
+    expect(claims.map((claim)=>claim.kind).sort()).toEqual(['BUSY','CLAIMED']);
+    const owner=claims[0]?.kind==='CLAIMED'?'worker-a':'worker-b';
+    const outsider=owner==='worker-a'?'worker-b':'worker-a';
+    await expect(adapter.providerFoundationStore.completeEvent(event.eventIdentity,outsider,1001)).resolves.toBe('NOT_CLAIMED');
+    await expect(adapter.providerFoundationStore.completeEvent(event.eventIdentity,owner,1001)).resolves.toBe('PROCESSED');
+    await expect(adapter.providerFoundationStore.completeEvent(event.eventIdentity,owner,1002)).resolves.toBe('PROCESSED');
+    await expect(adapter.providerFoundationStore.claimEvent(event.eventIdentity,'worker-c',1003,100)).resolves.toEqual({kind:'PROCESSED'});
+  });
+
+  test('53. V8 account cursor uses optimistic revision and transaction checkpoints reject stale regression', async () => {
+    const cellId=freshCellId();
+    const receipt=makeFundingReceipt(cellId,makeCommandId(`checkpoint-v8-${cellCounter}`),makeFundedEvent(cellId,V2));
+    await createIntent(adapter,receipt);
+    const correlation:ProviderTransactionCorrelation={provider:receipt.provider,environment:'LIVE',
+      providerAccountScope:'account-v8',providerTransactionId:receipt.providerTransactionId,
+      intentId:receipt.intentId,cellId,createdAt:T3};
+    await adapter.providerFoundationStore.correlateTransaction(correlation);
+    await adapter.providerFoundationStore.putCheckpoint({provider:receipt.provider,environment:'LIVE',
+      providerAccountScope:'account-v8',providerTransactionId:receipt.providerTransactionId,
+      state:'FUNDS_HELD',attemptCount:2,checkedAt:T3});
+    await adapter.providerFoundationStore.putCheckpoint({provider:receipt.provider,environment:'LIVE',
+      providerAccountScope:'account-v8',providerTransactionId:receipt.providerTransactionId,
+      state:'PENDING',attemptCount:3,checkedAt:T3});
+    await expect(adapter.providerFoundationStore.getCorrelation(receipt.provider,'LIVE',receipt.providerTransactionId,'account-v8'))
+      .resolves.toMatchObject({providerAccountScope:'account-v8'});
+    await expect(adapter.providerFoundationStore.getCheckpoint(receipt.provider,'LIVE',receipt.providerTransactionId,'account-v8'))
+      .resolves.toMatchObject({providerAccountScope:'account-v8',state:'FUNDS_HELD',attemptCount:2});
+    const accountCheckpoint={provider:receipt.provider,environment:'LIVE' as const,providerAccountScope:'account-v8',
+      cursor:'cursor-1',checkedAt:T3,revision:1};
+    await expect(adapter.providerFoundationStore.putAccountCheckpoint(accountCheckpoint)).resolves.toBe(true);
+    await expect(adapter.providerFoundationStore.putAccountCheckpoint({...accountCheckpoint,cursor:'stale',revision:1}))
+      .resolves.toBe(false);
+    await expect(adapter.providerFoundationStore.getAccountCheckpoint(receipt.provider,'LIVE','account-v8'))
+      .resolves.toMatchObject({cursor:'cursor-1',revision:1});
+  });
+
+  test('54. identical transaction IDs stay isolated across account scopes for correlation and negatives', async () => {
+    const cellId=freshCellId();
+    const receipt=makeFundingReceipt(cellId,makeCommandId(`scope-parity-${cellCounter}`),makeFundedEvent(cellId,V2));
+    await createIntent(adapter,receipt);
+    const cellB=freshCellId();
+    const receiptB=makeFundingReceipt(cellB,makeCommandId(`scope-parity-b-${cellCounter}`),makeFundedEvent(cellB,V2));
+    await createIntent(adapter,receiptB);
+    const tx='same-provider-transaction-id';
+    const a:ProviderTransactionCorrelation={provider:receipt.provider,environment:'LIVE',providerAccountScope:'account-A',
+      providerTransactionId:tx,intentId:receipt.intentId,cellId,createdAt:T3};
+    const b={...a,providerAccountScope:'account-B',intentId:receiptB.intentId,cellId:cellB};
+    await expect(adapter.providerFoundationStore.correlateTransaction(a)).resolves.toEqual({kind:'RECORDED'});
+    await expect(adapter.providerFoundationStore.correlateTransaction(b)).resolves.toEqual({kind:'RECORDED'});
+    await expect(adapter.providerFoundationStore.correlateTransaction(a)).resolves.toMatchObject({kind:'DUPLICATE'});
+    const observationA:FundingObservation={observationId:'scope-observation',provider:receipt.provider,environment:'LIVE',
+      providerAccountScope:'account-A',providerTransactionId:tx,direction:'CREDIT',amount:receipt.amount,currency:'TRY',
+      observedAt:T3,destinationReference:receipt.destinationId,rawPayloadDigest:'a'.repeat(64),state:'SETTLED'};
+    const observationB={...observationA,providerAccountScope:'account-B',observationId:'scope-observation-B',
+      amount:receiptB.amount,destinationReference:receiptB.destinationId};
+    await adapter.providerFoundationStore.recordObservation(observationA);
+    await adapter.providerFoundationStore.recordObservation(observationB);
+    expect(await adapter.providerFoundationStore.listUnmatchedObservations(receipt.provider,'LIVE','account-A',10)).toHaveLength(0);
+    expect(await adapter.providerFoundationStore.listUnmatchedObservations(receipt.provider,'LIVE','account-B',10)).toHaveLength(0);
+    const negative=(scope:string,intentId:string,cell:string):ProviderNegativeObservation=>({observationId:providerIdentityHash('scope-negative',scope),
+      provider:receipt.provider,environment:'LIVE',providerAccountScope:scope,providerObservationId:'negative-shared-id',
+      providerTransactionId:tx,intentId,cellId:cell,kind:'RETURNED',payloadDigest:'b'.repeat(64),
+      observedAt:T3,recordedAt:T3});
+    const negativeA=negative('account-A',receipt.intentId,cellId); const negativeB=negative('account-B',receiptB.intentId,cellB);
+    await expect(adapter.providerFoundationStore.appendNegativeObservation(negativeA)).resolves.toEqual({kind:'RECORDED'});
+    expect(await adapter.fundingDisputeStore.hasBlockingDispute(cellB)).toBe(false);
+    await expect(adapter.providerFoundationStore.appendNegativeObservation(negativeB)).resolves.toEqual({kind:'RECORDED'});
+    await expect(adapter.providerFoundationStore.appendNegativeObservation(negativeA)).resolves.toMatchObject({kind:'DUPLICATE'});
+    const pool=(adapter as unknown as {pool:Pool}).pool;
+    expect((await pool.query(`SELECT provider_account_scope FROM provider_negative_observations
+      WHERE observation_id=ANY($1::char(64)[]) ORDER BY provider_account_scope`,[[negativeA.observationId,negativeB.observationId]])).rows)
+      .toEqual([{provider_account_scope:'account-A'},{provider_account_scope:'account-B'}]);
+  });
+
+  test('55. negative write and settlement check serialize on the funding receipt row', async () => {
+    const cellId=freshCellId();
+    await adapter.eventStore.append(cellId,[makeEvent(cellId,V1)]);
+    const fundedEvent=makeFundedEvent(cellId,V2);
+    const receipt=makeFundingReceipt(cellId,makeCommandId(`negative-race-${cellCounter}`),fundedEvent);
+    await createIntent(adapter,receipt);
+    await adapter.commandExecutionStore.execute(receipt.commandId,'negative-race-funding',async(events,receipts)=>{
+      expect((await receipts.claim(receipt)).kind).toBe('CLAIMED');
+      expect((await events.append(cellId,[fundedEvent])).ok).toBe(true);
+      return {encodedResult:'{"outcome":"SUCCESS"}'};
+    });
+    await adapter.providerFoundationStore.correlateTransaction({provider:receipt.provider,environment:'LIVE',
+      providerAccountScope:'account-race',providerTransactionId:receipt.providerTransactionId,
+      intentId:receipt.intentId,receiptId:receipt.receiptId,cellId,createdAt:T3});
+    const pool=(adapter as unknown as {pool:Pool}).pool;
+    const settlementClient=await pool.connect();
+    const observation:ProviderNegativeObservation={observationId:providerIdentityHash('negative-race',String(cellId)),
+      provider:receipt.provider,environment:'LIVE',providerAccountScope:'account-race',
+      providerObservationId:`negative-race-${cellCounter}`,providerTransactionId:receipt.providerTransactionId,
+      intentId:receipt.intentId,receiptId:receipt.receiptId,cellId,kind:'RETURNED',payloadDigest:'e'.repeat(64),
+      observedAt:T3,recordedAt:T3};
+    try {
+      await settlementClient.query('BEGIN');
+      const txDisputes=new PostgresFundingDisputeStore(pool,settlementClient);
+      expect(await txDisputes.hasBlockingDispute(cellId)).toBe(false);
+      const writer=adapter.providerFoundationStore.appendNegativeObservation(observation);
+      let waiting=false;
+      const deadline=Date.now()+5_000;
+      while(Date.now()<deadline){
+        const activity=await pool.query<{waiting:boolean}>(`SELECT EXISTS(SELECT 1 FROM pg_stat_activity
+          WHERE wait_event_type='Lock' AND query LIKE '%funding_receipts WHERE cell_id=$1 FOR UPDATE%') AS waiting`);
+        if(activity.rows[0]?.waiting===true){waiting=true;break;}
+        await new Promise((resolve)=>setTimeout(resolve,10));
+      }
+      expect(waiting).toBe(true);
+      await settlementClient.query('COMMIT');
+      await expect(writer).resolves.toEqual({kind:'RECORDED'});
+      expect(await adapter.fundingDisputeStore.hasBlockingDispute(cellId)).toBe(true);
+    } catch(error) {
+      await settlementClient.query('ROLLBACK').catch(()=>undefined);
+      throw error;
+    } finally {
+      settlementClient.release();
+    }
+  });
+
+  test('negative resolution serializes with settlement and only enables a later recheck', async () => {
+    const cellId=freshCellId(); await adapter.eventStore.append(cellId,[makeEvent(cellId,V1)]);
+    const commandId=makeCommandId(`negative-resolution-race-${cellCounter}`),fundedEvent=makeFundedEvent(cellId,V2);
+    const receipt=makeFundingReceipt(cellId,commandId,fundedEvent,{environment:'LIVE',providerAccountScope:'resolution-race'});
+    await createIntent(adapter,receipt);
+    await adapter.commandExecutionStore.execute(commandId,'negative-resolution-race-funding',async(events,receipts)=>{
+      expect((await receipts.claim(receipt)).kind).toBe('CLAIMED');
+      expect((await events.append(cellId,[fundedEvent])).ok).toBe(true); return {encodedResult:'{"outcome":"SUCCESS"}'};
+    });
+    await adapter.providerFoundationStore.correlateTransaction({provider:receipt.provider,environment:'LIVE',
+      providerAccountScope:'resolution-race',providerTransactionId:receipt.providerTransactionId,intentId:receipt.intentId,
+      receiptId:receipt.receiptId,cellId,createdAt:T3});
+    const negative:ProviderNegativeObservation={observationId:providerIdentityHash('resolution-race',String(cellId)),
+      provider:receipt.provider,environment:'LIVE',providerAccountScope:'resolution-race',
+      providerObservationId:`resolution-race-${cellCounter}`,providerTransactionId:receipt.providerTransactionId,
+      intentId:receipt.intentId,receiptId:receipt.receiptId,cellId,kind:'RETURNED',amountMinor:receipt.amount,
+      currency:receipt.currency,payloadDigest:'8'.repeat(64),observedAt:T3,recordedAt:T3};
+    await adapter.providerFoundationStore.appendNegativeObservation(negative);
+    const pool=(adapter as unknown as {pool:Pool}).pool;
+    const principalId=`resolution-race-gateway-${cellCounter}`;
+    await pool.query(`INSERT INTO principals(principal_id,principal_type,actor_id,enabled,mapping_version)
+      VALUES($1,'GATEWAY',NULL,TRUE,1)`,[principalId]);
+    await pool.query(`INSERT INTO principal_capabilities(principal_id,capability) VALUES($1,'RESOLVE_FUNDING_NEGATIVE')`,[principalId]);
+    const disposition={resolutionId:`resolution-race-${cellCounter}`,sourceNegativeObservationId:negative.observationId,
+      provider:receipt.provider,environment:'LIVE' as const,providerAccountScope:'resolution-race',
+      providerObservationId:negative.providerObservationId,providerTransactionId:negative.providerTransactionId,
+      intentId:receipt.intentId,receiptId:receipt.receiptId,cellId,amount:receipt.amount,currency:receipt.currency,
+      status:'RESOLVED' as const,outcome:'FUNDS_RETAINED' as const,version:1n,evidenceReference:'statement/race',
+      evidenceDigest:'7'.repeat(64),observedAt:T3,recordedAt:T3,resolverPrincipalId:principalId,
+      resolverCapability:'RESOLVE_FUNDING_NEGATIVE' as const};
+    const settlementClient=await pool.connect();
+    try {
+      await settlementClient.query('BEGIN');
+      const settlementStore=new PostgresFundingDisputeStore(pool,settlementClient);
+      expect(await settlementStore.hasBlockingDispute(cellId)).toBe(true);
+      const resolver=adapter.providerFoundationStore.appendNegativeDisposition(disposition);
+      let waiting=false; const deadline=Date.now()+5_000;
+      while(Date.now()<deadline){
+        const activity=await pool.query<{waiting:boolean}>(`SELECT EXISTS(SELECT 1 FROM pg_stat_activity
+          WHERE wait_event_type='Lock' AND query LIKE '%funding_receipts WHERE receipt_id=$1 FOR UPDATE%') AS waiting`);
+        if(activity.rows[0]?.waiting===true){waiting=true;break;}
+        await new Promise((resolve)=>setTimeout(resolve,10));
+      }
+      expect(waiting).toBe(true);
+      await settlementClient.query('COMMIT');
+      await expect(resolver).resolves.toBe('RECORDED');
+      expect(await adapter.fundingDisputeStore.hasBlockingDispute(cellId)).toBe(false);
+    } catch(error) { await settlementClient.query('ROLLBACK').catch(()=>undefined); throw error; }
+    finally { settlementClient.release(); }
   });
 });
 

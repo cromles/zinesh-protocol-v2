@@ -3,9 +3,12 @@ import type { FundingDisputeObservation } from '../funding/types';
 import type { FundingDisputeRecordResult, FundingDisputeStore } from './funding-dispute-store';
 import { hasConsistentFundingDisputeLifecycle, isBlockingFundingDispute,
   sameFundingDisputeBinding, sameFundingDisputeObservation } from './funding-dispute-store';
+import type { InMemoryProviderFoundationStore } from './in-memory-provider-foundation-store';
 
 export class InMemoryFundingDisputeStore implements FundingDisputeStore {
   private readonly observations: FundingDisputeObservation[] = [];
+
+  constructor(private readonly providerFoundation?: InMemoryProviderFoundationStore) {}
 
   async record(observation: FundingDisputeObservation): Promise<FundingDisputeRecordResult> {
     if (!hasConsistentFundingDisputeLifecycle(observation)) return { kind: 'CONFLICT' };
@@ -35,6 +38,7 @@ export class InMemoryFundingDisputeStore implements FundingDisputeStore {
         latest.set(key, observation);
       }
     }
-    return [...latest.values()].some((item) => isBlockingFundingDispute(item.outcome));
+    return [...latest.values()].some((item) => isBlockingFundingDispute(item.outcome))
+      || this.providerFoundation?.hasBlockingNegativeForCell(String(cellId)) === true;
   }
 }

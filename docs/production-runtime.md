@@ -119,7 +119,7 @@ Release order:
 3. Only then start or replace serving replicas of that image.
 
 Serving replicas call `verifyExpectedVersion()` at startup and on `/ready`.
-Schema version equality is exact: this image requires `{1,2,3,4}`. A newer or
+Schema version equality is exact: this image requires `{1,2,3,4,5,6,7,8}`. A newer or
 older schema is not ready. There is no mixed-version compatibility window.
 
 Concurrent apply jobs are serialized by the existing PostgreSQL advisory lock.

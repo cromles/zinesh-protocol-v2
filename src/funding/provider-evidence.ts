@@ -1,9 +1,10 @@
 import type { Amount, Currency, Timestamp } from '../core/types';
+import type { FundingEnvironment } from './types';
 
-export type ProviderEnvironment = 'SANDBOX' | 'LIVE';
+export type ProviderEnvironment = FundingEnvironment;
 export type ProviderReconciliationState =
-  | 'PENDING' | 'FUNDS_HELD' | 'FAILED' | 'CANCELLED'
-  | 'REFUNDED' | 'REVERSED' | 'DISPUTED' | 'UNKNOWN';
+  | 'PENDING' | 'SETTLED' | 'FUNDS_HELD' | 'FAILED' | 'CANCELLED'
+  | 'REFUNDED' | 'REFUND' | 'RETURNED' | 'REVERSED' | 'DISPUTE' | 'DISPUTED' | 'UNKNOWN';
 
 export type ProviderAuthenticity = 'VERIFIED' | 'FAILED' | 'NOT_AVAILABLE';
 
@@ -12,6 +13,8 @@ export interface NormalizedProviderEvidence {
   readonly schemaVersion: 1;
   readonly provider: string;
   readonly environment: ProviderEnvironment;
+  readonly providerAccountScope: string;
+  readonly providerTransactionId: string;
   readonly intentId: string;
   readonly providerPaymentId: string;
   readonly providerConversationId: string;
@@ -37,9 +40,9 @@ export interface ProviderEvent {
   readonly provider: string;
   readonly environment: ProviderEnvironment;
   readonly providerEventId?: string | undefined;
-  readonly providerPaymentId: string;
+  readonly providerPaymentId?: string | undefined;
   readonly providerTransactionId: string;
-  readonly intentId: string;
+  readonly intentId?: string | undefined;
   readonly receiptId?: string | undefined;
   readonly cellId?: string | undefined;
   readonly eventType: string;
@@ -48,11 +51,22 @@ export interface ProviderEvent {
   readonly receivedAt: Timestamp;
 }
 
+/** Processing state is kept separately from the immutable provider event. */
+export type ProviderEventProcessingState = 'RECEIVED' | 'CLAIMED' | 'PROCESSED' | 'FAILED';
+
+export interface ProviderEventClaim {
+  readonly eventIdentity: string;
+  readonly workerId: string;
+  readonly leaseUntil: Timestamp;
+  readonly attemptCount: number;
+}
+
 export interface ProviderTransactionCorrelation {
   readonly provider: string;
   readonly environment: ProviderEnvironment;
+  readonly providerAccountScope?: string | undefined;
   readonly providerTransactionId: string;
-  readonly providerPaymentId: string;
+  readonly providerPaymentId?: string | undefined;
   readonly intentId: string;
   readonly receiptId?: string | undefined;
   readonly cellId: string;
@@ -62,6 +76,7 @@ export interface ProviderTransactionCorrelation {
 export interface ProviderReconciliationCheckpoint {
   readonly provider: string;
   readonly environment: ProviderEnvironment;
+  readonly providerAccountScope?: string | undefined;
   readonly providerTransactionId: string;
   readonly state: ProviderReconciliationState;
   readonly normalizedEvidenceDigest?: string | undefined;
@@ -72,12 +87,26 @@ export interface ProviderReconciliationCheckpoint {
   readonly lastErrorCategory?: string | undefined;
 }
 
-export type ProviderNegativeObservationKind = 'REFUND' | 'REVERSAL' | 'DISPUTE';
+/** Account-level scan position; cursor is opaque and has no provider-specific shape. */
+export interface ProviderAccountReconciliationCheckpoint {
+  readonly provider: string;
+  readonly environment: ProviderEnvironment;
+  readonly providerAccountScope: string;
+  readonly cursor?: string | undefined;
+  readonly pageToken?: string | undefined;
+  readonly statementSequence?: string | undefined;
+  readonly lastObservedAt?: Timestamp | undefined;
+  readonly checkedAt: Timestamp;
+  readonly revision: number;
+}
+
+export type ProviderNegativeObservationKind = 'REFUND' | 'RETURNED' | 'REVERSAL' | 'DISPUTE';
 
 export interface ProviderNegativeObservation {
   readonly observationId: string;
   readonly provider: string;
   readonly environment: ProviderEnvironment;
+  readonly providerAccountScope?: string | undefined;
   readonly providerObservationId: string;
   readonly providerTransactionId: string;
   readonly intentId: string;

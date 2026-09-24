@@ -52,7 +52,7 @@ const gateway: PrincipalRecord = {
 
 function funding(overrides: Partial<VerifiedFundingContext> = {}): VerifiedFundingContext {
   return {
-    intentId: INTENT_ID, provider: 'test-provider', providerTransactionId: 'provider-tx-1',
+    intentId: INTENT_ID, provider: 'test-provider', environment: 'SANDBOX', providerAccountScope: 'account-test', providerTransactionId: 'provider-tx-1',
     gatewayPrincipalId: gateway.principalId, cellId: CELL, payer: PAYER, payee: PAYEE,
     amount: AMOUNT, currency: 'TRY', destinationId: 'test-custody',
     confirmedAt: makeTimestamp(900_000), finality: 'FUNDS_HELD',
@@ -62,7 +62,7 @@ function funding(overrides: Partial<VerifiedFundingContext> = {}): VerifiedFundi
 
 async function seedIntent(persistence: InMemoryPersistenceAdapter): Promise<void> {
   await persistence.fundingIntentStore.create(createFundingIntent({
-    intentId: INTENT_ID, provider: 'test-provider', cellId: CELL, payer: PAYER, payee: PAYEE,
+    intentId: INTENT_ID, provider: 'test-provider', environment: 'SANDBOX', providerAccountScope: 'account-test', cellId: CELL, payer: PAYER, payee: PAYEE,
     amount: AMOUNT, currency: 'TRY', destinationId: 'test-custody',
     createdAt: makeTimestamp(800_000), expiresAt: makeTimestamp(2_000_000),
   }));

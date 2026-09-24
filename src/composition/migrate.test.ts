@@ -66,7 +66,20 @@ describe('one-shot schema apply command', () => {
     }
   });
 
-  test('group-accessible password file fails closed without leaking the secret', async () => {
+  test('missing PGHOST fails configuration before attempting persistence startup', async () => {
+    const stderr = jest.spyOn(process.stderr, 'write').mockReturnValue(true);
+    const codes: number[] = [];
+    try {
+      const { PGHOST: _ignored, ...withoutHost } = PG_ENV;
+      await migrateMain(withoutHost, (code) => { codes.push(code); });
+      expect(codes).toEqual([1]);
+      expect(stderr.mock.calls.map((call) => String(call[0])).join('')).toBe('Invalid configuration: PGHOST is required\n');
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
+  (process.platform === 'win32' ? test.skip : test)('group-accessible password file fails closed without leaking the secret', async () => {
     fs.chmodSync(POSTGRES_PASSWORD_PATH, 0o640);
     const codes: number[] = [];
     const stderr = jest.spyOn(process.stderr, 'write').mockReturnValue(true);
@@ -229,12 +242,14 @@ maybeDescribe('one-shot schema apply against PostgreSQL', () => {
     });
     try {
       expect((await pool.query('SELECT version FROM schema_migrations ORDER BY version')).rows)
-        .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }]);
-      expect(EXPECTED_SCHEMA_VERSION).toBe(7);
+        .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }]);
+      expect(EXPECTED_SCHEMA_VERSION).toBe(10);
       expect((await pool.query('SELECT name FROM schema_migrations WHERE version=6')).rows)
         .toEqual([{ name: 'funding-intents-held-semantics-disputes' }]);
       expect((await pool.query('SELECT name FROM schema_migrations WHERE version=7')).rows)
         .toEqual([{ name: 'provider-neutral-evidence-reconciliation' }]);
+      expect((await pool.query('SELECT name FROM schema_migrations WHERE version=8')).rows)
+        .toEqual([{ name: 'funding-route-observation-inbox-lifecycle' }]);
     } finally {
       await pool.end();
     }

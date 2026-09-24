@@ -177,6 +177,8 @@ function makeApp(now: Timestamp = T0): AppHarness {
         await persistence.fundingIntentStore.create(createFundingIntent({
           intentId,
           provider: 'test-provider',
+          environment: 'SANDBOX',
+          providerAccountScope: 'account-test',
           cellId: input.command.cellId,
           payer: (input.command.payload as { funderId: ActorId }).funderId,
           payee: PAYEE,
@@ -194,6 +196,7 @@ function makeApp(now: Timestamp = T0): AppHarness {
             fundingEvidence: {
               intentId,
               provider: 'test-provider',
+              environment: 'SANDBOX', providerAccountScope: 'account-test',
               providerTransactionId: `provider-${input.command.commandId}`,
               gatewayPrincipalId: 'gateway-1', cellId: input.command.cellId,
               payer: (input.command.payload as { funderId: ActorId }).funderId,

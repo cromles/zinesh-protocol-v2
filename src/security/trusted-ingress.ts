@@ -12,7 +12,7 @@ import { noOpSecurityTelemetry, serverCorrelationId } from './security-observabi
 import type { SecurityTelemetry } from './security-observability';
 
 export type PrincipalType = 'ACTOR' | 'GATEWAY' | 'SYSTEM';
-export type Capability = 'ACT_AS_SELF' | 'CONFIRM_FUNDING';
+export type Capability = 'ACT_AS_SELF' | 'CONFIRM_FUNDING' | 'RESOLVE_FUNDING_NEGATIVE';
 
 export interface PrincipalRecord {
   readonly principalId: string;
@@ -248,11 +248,12 @@ export class TrustedCommandIngress {
       let intent: FundingIntent | null;
       try { intent = await this.application.getFundingIntent(request.fundingEvidence.intentId); }
       catch { return fundingIngressRejection('FUNDING_DEPENDENCY_UNAVAILABLE'); }
-      if (intent === null || !matchesIntent(intent, request.fundingEvidence.provider, fundingBoundary)) {
+      if (intent === null || !matchesIntent(intent, request.fundingEvidence, fundingBoundary)) {
         return securityRejection('FUNDING_EVIDENCE_INVALID');
       }
       const expected: ExpectedFundingBinding = {
         intentId: intent.intentId,
+        environment: intent.environment, providerAccountScope: intent.providerAccountScope,
         gatewayPrincipalId: principal.principalId, cellId: command.cellId,
         payer: fundingBoundary.state.payer, amount: fundingBoundary.state.amount,
         payee: fundingBoundary.state.payee, currency: fundingBoundary.state.currency,
@@ -348,6 +349,8 @@ function isFundingEvidence(value: unknown): value is FundingEvidence {
   return typeof value === 'object' && value !== null
     && typeof (value as FundingEvidence).provider === 'string'
     && typeof (value as FundingEvidence).providerTransactionId === 'string'
+    && ((value as FundingEvidence).environment === undefined || (value as FundingEvidence).environment === 'LIVE' || (value as FundingEvidence).environment === 'SANDBOX')
+    && ((value as FundingEvidence).providerAccountScope === undefined || typeof (value as FundingEvidence).providerAccountScope === 'string')
     && typeof (value as FundingEvidence).intentId === 'string';
 }
 
@@ -355,6 +358,9 @@ function matchesExpectedBinding(
   context: VerifiedFundingContext, expected: ExpectedFundingBinding, evidence: FundingEvidence,
 ): boolean {
   return context.intentId === expected.intentId && context.provider === evidence.provider
+    && (evidence.environment === undefined || evidence.environment === expected.environment)
+    && (evidence.providerAccountScope === undefined || evidence.providerAccountScope === expected.providerAccountScope)
+    && context.environment === expected.environment && context.providerAccountScope === expected.providerAccountScope
     && context.providerTransactionId === evidence.providerTransactionId
     && context.gatewayPrincipalId === expected.gatewayPrincipalId
     && context.cellId === expected.cellId && context.payer === expected.payer && context.payee === expected.payee
@@ -364,11 +370,14 @@ function matchesExpectedBinding(
 }
 
 function matchesIntent(
-  intent: FundingIntent, provider: string,
+  intent: FundingIntent, evidence: FundingEvidence,
   boundary: { readonly state: Awaited<ReturnType<CellApplication['getCellState']>> & object; readonly destinationId: string },
 ): boolean {
   return hasValidFundingIntentBinding(intent)
-    && intent.provider === provider && intent.cellId === boundary.state.cellId
+    && intent.provider === evidence.provider
+    && (evidence.environment === undefined || intent.environment === evidence.environment)
+    && (evidence.providerAccountScope === undefined || intent.providerAccountScope === evidence.providerAccountScope)
+    && intent.cellId === boundary.state.cellId
     && intent.payer === boundary.state.payer && intent.payee === boundary.state.payee
     && intent.amount === boundary.state.amount && intent.currency === boundary.state.currency
     && intent.destinationId === boundary.destinationId;

@@ -15,22 +15,26 @@ import { InMemoryCommandExecutionStore } from './in-memory-command-execution-sto
 import { InMemoryFundingIntentStore } from './in-memory-funding-intent-store';
 import { InMemoryProviderFoundationStore } from './in-memory-provider-foundation-store';
 import { InMemoryFundingDisputeStore } from './in-memory-funding-dispute-store';
+import { InMemoryFundingReceiptStore } from './in-memory-funding-receipt-store';
 
 export class InMemoryPersistenceAdapter implements PersistenceAdapter {
   readonly eventStore: InMemoryEventStore;
   readonly snapshotStore: InMemorySnapshotStore;
   readonly commandExecutionStore: InMemoryCommandExecutionStore;
   readonly fundingIntentStore: InMemoryFundingIntentStore;
-  readonly providerFoundationStore = new InMemoryProviderFoundationStore();
+  readonly providerFoundationStore: InMemoryProviderFoundationStore;
   readonly fundingDisputeStore: InMemoryFundingDisputeStore;
+  readonly fundingReceiptStore: InMemoryFundingReceiptStore;
 
   constructor() {
+    this.providerFoundationStore = new InMemoryProviderFoundationStore();
     this.eventStore = new InMemoryEventStore();
     this.snapshotStore = new InMemorySnapshotStore();
     this.fundingIntentStore = new InMemoryFundingIntentStore();
-    this.fundingDisputeStore = new InMemoryFundingDisputeStore();
+    this.fundingDisputeStore = new InMemoryFundingDisputeStore(this.providerFoundationStore);
+    this.fundingReceiptStore = new InMemoryFundingReceiptStore();
     this.commandExecutionStore = new InMemoryCommandExecutionStore(
-      this.eventStore, this.fundingDisputeStore,
+      this.eventStore, this.fundingDisputeStore, this.fundingReceiptStore,
     );
   }
 

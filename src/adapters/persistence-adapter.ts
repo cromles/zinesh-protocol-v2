@@ -20,6 +20,7 @@ import type { CommandExecutionStore } from './command-execution-store';
 import type { FundingIntentStore } from './funding-intent-store';
 import type { FundingDisputeStore } from './funding-dispute-store';
 import type { ProviderFoundationStore } from './provider-foundation-store';
+import type { FundingReceiptStore } from './funding-receipt-store';
 
 export interface PersistenceAdapter {
   readonly eventStore: EventStore;
@@ -28,6 +29,7 @@ export interface PersistenceAdapter {
   readonly fundingIntentStore: FundingIntentStore;
   readonly fundingDisputeStore: FundingDisputeStore;
   readonly providerFoundationStore: ProviderFoundationStore;
+  readonly fundingReceiptStore: FundingReceiptStore;
 
   /**
    * Open / initialise the underlying storage.

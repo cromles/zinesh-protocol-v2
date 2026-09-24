@@ -19,6 +19,7 @@ export type FundingReceiptClaimResult =
  */
 export interface FundingReceiptStore {
   claim(receipt: FundingReceipt): Promise<FundingReceiptClaimResult>;
+  getById(receiptId: string): Promise<FundingReceipt | null>;
 }
 
 export function sameFundingReceiptIdentity(
@@ -27,6 +28,8 @@ export function sameFundingReceiptIdentity(
 ): boolean {
   return left.intentId === right.intentId
     && left.provider === right.provider
+    && left.environment === right.environment
+    && left.providerAccountScope === right.providerAccountScope
     && left.providerTransactionId === right.providerTransactionId
     && left.cellId === right.cellId
     && left.commandId === right.commandId

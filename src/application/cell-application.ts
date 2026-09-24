@@ -269,10 +269,16 @@ export class CellApplication {
 function createFundingReceipt(
   context: VerifiedFundingContext, command: Command, event: Event, now: Timestamp,
 ): FundingReceipt {
-  const receiptId = `funding-${createHash('sha256')
-    .update(`${context.provider}\u0000${context.providerTransactionId}`).digest('hex')}`;
+  const identityHash = createHash('sha256');
+  for (const part of [context.provider, context.environment, context.providerAccountScope, context.providerTransactionId]) {
+    const encoded = Buffer.from(part, 'utf8');
+    const length = Buffer.allocUnsafe(4); length.writeUInt32BE(encoded.length);
+    identityHash.update(length); identityHash.update(encoded);
+  }
+  const receiptId = `funding-${identityHash.digest('hex')}`;
   return {
     receiptId, intentId: context.intentId, provider: context.provider,
+    environment: context.environment, providerAccountScope: context.providerAccountScope,
     providerTransactionId: context.providerTransactionId,
     cellId: command.cellId, commandId: command.commandId, fundingEventId: event.eventId,
     gatewayPrincipalId: context.gatewayPrincipalId, payer: context.payer, payee: context.payee,

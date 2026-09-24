@@ -1,6 +1,6 @@
 import type { Pool, PoolClient } from 'pg';
 
-export const EXPECTED_SCHEMA_VERSION = 7;
+export const EXPECTED_SCHEMA_VERSION = 10;
 
 const CORE_SCHEMA = `
 CREATE TABLE IF NOT EXISTS events (
@@ -380,6 +380,259 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER provider_negative_immutable BEFORE UPDATE OR DELETE ON provider_negative_observations
 FOR EACH ROW EXECUTE FUNCTION prevent_provider_negative_mutation();`;
 
+const FUNDING_FOUNDATION_V8_SCHEMA = `
+ALTER TABLE provider_event_inbox ALTER COLUMN intent_id DROP NOT NULL;
+ALTER TABLE provider_event_inbox ALTER COLUMN provider_payment_id DROP NOT NULL;
+ALTER TABLE provider_event_inbox DROP CONSTRAINT IF EXISTS provider_event_inbox_provider_payment_id_check;
+ALTER TABLE provider_event_inbox ADD CONSTRAINT provider_event_payment_id_nonempty
+CHECK (provider_payment_id IS NULL OR length(provider_payment_id)>0);
+ALTER TABLE provider_transaction_correlations ALTER COLUMN provider_payment_id DROP NOT NULL;
+ALTER TABLE provider_transaction_correlations DROP CONSTRAINT IF EXISTS provider_transaction_correlations_provider_payment_id_check;
+ALTER TABLE provider_transaction_correlations ADD CONSTRAINT provider_correlation_payment_id_nonempty
+  CHECK (provider_payment_id IS NULL OR length(provider_payment_id)>0);
+
+CREATE TABLE provider_event_processing (
+  event_identity CHAR(64) PRIMARY KEY REFERENCES provider_event_inbox(event_identity) ON DELETE RESTRICT,
+  state TEXT NOT NULL CHECK (state IN ('RECEIVED','CLAIMED','PROCESSED','FAILED')),
+  worker_id TEXT,
+  lease_until BIGINT,
+  attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count>=0),
+  error_category TEXT,
+  updated_at BIGINT NOT NULL CHECK (updated_at>=0),
+  CHECK ((state='CLAIMED' AND worker_id IS NOT NULL AND lease_until IS NOT NULL)
+      OR (state<>'CLAIMED' AND worker_id IS NULL AND lease_until IS NULL))
+);
+INSERT INTO provider_event_processing(event_identity,state,attempt_count,updated_at)
+  SELECT event_identity,'RECEIVED',0,received_at FROM provider_event_inbox
+  ON CONFLICT(event_identity) DO NOTHING;
+CREATE INDEX provider_event_processing_claim ON provider_event_processing(state,lease_until,updated_at);
+
+CREATE TABLE funding_routes (
+  route_id TEXT PRIMARY KEY CHECK (length(route_id)>0),
+  intent_id TEXT NOT NULL REFERENCES funding_intents(intent_id) ON DELETE RESTRICT,
+  provider TEXT NOT NULL CHECK (length(provider)>0),
+  environment TEXT NOT NULL CHECK (environment IN ('SANDBOX','LIVE')),
+  provider_account_scope TEXT NOT NULL CHECK (length(provider_account_scope)>0),
+  destination_reference TEXT NOT NULL CHECK (length(destination_reference)>0),
+  currency TEXT NOT NULL CHECK (length(currency)>0),
+  expected_amount NUMERIC(31,0) NOT NULL CHECK (expected_amount>0),
+  status TEXT NOT NULL CHECK (status IN ('ACTIVE','EXPIRED','CLOSED')),
+  created_at BIGINT NOT NULL CHECK (created_at>=0),
+  expires_at BIGINT CHECK (expires_at IS NULL OR expires_at>=created_at),
+  UNIQUE(provider,environment,intent_id),
+  UNIQUE(provider,environment,provider_account_scope,destination_reference)
+);
+CREATE TRIGGER funding_routes_immutable BEFORE UPDATE OR DELETE ON funding_routes
+  FOR EACH ROW EXECUTE FUNCTION prevent_provider_event_mutation();
+
+CREATE TABLE provider_funding_observations (
+  provider TEXT NOT NULL CHECK (length(provider)>0),
+  environment TEXT NOT NULL CHECK (environment IN ('SANDBOX','LIVE')),
+  provider_account_scope TEXT NOT NULL CHECK (length(provider_account_scope)>0),
+  observation_id TEXT NOT NULL CHECK (length(observation_id)>0),
+  provider_transaction_id TEXT NOT NULL CHECK (length(provider_transaction_id)>0),
+  related_provider_transaction_id TEXT,
+  direction TEXT NOT NULL CHECK (direction IN ('CREDIT','DEBIT')),
+  amount_minor NUMERIC(31,0) NOT NULL CHECK (amount_minor>0),
+  currency TEXT NOT NULL CHECK (length(currency)>0),
+  observed_at BIGINT NOT NULL CHECK (observed_at>=0),
+  booked_at BIGINT CHECK (booked_at IS NULL OR booked_at>=0),
+  destination_reference TEXT,
+  raw_payload_digest CHAR(64) NOT NULL CHECK (raw_payload_digest ~ '^[0-9a-f]{64}$'),
+  state TEXT NOT NULL CHECK (state IN ('PENDING','SETTLED','FUNDS_HELD','RETURNED','REVERSED',
+    'REFUND','DISPUTE','FAILED','CANCELLED','REFUNDED','DISPUTED','UNKNOWN')),
+  PRIMARY KEY(provider,environment,provider_account_scope,observation_id)
+);
+CREATE INDEX provider_funding_observations_tx ON provider_funding_observations
+  (provider,environment,provider_account_scope,provider_transaction_id,observed_at);
+CREATE TRIGGER provider_funding_observations_immutable BEFORE UPDATE OR DELETE ON provider_funding_observations
+  FOR EACH ROW EXECUTE FUNCTION prevent_provider_event_mutation();
+
+CREATE TABLE provider_account_reconciliation_checkpoints (
+  provider TEXT NOT NULL CHECK (length(provider)>0),
+  environment TEXT NOT NULL CHECK (environment IN ('SANDBOX','LIVE')),
+  provider_account_scope TEXT NOT NULL CHECK (length(provider_account_scope)>0),
+  cursor TEXT, page_token TEXT, statement_sequence TEXT,
+  last_observed_at BIGINT CHECK (last_observed_at IS NULL OR last_observed_at>=0),
+  checked_at BIGINT NOT NULL CHECK (checked_at>=0),
+  revision INTEGER NOT NULL CHECK (revision>0),
+  PRIMARY KEY(provider,environment,provider_account_scope)
+);
+
+ALTER TABLE provider_reconciliation_checkpoints DROP CONSTRAINT IF EXISTS provider_reconciliation_checkpoints_state_check;
+ALTER TABLE provider_reconciliation_checkpoints ADD CONSTRAINT provider_reconciliation_state_check
+  CHECK (state IN ('PENDING','SETTLED','FUNDS_HELD','FAILED','CANCELLED','REFUNDED','REFUND',
+    'RETURNED','REVERSED','DISPUTE','DISPUTED','UNKNOWN'));
+ALTER TABLE provider_negative_observations DROP CONSTRAINT IF EXISTS provider_negative_observations_kind_check;
+ALTER TABLE provider_negative_observations ADD CONSTRAINT provider_negative_kind_check
+  CHECK (kind IN ('REFUND','RETURNED','REVERSAL','DISPUTE'));
+
+ALTER TABLE provider_transaction_correlations ADD COLUMN provider_account_scope TEXT NOT NULL DEFAULT 'DEFAULT';
+ALTER TABLE provider_reconciliation_checkpoints ADD COLUMN provider_account_scope TEXT NOT NULL DEFAULT 'DEFAULT';
+ALTER TABLE provider_negative_observations ADD COLUMN provider_account_scope TEXT NOT NULL DEFAULT 'DEFAULT';
+DO $$ DECLARE fk RECORD; BEGIN
+  FOR fk IN SELECT conrelid::regclass AS table_name,conname FROM pg_constraint
+    WHERE contype='f' AND confrelid='provider_transaction_correlations'::regclass
+  LOOP EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I',fk.table_name,fk.conname); END LOOP;
+END $$;
+ALTER TABLE provider_transaction_correlations DROP CONSTRAINT provider_transaction_correlations_pkey;
+ALTER TABLE provider_transaction_correlations DROP CONSTRAINT provider_correlation_intent_unique;
+ALTER TABLE provider_transaction_correlations DROP CONSTRAINT provider_correlation_full_unique;
+ALTER TABLE provider_transaction_correlations ADD PRIMARY KEY(provider,environment,provider_account_scope,provider_transaction_id);
+ALTER TABLE provider_transaction_correlations ADD CONSTRAINT provider_correlation_intent_unique
+  UNIQUE(provider,environment,provider_account_scope,intent_id);
+ALTER TABLE provider_transaction_correlations ADD CONSTRAINT provider_correlation_full_unique
+  UNIQUE(provider,environment,provider_account_scope,provider_transaction_id,intent_id);
+
+ALTER TABLE provider_reconciliation_checkpoints DROP CONSTRAINT provider_reconciliation_checkpoints_pkey;
+ALTER TABLE provider_reconciliation_checkpoints ADD PRIMARY KEY(provider,environment,provider_account_scope,provider_transaction_id);
+ALTER TABLE provider_reconciliation_checkpoints ADD CONSTRAINT provider_checkpoint_correlation_fk
+  FOREIGN KEY(provider,environment,provider_account_scope,provider_transaction_id)
+  REFERENCES provider_transaction_correlations(provider,environment,provider_account_scope,provider_transaction_id)
+  ON DELETE RESTRICT;
+
+ALTER TABLE provider_negative_observations DROP CONSTRAINT IF EXISTS provider_negative_observations_provider_environment_provider_observation_id_key;
+ALTER TABLE provider_negative_observations ADD CONSTRAINT provider_negative_observation_unique
+  UNIQUE(provider,environment,provider_account_scope,provider_observation_id);
+ALTER TABLE provider_negative_observations ADD CONSTRAINT provider_negative_correlation_fk
+  FOREIGN KEY(provider,environment,provider_account_scope,provider_transaction_id)
+  REFERENCES provider_transaction_correlations(provider,environment,provider_account_scope,provider_transaction_id)
+  ON DELETE RESTRICT;
+ALTER TABLE provider_negative_observations ADD CONSTRAINT provider_negative_intent_fk
+  FOREIGN KEY(provider,environment,provider_account_scope,provider_transaction_id,intent_id)
+  REFERENCES provider_transaction_correlations(provider,environment,provider_account_scope,provider_transaction_id,intent_id)
+  ON DELETE RESTRICT;
+CREATE OR REPLACE FUNCTION verify_provider_correlation_binding() RETURNS trigger AS $$
+DECLARE linked_intent funding_intents%ROWTYPE; linked_receipt funding_receipts%ROWTYPE;
+BEGIN
+  SELECT * INTO linked_intent FROM funding_intents WHERE intent_id=NEW.intent_id;
+  IF linked_intent.intent_id IS NULL OR linked_intent.provider<>NEW.provider OR
+     linked_intent.cell_id<>NEW.cell_id THEN
+    RAISE EXCEPTION 'provider correlation must match immutable funding intent' USING ERRCODE='23514';
+  END IF;
+  IF NEW.receipt_id IS NOT NULL THEN
+    SELECT * INTO linked_receipt FROM funding_receipts WHERE receipt_id=NEW.receipt_id;
+    IF linked_receipt.receipt_id IS NULL OR linked_receipt.intent_id<>NEW.intent_id OR
+       linked_receipt.provider<>NEW.provider OR linked_receipt.cell_id<>NEW.cell_id OR
+       linked_receipt.provider_transaction_id<>NEW.provider_transaction_id THEN
+      RAISE EXCEPTION 'provider correlation must match immutable funding receipt' USING ERRCODE='23514';
+    END IF;
+  END IF;
+  RETURN NEW;
+END; $$ LANGUAGE plpgsql;`;
+
+const PROVIDER_NEGATIVE_SCOPE_UNIQUE_V9_SCHEMA = `
+-- V8 attempted to remove this legacy unique constraint under a different generated name.
+-- Keep V8 immutable and remove the actual pre-scope key in a forward migration.
+ALTER TABLE provider_negative_observations
+  DROP CONSTRAINT IF EXISTS provider_negative_observation_provider_environment_provider_key;
+`;
+
+const FUNDING_ACCOUNT_SCOPE_V10_SCHEMA = `
+ALTER TABLE funding_intents ADD COLUMN environment TEXT;
+ALTER TABLE funding_intents ADD COLUMN provider_account_scope TEXT;
+ALTER TABLE funding_receipts ADD COLUMN environment TEXT;
+ALTER TABLE funding_receipts ADD COLUMN provider_account_scope TEXT;
+-- Preserve unknown legacy bindings as NULL; do not invent an environment or account scope.
+ALTER TABLE funding_intents DISABLE TRIGGER funding_intents_immutable;
+UPDATE funding_intents i SET environment=r.environment,provider_account_scope=r.provider_account_scope
+ FROM (SELECT intent_id,min(provider) AS provider,min(environment) AS environment,
+       min(provider_account_scope) AS provider_account_scope
+       FROM funding_routes GROUP BY intent_id HAVING count(*)=1) r
+ WHERE r.intent_id=i.intent_id AND r.provider=i.provider;
+ALTER TABLE funding_intents ENABLE TRIGGER funding_intents_immutable;
+ALTER TABLE funding_receipts DISABLE TRIGGER funding_receipts_immutable;
+UPDATE funding_receipts r SET environment=i.environment,provider_account_scope=i.provider_account_scope
+ FROM funding_intents i WHERE i.intent_id=r.intent_id AND i.environment IS NOT NULL;
+ALTER TABLE funding_receipts ENABLE TRIGGER funding_receipts_immutable;
+ALTER TABLE funding_receipts DROP CONSTRAINT IF EXISTS funding_receipts_provider_tx_unique;
+ALTER TABLE funding_receipts ADD CONSTRAINT funding_receipts_scoped_provider_tx_unique
+ UNIQUE(provider,environment,provider_account_scope,provider_transaction_id);
+ALTER TABLE funding_intents ADD CONSTRAINT funding_intents_scope_pair_check
+ CHECK ((environment IS NULL AND provider_account_scope IS NULL) OR
+        (environment IN ('SANDBOX','LIVE') AND length(provider_account_scope)>0));
+ALTER TABLE funding_receipts ADD CONSTRAINT funding_receipts_scope_pair_check
+ CHECK ((environment IS NULL AND provider_account_scope IS NULL) OR
+        (environment IN ('SANDBOX','LIVE') AND length(provider_account_scope)>0));
+CREATE OR REPLACE FUNCTION require_funding_intent_scope() RETURNS trigger AS $$
+BEGIN
+ IF NEW.environment IS NULL OR NEW.provider_account_scope IS NULL OR length(NEW.provider_account_scope)=0 THEN
+  RAISE EXCEPTION 'new funding intent requires environment and provider account scope' USING ERRCODE='23514';
+ END IF;
+ RETURN NEW;
+END; $$ LANGUAGE plpgsql;
+CREATE TRIGGER funding_intents_scope_required BEFORE INSERT ON funding_intents
+ FOR EACH ROW EXECUTE FUNCTION require_funding_intent_scope();
+CREATE OR REPLACE FUNCTION verify_funding_receipt_intent_link() RETURNS trigger AS $$
+DECLARE linked funding_intents%ROWTYPE;
+BEGIN
+ SELECT * INTO linked FROM funding_intents WHERE intent_id=NEW.intent_id;
+ IF linked.intent_id IS NULL OR linked.provider<>NEW.provider OR linked.environment<>NEW.environment OR
+   linked.provider_account_scope<>NEW.provider_account_scope OR linked.cell_id<>NEW.cell_id OR
+   linked.payer<>NEW.payer OR linked.payee<>NEW.payee OR linked.amount<>NEW.amount OR
+   linked.currency<>NEW.currency OR linked.destination_id<>NEW.destination_id THEN
+  RAISE EXCEPTION 'funding receipt must match its immutable scoped intent' USING ERRCODE='23514';
+ END IF;
+ RETURN NEW;
+END; $$ LANGUAGE plpgsql;
+CREATE TABLE provider_negative_dispositions (
+ resolution_id TEXT PRIMARY KEY CHECK(length(resolution_id)>0),
+ source_negative_observation_id CHAR(64) NOT NULL REFERENCES provider_negative_observations(observation_id) ON DELETE RESTRICT,
+ provider TEXT NOT NULL, environment TEXT NOT NULL CHECK(environment IN ('SANDBOX','LIVE')),
+ provider_account_scope TEXT NOT NULL CHECK(length(provider_account_scope)>0),
+ provider_observation_id TEXT NOT NULL, provider_transaction_id TEXT NOT NULL,
+ intent_id TEXT NOT NULL REFERENCES funding_intents(intent_id) ON DELETE RESTRICT,
+ receipt_id TEXT NOT NULL REFERENCES funding_receipts(receipt_id) ON DELETE RESTRICT,
+ cell_id TEXT NOT NULL, amount NUMERIC(31,0) NOT NULL CHECK(amount>0), currency TEXT NOT NULL CHECK(length(currency)>0),
+ disposition_status TEXT NOT NULL CHECK(disposition_status IN ('PENDING','RESOLVED','CLOSED')),
+ outcome TEXT NOT NULL CHECK(outcome IN ('PENDING','FUNDS_RETAINED','FUNDS_LOST')),
+ version BIGINT NOT NULL CHECK(version>0), evidence_reference TEXT NOT NULL CHECK(length(evidence_reference)>0),
+ evidence_digest CHAR(64) NOT NULL CHECK(evidence_digest ~ '^[0-9a-f]{64}$'),
+ observed_at BIGINT NOT NULL CHECK(observed_at>=0), recorded_at BIGINT NOT NULL CHECK(recorded_at>=0),
+ resolver_principal_id TEXT NOT NULL REFERENCES principals(principal_id) ON DELETE RESTRICT,
+ resolver_capability TEXT NOT NULL CHECK(resolver_capability='RESOLVE_FUNDING_NEGATIVE'),
+ FOREIGN KEY(resolver_principal_id,resolver_capability)
+   REFERENCES principal_capabilities(principal_id,capability) ON DELETE RESTRICT,
+ CHECK((disposition_status='PENDING' AND outcome='PENDING') OR
+       (disposition_status IN ('RESOLVED','CLOSED') AND outcome IN ('FUNDS_RETAINED','FUNDS_LOST'))),
+ UNIQUE(source_negative_observation_id,version), UNIQUE(source_negative_observation_id,evidence_digest)
+);
+CREATE INDEX provider_negative_disposition_latest ON provider_negative_dispositions(source_negative_observation_id,version DESC);
+CREATE TRIGGER provider_negative_dispositions_immutable BEFORE UPDATE OR DELETE ON provider_negative_dispositions
+ FOR EACH ROW EXECUTE FUNCTION prevent_provider_negative_mutation();
+CREATE OR REPLACE FUNCTION verify_provider_negative_disposition_binding() RETURNS trigger AS $$
+DECLARE n provider_negative_observations%ROWTYPE; r funding_receipts%ROWTYPE;
+BEGIN
+ SELECT * INTO n FROM provider_negative_observations WHERE observation_id=NEW.source_negative_observation_id;
+ SELECT * INTO r FROM funding_receipts WHERE receipt_id=NEW.receipt_id;
+ IF n.observation_id IS NULL OR r.receipt_id IS NULL OR n.provider<>NEW.provider OR
+   n.environment<>NEW.environment OR n.provider_account_scope<>NEW.provider_account_scope OR
+   n.provider_observation_id<>NEW.provider_observation_id OR n.provider_transaction_id<>NEW.provider_transaction_id OR
+   n.intent_id<>NEW.intent_id OR n.receipt_id IS DISTINCT FROM NEW.receipt_id OR n.cell_id IS DISTINCT FROM NEW.cell_id OR
+   r.provider<>NEW.provider OR r.environment<>NEW.environment OR r.provider_account_scope<>NEW.provider_account_scope OR
+   r.provider_transaction_id<>NEW.provider_transaction_id OR r.intent_id<>NEW.intent_id OR r.cell_id<>NEW.cell_id OR
+   r.amount<>NEW.amount OR r.currency<>NEW.currency OR
+   (NEW.outcome='FUNDS_RETAINED' AND (n.amount_minor IS NULL OR n.amount_minor<>r.amount OR n.currency<>r.currency)) THEN
+  RAISE EXCEPTION 'negative disposition must match verified source and receipt binding' USING ERRCODE='23514';
+ END IF;
+ RETURN NEW;
+END; $$ LANGUAGE plpgsql;
+CREATE CONSTRAINT TRIGGER provider_negative_disposition_binding
+ AFTER INSERT ON provider_negative_dispositions DEFERRABLE INITIALLY DEFERRED
+ FOR EACH ROW EXECUTE FUNCTION verify_provider_negative_disposition_binding();
+ALTER TABLE principal_capabilities DROP CONSTRAINT IF EXISTS principal_capabilities_capability_check;
+ALTER TABLE principal_capabilities ADD CONSTRAINT principal_capabilities_capability_check
+ CHECK(capability IN ('ACT_AS_SELF','CONFIRM_FUNDING','RESOLVE_FUNDING_NEGATIVE'));
+CREATE OR REPLACE FUNCTION enforce_principal_capability() RETURNS trigger AS $$
+DECLARE ptype TEXT;
+BEGIN
+ SELECT principal_type INTO ptype FROM principals WHERE principal_id=NEW.principal_id;
+ IF (ptype='ACTOR' AND NEW.capability='ACT_AS_SELF') OR
+    (ptype='GATEWAY' AND NEW.capability IN ('CONFIRM_FUNDING','RESOLVE_FUNDING_NEGATIVE')) THEN RETURN NEW; END IF;
+ RAISE EXCEPTION 'capability not allowed for principal type' USING ERRCODE='23514';
+END; $$ LANGUAGE plpgsql;
+`;
+
 export class SchemaVersionError extends Error {
   constructor(message: string) { super(message); this.name = 'SchemaVersionError'; }
 }
@@ -427,6 +680,21 @@ export class PostgresMigrator {
         await client.query(PROVIDER_FOUNDATION_SCHEMA);
         await client.query('INSERT INTO schema_migrations(version,name) VALUES (7,$1)',
           ['provider-neutral-evidence-reconciliation']);
+      }
+      if (!applied.has(8)) {
+        await client.query(FUNDING_FOUNDATION_V8_SCHEMA);
+        await client.query('INSERT INTO schema_migrations(version,name) VALUES (8,$1)',
+          ['funding-route-observation-inbox-lifecycle']);
+      }
+      if (!applied.has(9)) {
+        await client.query(PROVIDER_NEGATIVE_SCOPE_UNIQUE_V9_SCHEMA);
+        await client.query('INSERT INTO schema_migrations(version,name) VALUES (9,$1)',
+          ['provider-negative-observation-account-scope-unique']);
+      }
+      if (!applied.has(10)) {
+        await client.query(FUNDING_ACCOUNT_SCOPE_V10_SCHEMA);
+        await client.query('INSERT INTO schema_migrations(version,name) VALUES (10,$1)',
+          ['account-scoped-funding-and-negative-dispositions']);
       }
       await client.query('COMMIT');
     } catch (error) {

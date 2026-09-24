@@ -15,9 +15,12 @@ export class InMemoryCommandExecutionStore implements CommandExecutionStore {
   private readonly records = new Map<CommandId, RecordEntry>();
   private readonly tails = new Map<CommandId, Promise<void>>();
 
-  private readonly fundingReceiptStore = new InMemoryFundingReceiptStore();
+  private readonly fundingReceiptStore: FundingReceiptStore;
 
-  constructor(private readonly eventStore: EventStore, private readonly fundingDisputeStore: FundingDisputeStore) {}
+  constructor(private readonly eventStore: EventStore, private readonly fundingDisputeStore: FundingDisputeStore,
+    fundingReceiptStore: FundingReceiptStore = new InMemoryFundingReceiptStore()) {
+    this.fundingReceiptStore = fundingReceiptStore;
+  }
 
   execute(
     commandId: CommandId,

@@ -71,7 +71,7 @@ async function execute() {
   try {
     assert.deepEqual(
       (await smokePool.query('SELECT version FROM schema_migrations ORDER BY version')).rows,
-      [{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }],
+      [{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }],
     );
   } finally {
     await smokePool.end();

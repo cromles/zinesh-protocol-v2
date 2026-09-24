@@ -3,10 +3,11 @@ import type { ExpectedFundingBinding } from './types';
 import type { NormalizedProviderEvidence } from './provider-evidence';
 import { assessProviderEvidence } from './provider-evidence-contract';
 
-const expected: ExpectedFundingBinding = { intentId:'intent-1',gatewayPrincipalId:'gateway',
+const expected: ExpectedFundingBinding = { intentId:'intent-1',environment:'SANDBOX',providerAccountScope:'account-test',gatewayPrincipalId:'gateway',
   cellId:makeCellId('cell-1'),payer:makeActorId('payer'),payee:makeActorId('payee'),
   amount:makeAmount(100n),currency:'TRY',destinationId:'custody-1' };
 const evidence: NormalizedProviderEvidence = { schemaVersion:1,provider:'provider',environment:'SANDBOX',
+  providerAccountScope:'account-test',providerTransactionId:'tx-1',
   intentId:'intent-1',providerPaymentId:'payment-1',providerConversationId:'conversation-1',
   destinationReference:'custody-1',amountMinor:makeAmount(100n),currency:'TRY',providerStatus:'CAPTURED',
   reconciliationState:'FUNDS_HELD',queriedAt:makeTimestamp(100),responseAuthenticity:'VERIFIED',

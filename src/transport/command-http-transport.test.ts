@@ -146,7 +146,7 @@ describe('Phase 7E real HTTP trusted command transport', () => {
     const h = await setup();
     await post(h, { command: command('funding-route', '4200') });
     await h.persistence.fundingIntentStore.create(createFundingIntent({
-      intentId: 'transport-intent', provider: 'test-provider', cellId: makeCellId('cell-funding-route'),
+      intentId: 'transport-intent', provider: 'test-provider', environment: 'SANDBOX', providerAccountScope: 'account-test', cellId: makeCellId('cell-funding-route'),
       payer: PAYER, payee: PAYEE, amount: makeAmount(4200n), currency: 'TRY',
       destinationId: 'transport-custody',
       createdAt: makeTimestamp(800_000), expiresAt: makeTimestamp(2_000_000),
@@ -170,7 +170,7 @@ describe('Phase 7E real HTTP trusted command transport', () => {
     await post(h, { command: command('dispute-route', '4200') });
     const cellId = makeCellId('cell-dispute-route');
     await h.persistence.fundingIntentStore.create(createFundingIntent({
-      intentId: 'transport-dispute-intent', provider: 'test-provider', cellId, payer: PAYER, payee: PAYEE,
+      intentId: 'transport-dispute-intent', provider: 'test-provider', environment: 'SANDBOX', providerAccountScope: 'account-test', cellId, payer: PAYER, payee: PAYEE,
       amount: makeAmount(4200n), currency: 'TRY', destinationId: 'transport-custody',
       createdAt: makeTimestamp(800_000), expiresAt: makeTimestamp(2_000_000),
     }));
