@@ -106,7 +106,7 @@ const OUTCOMES = new Set<SecurityEventOutcome>([
 const SAFE_TOKEN = /^[A-Z][A-Z0-9_]{0,63}$/;
 const SAFE_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const COMMAND_TYPES = new Set([
-  'CreateCell', 'FundCell', 'RequestRelease', 'ApproveRelease', 'RequestRefund',
+  'CreateCell', 'AcceptCell', 'RejectCell', 'FundCell', 'RequestRelease', 'ApproveRelease', 'RequestRefund',
   'ApproveRefund', 'ForceRefund', 'ExpireCell', 'OpenDispute', 'ResolveDispute',
 ]);
 const METRIC_ACTIONS = new Set([

@@ -21,6 +21,9 @@ import { CommandHttpsTransport } from '../transport/command-https-transport';
 import { selfSignedTestCertificate } from '../transport/tls-test-certificate';
 import { SecurityTelemetry } from '../security/security-observability';
 import type { SecurityEvent } from '../security/security-observability';
+import { DEVELOPMENT_IDENTITY_ISSUER, DevelopmentIdentityIssuer } from '../development/development-identity-issuer';
+import { provisionDevelopmentActors } from '../development/provision-development-actors';
+import { createDevelopmentHttpServerFactory, DEVELOPMENT_TOKEN_PATH } from '../development/development-http';
 
 const enabled = process.env['ZINESH_POSTGRES_TESTS'] === 'true';
 const maybeDescribe = enabled ? describe : describe.skip;
@@ -76,6 +79,75 @@ maybeDescribe('Phase 7C PostgreSQL Principal Authority', () => {
     expect(resolved).toMatchObject({ principalId: 'actor-1', type: 'ACTOR', actorId: ACTOR, enabled: true, mappingVersion: 1 });
   });
 
+  test('provisions the fixed development actors idempotently and resolves their real JWT identities', async () => {
+    const first = await provisionDevelopmentActors(authority, context('development-bootstrap-first'));
+    expect(first.map((item) => item.outcome)).toEqual(['CREATED', 'CREATED']);
+    const second = await provisionDevelopmentActors(authority, context('development-bootstrap-second'));
+    expect(second.map((item) => item.outcome)).toEqual(['UNCHANGED', 'UNCHANGED']);
+    expect((await pool.query('SELECT count(*)::int AS count FROM principals')).rows[0]).toEqual({ count: 2 });
+
+    const issuer = new DevelopmentIdentityIssuer();
+    const jwtConfig = issuer.authenticationConfig();
+    const authentication = new JwtAuthenticationAdapter(jwtConfig,
+      new CachedJwksProvider(issuer, jwtConfig.jwksCacheTtlMs, jwtConfig.jwksTimeoutMs));
+    const payerIdentity = await authentication.authenticate(issuer.issue('PAYER'));
+    const payeeIdentity = await authentication.authenticate(issuer.issue('PAYEE'));
+    expect(payerIdentity.ok).toBe(true);
+    expect(payeeIdentity.ok).toBe(true);
+    if (!payerIdentity.ok || !payeeIdentity.ok) throw new Error('Development JWT verification failed');
+
+    const payer = await authority.resolve(payerIdentity.identity);
+    const payee = await authority.resolve(payeeIdentity.identity);
+    expect(payer).toMatchObject({ principalId: 'development-principal-payer', type: 'ACTOR',
+      actorId: makeActorId('development-payer'), enabled: true, capabilities: ['ACT_AS_SELF'] });
+    expect(payee).toMatchObject({ principalId: 'development-principal-payee', type: 'ACTOR',
+      actorId: makeActorId('development-payee'), enabled: true, capabilities: ['ACT_AS_SELF'] });
+    expect(payer?.actorId).not.toBe(payee?.actorId);
+    expect(payerIdentity.identity).toEqual({ issuer: DEVELOPMENT_IDENTITY_ISSUER, subject: 'development-payer' });
+    expect(payeeIdentity.identity).toEqual({ issuer: DEVELOPMENT_IDENTITY_ISSUER, subject: 'development-payee' });
+  });
+
+  test('browser bootstrap token resolves through JWT authentication and PostgreSQL principal authority', async () => {
+    await provisionDevelopmentActors(authority, context('development-browser-bootstrap'));
+    const issuer = new DevelopmentIdentityIssuer();
+    const jwtConfig = issuer.authenticationConfig();
+    const authentication = new JwtAuthenticationAdapter(jwtConfig,
+      new CachedJwksProvider(issuer, jwtConfig.jwksCacheTtlMs, jwtConfig.jwksTimeoutMs));
+    const server = createDevelopmentHttpServerFactory(issuer, 'http://localhost:5173', 16_384)(
+      (_request, response) => { response.statusCode = 404; response.end(); },
+    );
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', () => { server.off('error', reject); resolve(); });
+    });
+    const address = server.address();
+    if (address === null || typeof address === 'string') throw new Error('Development token server did not bind');
+    try {
+      for (const role of ['payer', 'payee'] as const) {
+        const response = await fetch(`http://127.0.0.1:${address.port}${DEVELOPMENT_TOKEN_PATH}`, {
+          method: 'POST',
+          headers: { origin: 'http://localhost:5173', 'content-type': 'application/json' },
+          body: JSON.stringify({ role }),
+        });
+        expect(response.status).toBe(200);
+        const token = (await response.json() as { token: string }).token;
+        const identity = await authentication.authenticate(token);
+        expect(identity.ok).toBe(true);
+        if (!identity.ok) throw new Error('Development browser token was not authenticated');
+        const principal = await authority.resolve(identity.identity);
+        expect(principal).toMatchObject({
+          principalId: role === 'payer' ? 'development-principal-payer' : 'development-principal-payee',
+          type: 'ACTOR',
+          actorId: makeActorId(role === 'payer' ? 'development-payer' : 'development-payee'),
+          enabled: true,
+          capabilities: ['ACT_AS_SELF'],
+        });
+      }
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
   test('rejects invalid type/ActorId shapes at authority and database levels', async () => {
     expect((await authority.create({
       principalId: 'missing', type: 'ACTOR', identity: { issuer: 'issuer-a', subject: 'missing' },
@@ -129,7 +201,7 @@ maybeDescribe('Phase 7C PostgreSQL Principal Authority', () => {
     );
     const result = await ingress.handle({ credential: 'rotated-credential', command: {
       commandId: 'disabled-command' as never, cellId: 'disabled-cell' as never, type: 'CreateCell',
-      payload: { payer: ACTOR, payee: ACTOR_2, amount: 100n as never, currency: 'TRY',
+      payload: { payer: ACTOR, payee: ACTOR_2, description: 'Disabled principal test.', amount: 100n as never, currency: 'TRY',
         fundingDeadline: 2 as never, completionDeadline: 3 as never },
     } });
     expect(result.outcome).toBe('APPLICATION_REJECTION');
@@ -202,7 +274,7 @@ maybeDescribe('Phase 7C PostgreSQL Principal Authority', () => {
     const cellId = makeCellId('history-cell');
     const command = {
       commandId: makeCommandId('history-command'), cellId, type: 'CreateCell' as const,
-      payload: { payer: ACTOR, payee: ACTOR_2, amount: makeAmount(10000n), currency: 'TRY' as const,
+      payload: { payer: ACTOR, payee: ACTOR_2, description: 'Authority history agreement.', amount: makeAmount(10000n), currency: 'TRY' as const,
         fundingDeadline: makeTimestamp(2_000_000), completionDeadline: makeTimestamp(5_000_000) },
     };
     expect((await ingress.handle({ credential: 'first', command })).outcome).toBe('SUCCESS');
@@ -241,7 +313,7 @@ maybeDescribe('Phase 7C PostgreSQL Principal Authority', () => {
       const signature = sign('RSA-SHA256', Buffer.from(`${header}.${claims}`), pair.privateKey).toString('base64url');
       const result = await runtime.handleCommand({ credential: `${header}.${claims}.${signature}`, command: {
         commandId: makeCommandId('crypto-command'), cellId: makeCellId('crypto-cell'), type: 'CreateCell',
-        payload: { payer: ACTOR, payee: ACTOR_2, amount: makeAmount(10000n), currency: 'TRY',
+        payload: { payer: ACTOR, payee: ACTOR_2, description: 'Cryptographic identity agreement.', amount: makeAmount(10000n), currency: 'TRY',
           fundingDeadline: makeTimestamp(2_000_000), completionDeadline: makeTimestamp(5_000_000) },
       } });
       expect(result.outcome).toBe('SUCCESS');
@@ -292,7 +364,7 @@ maybeDescribe('Phase 7C PostgreSQL Principal Authority', () => {
       const token = `${header}.${claims}.${signature}`;
       const body = JSON.stringify({ command: {
         commandId: 'http-postgres-command', cellId: 'http-postgres-cell', type: 'CreateCell',
-        payload: { payer: ACTOR, payee: ACTOR_2, amount: '900719925474099312345', currency: 'TRY',
+        payload: { payer: ACTOR, payee: ACTOR_2, description: 'HTTPS identity agreement.', amount: '900719925474099312345', currency: 'TRY',
           fundingDeadline: 2_000_000, completionDeadline: 5_000_000 },
       } });
       const invoke = async () => new Promise<{ status: number; value: { nextState: { amount: string } } }>((resolve, reject) => {

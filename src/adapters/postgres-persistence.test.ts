@@ -84,6 +84,10 @@ import type { FundingObservation, FundingRoute } from '../funding/funding-founda
 import type { ProviderEvent, ProviderNegativeObservation,
   ProviderTransactionCorrelation } from '../funding/provider-evidence';
 import { providerIdentityHash } from '../funding/provider-identity';
+import { CellApplication } from '../application/cell-application';
+import { fixedClock } from '../application/clock';
+import { createEventIdFactory } from '../application/event-id-factory';
+import { actorIdentity, createTestIngress } from '../security/testing';
 
 // ---------------------------------------------------------------------------
 // Skip guard — tests require a real PostgreSQL instance
@@ -197,6 +201,8 @@ async function verifyAuthenticatedTlsBoundary(): Promise<void> {
 
 const PAYER  = makeActorId('payer-1');
 const PAYEE  = makeActorId('payee-1');
+const OTHER_ACTOR = makeActorId('other-actor-pg');
+const DIRECTORY_THIRD_ACTOR = makeActorId('directory-third-actor-pg');
 const AMOUNT = makeAmount(10000n);
 const T1 = makeTimestamp(1_000_000);
 const T2 = makeTimestamp(2_000_000);
@@ -569,7 +575,7 @@ maybeDescribe('PostgreSQL Persistence', () => {
       cellId:  CELL,
       version: V2,
       state: {
-        cellId: CELL, status: 'FUNDED' as const,
+        cellId: CELL, status: 'FUNDED' as const, acceptanceStatus: 'ACCEPTED' as const,
         payer: PAYER, payee: PAYEE, amount: AMOUNT, currency: 'TRY' as const,
         fundingDeadline: T1, completionDeadline: T3, fundedAt: T2,
       },
@@ -583,7 +589,7 @@ maybeDescribe('PostgreSQL Persistence', () => {
       cellId:  CELL,
       version: V2,
       state: {
-        cellId: CELL, status: 'FUNDED' as const,
+        cellId: CELL, status: 'FUNDED' as const, acceptanceStatus: 'ACCEPTED' as const,
         payer: PAYER, payee: PAYEE, amount: AMOUNT, currency: 'TRY' as const,
         fundingDeadline: T1, completionDeadline: T3, fundedAt: T2,
       },
@@ -602,7 +608,7 @@ maybeDescribe('PostgreSQL Persistence', () => {
   test('22. snapshot upsert replaces previous snapshot', async () => {
     const CELL = freshCellId();
     const base = {
-      cellId: CELL, status: 'FUNDED' as const,
+      cellId: CELL, status: 'FUNDED' as const, acceptanceStatus: 'ACCEPTED' as const,
       payer: PAYER, payee: PAYEE, amount: AMOUNT, currency: 'TRY' as const,
       fundingDeadline: T1, completionDeadline: T3,
     };
@@ -619,7 +625,7 @@ maybeDescribe('PostgreSQL Persistence', () => {
   test('23. snapshot version is preserved', async () => {
     const CELL = freshCellId();
     const state = {
-      cellId: CELL, status: 'FUNDED' as const,
+      cellId: CELL, status: 'FUNDED' as const, acceptanceStatus: 'ACCEPTED' as const,
       payer: PAYER, payee: PAYEE, amount: AMOUNT, currency: 'TRY' as const,
       fundingDeadline: T1, completionDeadline: T3,
     };
@@ -636,11 +642,11 @@ maybeDescribe('PostgreSQL Persistence', () => {
     const CELL_A = freshCellId();
     const CELL_B = freshCellId();
     const stateA = {
-      cellId: CELL_A, status: 'FUNDED' as const,
+      cellId: CELL_A, status: 'FUNDED' as const, acceptanceStatus: 'ACCEPTED' as const,
       payer: PAYER, payee: PAYEE, amount: AMOUNT, currency: 'TRY' as const,
       fundingDeadline: T1, completionDeadline: T3,
     };
-    const stateB = { ...stateA, cellId: CELL_B, status: 'CREATED' as const };
+    const stateB = { ...stateA, cellId: CELL_B, status: 'CREATED' as const, acceptanceStatus: 'PENDING' as const };
     await adapter.snapshotStore.save(CELL_A, { cellId: CELL_A, version: V1, state: stateA });
     await adapter.snapshotStore.save(CELL_B, { cellId: CELL_B, version: V2, state: stateB });
     const loadedA = await adapter.snapshotStore.load(CELL_A);
@@ -657,7 +663,7 @@ maybeDescribe('PostgreSQL Persistence', () => {
     const CELL = freshCellId();
     await adapter.eventStore.append(CELL, [makeEvent(CELL, V1), makeFundedEvent(CELL, V2)]);
     const state = {
-      cellId: CELL, status: 'FUNDED' as const,
+      cellId: CELL, status: 'FUNDED' as const, acceptanceStatus: 'ACCEPTED' as const,
       payer: PAYER, payee: PAYEE, amount: AMOUNT, currency: 'TRY' as const,
       fundingDeadline: T1, completionDeadline: T3, fundedAt: T2,
     };
@@ -705,7 +711,7 @@ maybeDescribe('PostgreSQL Persistence', () => {
         cellId: CELL,
         type: 'CreateCell',
         payload: {
-          payer: PAYER, payee: PAYEE, amount: AMOUNT, currency: 'TRY',
+          payer: PAYER, payee: PAYEE, description: 'Postgres replay agreement.', amount: AMOUNT, currency: 'TRY',
           fundingDeadline: T1, completionDeadline: T3,
         },
       },
@@ -717,6 +723,23 @@ maybeDescribe('PostgreSQL Persistence', () => {
     await adapter.eventStore.append(CELL, createResult.events);
     kernelState = createResult.nextState;
 
+    // Acceptance is distinct from funding for newly created cells.
+    const acceptResult = cellKernel.applyCommand(
+      kernelState,
+      {
+        commandId: makeCommandId('cmd-accept'),
+        cellId: CELL,
+        type: 'AcceptCell',
+        payload: { acceptedBy: PAYEE },
+      },
+      nextVersion(nextVersion(ZERO_VERSION)),
+      { now: T1, nextEventId: (i) => makeEventId(`pg-evt-${++evtCounter}-${i}`) },
+    );
+    expect(acceptResult.ok).toBe(true);
+    if (!acceptResult.ok) return;
+    await adapter.eventStore.append(CELL, acceptResult.events);
+    kernelState = acceptResult.nextState;
+
     // Apply FundCell command
     const fundResult = cellKernel.applyCommand(
       kernelState,
@@ -726,7 +749,7 @@ maybeDescribe('PostgreSQL Persistence', () => {
         type: 'FundCell',
         payload: { funderId: PAYER, amount: AMOUNT },
       },
-      nextVersion(nextVersion(ZERO_VERSION)),
+      nextVersion(nextVersion(nextVersion(ZERO_VERSION))),
       { now: T2, nextEventId: (i) => makeEventId(`pg-evt-${++evtCounter}-${i}`) },
     );
     expect(fundResult.ok).toBe(true);
@@ -735,7 +758,7 @@ maybeDescribe('PostgreSQL Persistence', () => {
 
     // Reload events from DB and replay through kernel
     const reloadedEvents = await adapter.eventStore.getEvents(CELL);
-    expect(reloadedEvents).toHaveLength(2);
+    expect(reloadedEvents).toHaveLength(3);
 
     const replayedState = cellKernel.evolve(CELL, reloadedEvents);
     expect('code' in replayedState).toBe(false);
@@ -769,7 +792,7 @@ maybeDescribe('PostgreSQL Persistence', () => {
 
     // Save a stale snapshot at V1
     const staleState = {
-      cellId: CELL, status: 'CREATED' as const,
+      cellId: CELL, status: 'CREATED' as const, acceptanceStatus: 'PENDING' as const,
       payer: PAYER, payee: PAYEE, amount: AMOUNT, currency: 'TRY' as const,
       fundingDeadline: T1, completionDeadline: T3,
     };
@@ -1255,6 +1278,30 @@ maybeDescribe('PostgreSQL Persistence', () => {
       [observation.observationId])).rejects.toThrow(/append-only/i);
     expect((await pool.query('SELECT count(*)::int AS count FROM funding_receipts WHERE receipt_id=$1',
       [receipt.receiptId])).rows[0]).toEqual({count:1});
+  });
+
+  test('actor cell directory returns only participant cells', async () => {
+    const payerCell = freshCellId();
+    const payeeCell = freshCellId();
+    const unrelatedCell = freshCellId();
+    const application = new CellApplication({ persistence: adapter, kernel: cellKernel, clock: fixedClock(T1),
+      eventIds: createEventIdFactory(`actor-directory-${++evtCounter}`) });
+    const ingress = createTestIngress(application,
+      [actorIdentity(PAYER), actorIdentity(PAYEE), actorIdentity(OTHER_ACTOR), actorIdentity(DIRECTORY_THIRD_ACTOR)]);
+    const create = (credential: string, cellId: CellId, payer: ReturnType<typeof makeActorId>,
+      payee: ReturnType<typeof makeActorId>, commandId: string) => ingress.handle({ credential, command: {
+      commandId: makeCommandId(commandId), cellId, type: 'CreateCell', payload: { payer, payee,
+        description: 'Postgres actor directory agreement.', amount: AMOUNT,
+        currency: 'TRY', fundingDeadline: T2, completionDeadline: T3 },
+    } });
+    expect((await create(`test-credential-${PAYER}`, payerCell, PAYER, PAYEE, 'directory-payer')).outcome).toBe('SUCCESS');
+    expect((await create(`test-credential-${OTHER_ACTOR}`, payeeCell, OTHER_ACTOR, PAYER, 'directory-payee')).outcome).toBe('SUCCESS');
+    expect((await create(`test-credential-${OTHER_ACTOR}`, unrelatedCell, OTHER_ACTOR, DIRECTORY_THIRD_ACTOR,
+      'directory-unrelated')).outcome).toBe('SUCCESS');
+    expect((await adapter.eventStore.getEventsForActor(PAYER)).map((event) => event.cellId))
+      .toEqual([payerCell, payeeCell]);
+    expect((await adapter.eventStore.getEventsForActor(OTHER_ACTOR)).map((event) => event.cellId))
+      .toEqual([payeeCell, unrelatedCell]);
   });
 
   test('V10 persists scoped receipt bindings and append-only negative dispositions idempotently', async () => {

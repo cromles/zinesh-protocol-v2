@@ -8,13 +8,14 @@
  *   - Store does NOT generate version, timestamp, or eventId
  *   - Store does NOT reorder supplied events
  *   - Store does NOT modify payload
- *   - All queries are scoped to a single cellId — no cross-cell access
+ *   - Cell history queries are scoped to one cell; directory lookup is restricted to cells
+ *     whose immutable creation event includes the requested actor as payer or payee
  *   - getEvents / getEventsSince return defensive copies
  *
  * All methods are async to be compatible with future PostgreSQL implementation.
  */
 
-import type { CellId, Event, Version } from '../core/types';
+import type { ActorId, CellId, Event, Version } from '../core/types';
 
 export interface EventStoreError {
   readonly kind: 'APPEND_VERSION_CONFLICT' | 'APPEND_INTEGRITY_ERROR';
@@ -50,6 +51,9 @@ export interface EventStore {
    * Returns a defensive copy — callers cannot mutate the store through the result.
    */
   getEvents(cellId: CellId): Promise<ReadonlyArray<Event>>;
+
+  /** Retrieve event streams only for cells whose immutable creation event includes this actor. */
+  getEventsForActor(actorId: ActorId): Promise<ReadonlyArray<Event>>;
 
   /**
    * Retrieve events for a cell with version strictly greater than afterVersion,

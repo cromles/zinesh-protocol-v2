@@ -80,6 +80,7 @@ function createCellPayload(opts: { arbiter?: ActorId } = {}) {
   return {
     payer: PAYER,
     payee: PAYEE,
+    description: 'Test agreement description.',
     amount: AMOUNT,
     currency: 'TRY' as const,
     fundingDeadline: T_FUNDING_DEADLINE,
@@ -240,11 +241,15 @@ async function createCell(
   cellId: CellId,
   opts: { arbiter?: ActorId } = {},
 ) {
-  return expectSuccess(
+  const created = await expectSuccess(
     await harness.app.handleCommand(
       request(cmd('CreateCell', createCellPayload(opts), cellId)),
     ),
   );
+  await expectSuccess(await harness.app.handleCommand(request(
+    cmd('AcceptCell', { acceptedBy: PAYEE }, cellId), { actor: PAYEE },
+  )));
+  return created;
 }
 
 async function fundCell(harness: AppHarness, cellId: CellId, funderId: ActorId = PAYER) {
@@ -287,7 +292,9 @@ describe('1. CreateCell through Application succeeds', () => {
   test('CreateCell persists CellCreated and returns FUNDED-ready CREATED state', async () => {
     const harness = makeApp();
     const cellId = nextCellId();
-    const result = await createCell(harness, cellId);
+    const result = await expectSuccess(await harness.app.handleCommand(
+      request(cmd('CreateCell', createCellPayload(), cellId)),
+    ));
 
     expect(result.nextState.status).toBe('CREATED');
     expect(result.nextState.payer).toBe(PAYER);
@@ -357,6 +364,42 @@ describe('Phase 7A command execution boundary', () => {
   });
 });
 
+describe('bilateral agreement acceptance', () => {
+  test('only payee may accept/reject; acceptance is idempotent and funding remains separately authorized', async () => {
+    const h = makeApp(); const cellId = nextCellId();
+    await expectSuccess(await h.app.handleCommand(request(cmd('CreateCell', createCellPayload(), cellId))));
+    const payerAttempt = await h.app.handleCommand(request(cmd('AcceptCell', { acceptedBy: PAYEE }, cellId), { actor: PAYER }));
+    expect(payerAttempt).toMatchObject({ outcome: 'APPLICATION_REJECTION', error: { code: 'ACTOR_MISMATCH' } });
+    const acceptedCommand = cmd('AcceptCell', { acceptedBy: PAYEE }, cellId);
+    const accepted = await h.app.handleCommand(request(acceptedCommand, { actor: PAYEE }));
+    expect(accepted).toMatchObject({ outcome: 'SUCCESS', nextState: { status: 'CREATED', acceptanceStatus: 'ACCEPTED' } });
+    expect(await h.app.handleCommand(request(acceptedCommand, { actor: PAYEE }))).toEqual(accepted);
+    const second = await h.app.handleCommand(request(cmd('AcceptCell', { acceptedBy: PAYEE }, cellId), { actor: PAYEE }));
+    expect(second).toMatchObject({ outcome: 'KERNEL_REJECTION', error: { code: 'ILLEGAL_TRANSITION' } });
+  });
+
+  test('payee rejection closes the acceptance path and blocks funding', async () => {
+    const h = makeApp(); const cellId = nextCellId();
+    await expectSuccess(await h.app.handleCommand(request(cmd('CreateCell', createCellPayload(), cellId))));
+    const rejected = await h.app.handleCommand(request(cmd('RejectCell', { rejectedBy: PAYEE }, cellId), { actor: PAYEE }));
+    expect(rejected).toMatchObject({ outcome: 'SUCCESS', nextState: { status: 'CREATED', acceptanceStatus: 'REJECTED' } });
+    const funding = await h.app.handleCommand(request(cmd('FundCell', { funderId: PAYER, amount: AMOUNT }, cellId), { gateway: gateway() }));
+    expect(funding).toMatchObject({ outcome: 'KERNEL_REJECTION', error: { code: 'ILLEGAL_TRANSITION' } });
+  });
+
+  test('accept versus reject race persists exactly one decision', async () => {
+    const h = makeApp(); const cellId = nextCellId();
+    await expectSuccess(await h.app.handleCommand(request(cmd('CreateCell', createCellPayload(), cellId))));
+    const [accepted, rejected] = await Promise.all([
+      h.app.handleCommand(request(cmd('AcceptCell', { acceptedBy: PAYEE }, cellId), { actor: PAYEE })),
+      h.app.handleCommand(request(cmd('RejectCell', { rejectedBy: PAYEE }, cellId), { actor: PAYEE })),
+    ]);
+    expect([accepted, rejected].filter((result) => result.outcome === 'SUCCESS')).toHaveLength(1);
+    const events = await h.persistence.eventStore.getEvents(cellId);
+    expect(events.filter((event) => event.type === 'CellAccepted' || event.type === 'CellRejected')).toHaveLength(1);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // 2. Application loads existing events before command
 // ---------------------------------------------------------------------------
@@ -370,11 +413,11 @@ describe('2. Application loads existing events before command', () => {
 
     expect(funded.events).toHaveLength(1);
     expect(funded.events[0]?.type).toBe('CellFunded');
-    expect(funded.events[0]?.version).toBe(2);
+    expect(funded.events[0]?.version).toBe(3);
 
     const stored = await harness.persistence.eventStore.getEvents(cellId);
-    expect(stored.map((e) => e.type)).toEqual(['CellCreated', 'CellFunded']);
-    expect(stored.map((e) => e.version)).toEqual([1, 2]);
+    expect(stored.map((e) => e.type)).toEqual(['CellCreated', 'CellAccepted', 'CellFunded']);
+    expect(stored.map((e) => e.version)).toEqual([1, 2, 3]);
   });
 });
 
@@ -460,7 +503,7 @@ describe('5. Application does not bypass Kernel authorization', () => {
     expect(result.error.code).toBe('ACTOR_MISMATCH');
 
     const stored = await harness.persistence.eventStore.getEvents(cellId);
-    expect(stored).toHaveLength(2);
+    expect(stored).toHaveLength(3);
   });
 });
 
@@ -486,7 +529,7 @@ describe('5A. Provider funding disputes gate financial settlement outside the Ke
     expect(blocked).toMatchObject({ outcome: 'APPLICATION_REJECTION',
       error: { code: 'FUNDING_DISPUTE_BLOCKED' } });
     expect((await harness.persistence.eventStore.getEvents(cellId)).map((event) => event.type))
-      .toEqual(['CellCreated', 'CellFunded', 'ReleaseRequested']);
+      .toEqual(['CellCreated', 'CellAccepted', 'CellFunded', 'ReleaseRequested']);
 
     await harness.persistence.fundingDisputeStore.record({
       observationId: 'chargeback-won', provider: 'test-provider', providerDisputeId: 'chargeback-1',
@@ -681,8 +724,9 @@ describe('13. expectedNextVersion follows last event version', () => {
   test('second command uses lastEvent.version + 1', async () => {
     const harness = makeApp();
     const cellId = nextCellId();
-    const created = await createCell(harness, cellId);
-    const last = created.events[created.events.length - 1];
+    await createCell(harness, cellId);
+    const stream = await harness.persistence.eventStore.getEvents(cellId);
+    const last = stream[stream.length - 1];
     expect(last).toBeDefined();
 
     const funded = await fundCell(harness, cellId);
@@ -721,8 +765,8 @@ describe('14. Multi-event ResolveDispute receives distinct event IDs', () => {
     expect(resolved.events[0]?.type).toBe('DisputeResolved');
     expect(resolved.events[1]?.type).toBe('Released');
     expect(resolved.events[0]?.eventId).not.toBe(resolved.events[1]?.eventId);
-    expect(resolved.events[0]?.version).toBe(4);
-    expect(resolved.events[1]?.version).toBe(5);
+    expect(resolved.events[0]?.version).toBe(5);
+    expect(resolved.events[1]?.version).toBe(6);
   });
 });
 
@@ -764,14 +808,14 @@ describe('16. Persistence append receives exactly Kernel-produced events', () =>
   test('store contents equal Kernel result events for the command', async () => {
     const harness = makeApp();
     const cellId = nextCellId();
-    const created = await createCell(harness, cellId);
+    await createCell(harness, cellId);
     const afterCreate = await harness.persistence.eventStore.getEvents(cellId);
-    expect(afterCreate).toEqual([...created.events]);
+    expect(afterCreate.map((event) => event.type)).toEqual(['CellCreated', 'CellAccepted']);
 
     const funded = await fundCell(harness, cellId);
     const afterFund = await harness.persistence.eventStore.getEvents(cellId);
     expect(afterFund.slice(afterCreate.length)).toEqual([...funded.events]);
-    expect(afterFund).toHaveLength(created.events.length + funded.events.length);
+    expect(afterFund).toHaveLength(afterCreate.length + funded.events.length);
   });
 });
 
@@ -832,8 +876,8 @@ describe('18. No version mutation/retry occurs', () => {
     ]);
 
     const stored = await harness.persistence.eventStore.getEvents(cellId);
-    expect(stored).toHaveLength(2);
-    expect(stored.map((e) => e.version)).toEqual([1, 2]);
+    expect(stored).toHaveLength(3);
+    expect(stored.map((e) => e.version)).toEqual([1, 2, 3]);
     expect(stored.filter((e) => e.type === 'CellFunded')).toHaveLength(1);
   });
 });
@@ -846,7 +890,7 @@ describe('19. Snapshot save may occur after successful append', () => {
   test('a snapshot is stored at the resulting version after CreateCell', async () => {
     const harness = makeApp();
     const cellId = nextCellId();
-    const created = await createCell(harness, cellId);
+    const created = await expectSuccess(await harness.app.handleCommand(request(cmd('CreateCell', createCellPayload(), cellId))));
 
     const snapshot = await harness.persistence.snapshotStore.load(cellId);
     expect(snapshot).not.toBeNull();
@@ -890,7 +934,7 @@ describe('21. Application works with InMemoryPersistenceAdapter', () => {
     expect(harness.persistence).toBeInstanceOf(InMemoryPersistenceAdapter);
     const cellId = nextCellId();
     await createCell(harness, cellId);
-    expect(await harness.persistence.eventStore.getEvents(cellId)).toHaveLength(1);
+    expect(await harness.persistence.eventStore.getEvents(cellId)).toHaveLength(2);
   });
 });
 

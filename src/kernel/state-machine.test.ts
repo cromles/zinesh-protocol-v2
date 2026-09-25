@@ -100,6 +100,7 @@ function createCellPayload(opts: { arbiter?: ActorId } = {}) {
   return {
     payer:               PAYER,
     payee:               PAYEE,
+    description:         'Test agreement description.',
     amount:              AMOUNT,
     currency:            'TRY' as const,
     fundingDeadline:     T_FUNDING_DEADLINE,
@@ -135,6 +136,7 @@ function applyAll(
 function fundedState(opts: { arbiter?: ActorId } = {}): CellState {
   return applyAll([
     { cmd: makeCmd('CreateCell', createCellPayload(opts)) },
+      { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) },
     { cmd: makeCmd('FundCell', { funderId: PAYER, amount: AMOUNT }) },
   ]);
 }
@@ -176,6 +178,7 @@ describe('1. CreateCell', () => {
     expect(result.events).toHaveLength(1);
     expect(result.events[0]!.type).toBe('CellCreated');
     expect(result.nextState.status).toBe('CREATED');
+    expect(result.nextState.acceptanceStatus).toBe('PENDING');
     expect(result.nextState.payer).toBe(PAYER);
     expect(result.nextState.payee).toBe(PAYEE);
     expect(result.nextState.arbiter).toBe(ARBITER);
@@ -183,6 +186,56 @@ describe('1. CreateCell', () => {
     expect(result.nextState.currency).toBe('TRY');
     expect(result.nextState.fundingDeadline).toBe(T_FUNDING_DEADLINE);
     expect(result.nextState.completionDeadline).toBe(T_COMPLETION_DEADLINE);
+  });
+
+  test('payee can accept once without changing financial status', () => {
+    const state = applyAll([{ cmd: makeCmd('CreateCell', createCellPayload()) }]);
+    const accepted = cellKernel.applyCommand(state, makeCmd('AcceptCell', { acceptedBy: PAYEE }),
+      (ZERO_VERSION + 2) as typeof ZERO_VERSION, makeCtx());
+    expect(accepted.ok).toBe(true);
+    if (!accepted.ok) return;
+    expect(accepted.events[0]?.type).toBe('CellAccepted');
+    expect(accepted.nextState.acceptanceStatus).toBe('ACCEPTED');
+    expect(accepted.nextState.status).toBe('CREATED');
+  });
+
+  test.each([
+    ['payer', PAYER], ['third party', STRANGER],
+  ])('%s cannot accept or reject the invitation', (_name, actor) => {
+    const state = applyAll([{ cmd: makeCmd('CreateCell', createCellPayload()) }]);
+    expectFail(state, makeCmd('AcceptCell', { acceptedBy: actor }), 'AUTHORIZATION_DENIED',
+      (ZERO_VERSION + 2) as typeof ZERO_VERSION);
+    expectFail(state, makeCmd('RejectCell', { rejectedBy: actor }), 'AUTHORIZATION_DENIED',
+      (ZERO_VERSION + 2) as typeof ZERO_VERSION);
+  });
+
+  test('rejection is final and prevents acceptance and funding', () => {
+    const rejected = applyAll([
+      { cmd: makeCmd('CreateCell', createCellPayload()) },
+      { cmd: makeCmd('RejectCell', { rejectedBy: PAYEE }) },
+    ]);
+    expect(rejected.acceptanceStatus).toBe('REJECTED');
+    expectFail(rejected, makeCmd('AcceptCell', { acceptedBy: PAYEE }), 'ILLEGAL_TRANSITION',
+      (ZERO_VERSION + 3) as typeof ZERO_VERSION);
+    expectFail(rejected, makeCmd('FundCell', { funderId: PAYER, amount: AMOUNT }), 'ILLEGAL_TRANSITION',
+      (ZERO_VERSION + 3) as typeof ZERO_VERSION);
+  });
+
+  test('pending acceptance prevents funding', () => {
+    const pending = applyAll([{ cmd: makeCmd('CreateCell', createCellPayload()) }]);
+    expectFail(pending, makeCmd('FundCell', { funderId: PAYER, amount: AMOUNT }), 'ILLEGAL_TRANSITION',
+      (ZERO_VERSION + 2) as typeof ZERO_VERSION);
+  });
+
+  test('duplicate or opposite decision after acceptance is rejected', () => {
+    const accepted = applyAll([
+      { cmd: makeCmd('CreateCell', createCellPayload()) },
+      { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) },
+    ]);
+    expectFail(accepted, makeCmd('AcceptCell', { acceptedBy: PAYEE }), 'ILLEGAL_TRANSITION',
+      (ZERO_VERSION + 3) as typeof ZERO_VERSION);
+    expectFail(accepted, makeCmd('RejectCell', { rejectedBy: PAYEE }), 'ILLEGAL_TRANSITION',
+      (ZERO_VERSION + 3) as typeof ZERO_VERSION);
   });
 
   test('creates a cell without arbiter', () => {
@@ -237,7 +290,7 @@ describe('1. CreateCell', () => {
   });
 
   test('rejects double creation', () => {
-    const state = applyAll([{ cmd: makeCmd('CreateCell', createCellPayload()) }]);
+    const state = applyAll([{ cmd: makeCmd('CreateCell', createCellPayload()) }, { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) }]);
     expectFail(state, makeCmd('CreateCell', createCellPayload()), 'ILLEGAL_TRANSITION',
       nextVersion(nextVersion(ZERO_VERSION)));
   });
@@ -249,7 +302,7 @@ describe('1. CreateCell', () => {
 
 describe('2. FundCell', () => {
   test('transitions CREATED → FUNDED', () => {
-    const state = applyAll([{ cmd: makeCmd('CreateCell', createCellPayload()) }]);
+    const state = applyAll([{ cmd: makeCmd('CreateCell', createCellPayload()) }, { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) }]);
     const v2 = nextVersion(nextVersion(ZERO_VERSION));
     const result = cellKernel.applyCommand(state, makeCmd('FundCell', { funderId: PAYER, amount: AMOUNT }), v2, makeCtx());
     expect(result.ok).toBe(true);
@@ -283,7 +336,7 @@ describe('16. Double funding', () => {
 
 describe('18. Partial funding rejection', () => {
   test('rejects funding with less than cell amount', () => {
-    const state = applyAll([{ cmd: makeCmd('CreateCell', createCellPayload()) }]);
+    const state = applyAll([{ cmd: makeCmd('CreateCell', createCellPayload()) }, { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) }]);
     const v2 = nextVersion(nextVersion(ZERO_VERSION));
     const result = cellKernel.applyCommand(
       state,
@@ -297,7 +350,7 @@ describe('18. Partial funding rejection', () => {
   });
 
   test('rejects funding with more than cell amount', () => {
-    const state = applyAll([{ cmd: makeCmd('CreateCell', createCellPayload()) }]);
+    const state = applyAll([{ cmd: makeCmd('CreateCell', createCellPayload()) }, { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) }]);
     const v2 = nextVersion(nextVersion(ZERO_VERSION));
     const result = cellKernel.applyCommand(
       state,
@@ -317,7 +370,7 @@ describe('18. Partial funding rejection', () => {
 
 describe('3. ExpireCell', () => {
   test('transitions CREATED → EXPIRED after fundingDeadline', () => {
-    const state = applyAll([{ cmd: makeCmd('CreateCell', createCellPayload()) }]);
+    const state = applyAll([{ cmd: makeCmd('CreateCell', createCellPayload()) }, { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) }]);
     const v2 = nextVersion(nextVersion(ZERO_VERSION));
     const result = cellKernel.applyCommand(
       state,
@@ -332,7 +385,7 @@ describe('3. ExpireCell', () => {
   });
 
   test('rejects ExpireCell before fundingDeadline', () => {
-    const state = applyAll([{ cmd: makeCmd('CreateCell', createCellPayload()) }]);
+    const state = applyAll([{ cmd: makeCmd('CreateCell', createCellPayload()) }, { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) }]);
     const v2 = nextVersion(nextVersion(ZERO_VERSION));
     const result = cellKernel.applyCommand(
       state,
@@ -411,6 +464,7 @@ describe('5. ApproveRelease', () => {
   test("Payee approves Payer's release request → RELEASED", () => {
     const state = applyAll([
       { cmd: makeCmd('CreateCell', createCellPayload()) },
+      { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) },
       { cmd: makeCmd('FundCell', { funderId: PAYER, amount: AMOUNT }) },
       { cmd: makeCmd('RequestRelease', { requestedBy: PAYER }) },
     ]);
@@ -430,6 +484,7 @@ describe('5. ApproveRelease', () => {
   test("Payer approves Payee's release request → RELEASED", () => {
     const state = applyAll([
       { cmd: makeCmd('CreateCell', createCellPayload()) },
+      { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) },
       { cmd: makeCmd('FundCell', { funderId: PAYER, amount: AMOUNT }) },
       { cmd: makeCmd('RequestRelease', { requestedBy: PAYEE }) },
     ]);
@@ -448,6 +503,7 @@ describe('5. ApproveRelease', () => {
   test('rejects if requester tries to self-approve', () => {
     const state = applyAll([
       { cmd: makeCmd('CreateCell', createCellPayload()) },
+      { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) },
       { cmd: makeCmd('FundCell', { funderId: PAYER, amount: AMOUNT }) },
       { cmd: makeCmd('RequestRelease', { requestedBy: PAYER }) },
     ]);
@@ -480,6 +536,7 @@ describe('5. ApproveRelease', () => {
   test('stranger cannot approve release', () => {
     const state = applyAll([
       { cmd: makeCmd('CreateCell', createCellPayload()) },
+      { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) },
       { cmd: makeCmd('FundCell', { funderId: PAYER, amount: AMOUNT }) },
       { cmd: makeCmd('RequestRelease', { requestedBy: PAYER }) },
     ]);
@@ -554,6 +611,7 @@ describe('7. ApproveRefund', () => {
   test("Payee approves Payer's refund request → REFUNDED", () => {
     const state = applyAll([
       { cmd: makeCmd('CreateCell', createCellPayload()) },
+      { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) },
       { cmd: makeCmd('FundCell', { funderId: PAYER, amount: AMOUNT }) },
       { cmd: makeCmd('RequestRefund', { requestedBy: PAYER }) },
     ]);
@@ -573,6 +631,7 @@ describe('7. ApproveRefund', () => {
   test('Payer cannot self-approve refund', () => {
     const state = applyAll([
       { cmd: makeCmd('CreateCell', createCellPayload()) },
+      { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) },
       { cmd: makeCmd('FundCell', { funderId: PAYER, amount: AMOUNT }) },
       { cmd: makeCmd('RequestRefund', { requestedBy: PAYER }) },
     ]);
@@ -605,6 +664,7 @@ describe('7. ApproveRefund', () => {
   test('stranger cannot approve refund', () => {
     const state = applyAll([
       { cmd: makeCmd('CreateCell', createCellPayload()) },
+      { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) },
       { cmd: makeCmd('FundCell', { funderId: PAYER, amount: AMOUNT }) },
       { cmd: makeCmd('RequestRefund', { requestedBy: PAYER }) },
     ]);
@@ -670,7 +730,7 @@ describe('8. ForceRefund', () => {
   });
 
   test('rejects ForceRefund in CREATED state', () => {
-    const state = applyAll([{ cmd: makeCmd('CreateCell', createCellPayload()) }]);
+    const state = applyAll([{ cmd: makeCmd('CreateCell', createCellPayload()) }, { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) }]);
     const v = nextVersion(nextVersion(ZERO_VERSION));
     const result = cellKernel.applyCommand(
       state,
@@ -747,7 +807,7 @@ describe('9. OpenDispute', () => {
   });
 
   test('rejects OpenDispute on CREATED cell', () => {
-    const state = applyAll([{ cmd: makeCmd('CreateCell', createCellPayload({ arbiter: ARBITER })) }]);
+    const state = applyAll([{ cmd: makeCmd('CreateCell', createCellPayload({ arbiter: ARBITER })) }, { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) }]);
     const v = nextVersion(nextVersion(ZERO_VERSION));
     const result = cellKernel.applyCommand(
       state,
@@ -818,6 +878,7 @@ describe('10. ResolveDispute → favour payee (RELEASED)', () => {
   function disputedState(): CellState {
     return applyAll([
       { cmd: makeCmd('CreateCell', createCellPayload({ arbiter: ARBITER })) },
+      { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) },
       { cmd: makeCmd('FundCell', { funderId: PAYER, amount: AMOUNT }) },
       { cmd: makeCmd('OpenDispute', { openedBy: PAYER, currentTime: T_BEFORE_COMPLETION_DL }),
         ctx: makeCtx(T_BEFORE_COMPLETION_DL) },
@@ -853,6 +914,7 @@ describe('11. ResolveDispute → favour payer (REFUNDED)', () => {
   function disputedState(): CellState {
     return applyAll([
       { cmd: makeCmd('CreateCell', createCellPayload({ arbiter: ARBITER })) },
+      { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) },
       { cmd: makeCmd('FundCell', { funderId: PAYER, amount: AMOUNT }) },
       { cmd: makeCmd('OpenDispute', { openedBy: PAYEE, currentTime: T_BEFORE_COMPLETION_DL }),
         ctx: makeCtx(T_BEFORE_COMPLETION_DL) },
@@ -912,7 +974,7 @@ describe('11. ResolveDispute → favour payer (REFUNDED)', () => {
 
 describe('12. Unauthorized actors', () => {
   test('arbiter cannot fund a cell', () => {
-    const state = applyAll([{ cmd: makeCmd('CreateCell', createCellPayload({ arbiter: ARBITER })) }]);
+    const state = applyAll([{ cmd: makeCmd('CreateCell', createCellPayload({ arbiter: ARBITER })) }, { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) }]);
     const v = nextVersion(nextVersion(ZERO_VERSION));
     const result = cellKernel.applyCommand(
       state,
@@ -960,7 +1022,7 @@ describe('12. Unauthorized actors', () => {
 
 describe('14. Deadline violations', () => {
   test('ExpireCell at exactly fundingDeadline is rejected (must be strictly after)', () => {
-    const state = applyAll([{ cmd: makeCmd('CreateCell', createCellPayload()) }]);
+    const state = applyAll([{ cmd: makeCmd('CreateCell', createCellPayload()) }, { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) }]);
     const v = nextVersion(nextVersion(ZERO_VERSION));
     const result = cellKernel.applyCommand(
       state,
@@ -1010,6 +1072,7 @@ describe('15. Terminal state rejection', () => {
   function releasedState(): CellState {
     return applyAll([
       { cmd: makeCmd('CreateCell', createCellPayload()) },
+      { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) },
       { cmd: makeCmd('FundCell', { funderId: PAYER, amount: AMOUNT }) },
       { cmd: makeCmd('RequestRelease', { requestedBy: PAYER }) },
       { cmd: makeCmd('ApproveRelease', { approvedBy: PAYEE }) },
@@ -1019,6 +1082,7 @@ describe('15. Terminal state rejection', () => {
   function refundedState(): CellState {
     return applyAll([
       { cmd: makeCmd('CreateCell', createCellPayload()) },
+      { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) },
       { cmd: makeCmd('FundCell', { funderId: PAYER, amount: AMOUNT }) },
       { cmd: makeCmd('ForceRefund', { requestedBy: PAYER, currentTime: T_AFTER_COMPLETION_DL }),
         ctx: makeCtx(T_AFTER_COMPLETION_DL) },
@@ -1087,6 +1151,7 @@ describe('17. Double settlement', () => {
   test('cannot apply ApproveRelease after already RELEASED (terminal)', () => {
     const state = applyAll([
       { cmd: makeCmd('CreateCell', createCellPayload()) },
+      { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) },
       { cmd: makeCmd('FundCell', { funderId: PAYER, amount: AMOUNT }) },
       { cmd: makeCmd('RequestRelease', { requestedBy: PAYER }) },
       { cmd: makeCmd('ApproveRelease', { approvedBy: PAYEE }) },
@@ -1106,6 +1171,7 @@ describe('17. Double settlement', () => {
   test('cannot apply ApproveRefund after already REFUNDED (terminal)', () => {
     const state = applyAll([
       { cmd: makeCmd('CreateCell', createCellPayload()) },
+      { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) },
       { cmd: makeCmd('FundCell', { funderId: PAYER, amount: AMOUNT }) },
       { cmd: makeCmd('RequestRefund', { requestedBy: PAYER }) },
       { cmd: makeCmd('ApproveRefund', { approvedBy: PAYEE }) },
@@ -1131,6 +1197,7 @@ describe('19. Partial settlement / binary resolution', () => {
   test('ResolveDispute favourOf must be payer or payee (binary, not split)', () => {
     const state = applyAll([
       { cmd: makeCmd('CreateCell', createCellPayload({ arbiter: ARBITER })) },
+      { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) },
       { cmd: makeCmd('FundCell', { funderId: PAYER, amount: AMOUNT }) },
       { cmd: makeCmd('OpenDispute', { openedBy: PAYER, currentTime: T_BEFORE_COMPLETION_DL }),
         ctx: makeCtx(T_BEFORE_COMPLETION_DL) },
@@ -1151,6 +1218,7 @@ describe('19. Partial settlement / binary resolution', () => {
     // Rebuild for payer test
     const state2 = applyAll([
       { cmd: makeCmd('CreateCell', createCellPayload({ arbiter: ARBITER })) },
+      { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) },
       { cmd: makeCmd('FundCell', { funderId: PAYER, amount: AMOUNT }) },
       { cmd: makeCmd('OpenDispute', { openedBy: PAYER, currentTime: T_BEFORE_COMPLETION_DL }),
         ctx: makeCtx(T_BEFORE_COMPLETION_DL) },
@@ -1210,6 +1278,35 @@ describe('20. Event ordering', () => {
 // ---------------------------------------------------------------------------
 
 describe('21. Event replay', () => {
+  test('historical CellCreated events without description remain replayable', () => {
+    const historicalEvent: Event = {
+      eventId: makeEventId('historical-cell-created'), cellId: CELL_A, version: nextVersion(ZERO_VERSION),
+      timestamp: T0, type: 'CellCreated', payload: { payer: PAYER, payee: PAYEE, amount: AMOUNT,
+        currency: 'TRY', fundingDeadline: T_FUNDING_DEADLINE, completionDeadline: T_COMPLETION_DEADLINE },
+    };
+    const state = cellKernel.evolve(CELL_A, [historicalEvent]);
+    expect('code' in state).toBe(false);
+    if (!('code' in state)) {
+      expect(state.description).toBeUndefined();
+      expect(state.acceptanceStatus).toBe('ACCEPTED');
+    }
+  });
+
+  test('legacy CellCreated without acceptanceRequired retains historical funding behavior', () => {
+    const event: Event = { eventId: makeEventId('legacy-acceptance-cell'), cellId: CELL_A,
+      version: nextVersion(ZERO_VERSION), timestamp: T0, type: 'CellCreated', payload: {
+        payer: PAYER, payee: PAYEE, amount: AMOUNT, currency: 'TRY',
+        fundingDeadline: T_FUNDING_DEADLINE, completionDeadline: T_COMPLETION_DEADLINE,
+      } };
+    const state = cellKernel.evolve(CELL_A, [event]);
+    expect('code' in state).toBe(false);
+    if ('code' in state) return;
+    expect(state.acceptanceStatus).toBe('ACCEPTED');
+    const funded = cellKernel.applyCommand(state, makeCmd('FundCell', { funderId: PAYER, amount: AMOUNT }),
+      nextVersion(ZERO_VERSION), makeCtx());
+    expect(funded.ok).toBe(true);
+  });
+
   test('replaying events produces same state as applying commands', () => {
     // Apply commands to get events
     let state = cellKernel.evolve(CELL_A, []);
@@ -1220,6 +1317,7 @@ describe('21. Event replay', () => {
 
     const commands: Array<Command> = [
       makeCmd('CreateCell', createCellPayload({ arbiter: ARBITER })),
+      makeCmd('AcceptCell', { acceptedBy: PAYEE }),
       makeCmd('FundCell', { funderId: PAYER, amount: AMOUNT }),
       makeCmd('RequestRelease', { requestedBy: PAYER }),
     ];
@@ -1408,6 +1506,7 @@ describe('24. Deterministic execution', () => {
 
     for (const cmd of [
       makeCmd('CreateCell', createCellPayload()),
+      makeCmd('AcceptCell', { acceptedBy: PAYEE }),
       makeCmd('FundCell', { funderId: PAYER, amount: AMOUNT }),
     ]) {
       const r = cellKernel.applyCommand(state, cmd, v, ctx);
@@ -1456,7 +1555,7 @@ describe('24. Deterministic execution', () => {
 
 describe('PATCH: FundCell actor identity', () => {
   test('valid payer FundCell → FUNDED', () => {
-    const state = applyAll([{ cmd: makeCmd('CreateCell', createCellPayload()) }]);
+    const state = applyAll([{ cmd: makeCmd('CreateCell', createCellPayload()) }, { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) }]);
     const v2 = nextVersion(nextVersion(ZERO_VERSION));
     const result = cellKernel.applyCommand(
       state,
@@ -1470,7 +1569,7 @@ describe('PATCH: FundCell actor identity', () => {
   });
 
   test('FundCell with funderId !== payer → REJECTED', () => {
-    const state = applyAll([{ cmd: makeCmd('CreateCell', createCellPayload()) }]);
+    const state = applyAll([{ cmd: makeCmd('CreateCell', createCellPayload()) }, { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) }]);
     const v2 = nextVersion(nextVersion(ZERO_VERSION));
     const result = cellKernel.applyCommand(
       state,
@@ -1484,7 +1583,7 @@ describe('PATCH: FundCell actor identity', () => {
   });
 
   test('stranger cannot fund a cell', () => {
-    const state = applyAll([{ cmd: makeCmd('CreateCell', createCellPayload()) }]);
+    const state = applyAll([{ cmd: makeCmd('CreateCell', createCellPayload()) }, { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) }]);
     const v2 = nextVersion(nextVersion(ZERO_VERSION));
     const result = cellKernel.applyCommand(
       state,
@@ -1506,6 +1605,7 @@ describe('PATCH: Release request idempotency', () => {
   test('same party requests release twice → REJECTED', () => {
     const state = applyAll([
       { cmd: makeCmd('CreateCell', createCellPayload()) },
+      { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) },
       { cmd: makeCmd('FundCell', { funderId: PAYER, amount: AMOUNT }) },
       { cmd: makeCmd('RequestRelease', { requestedBy: PAYER }) },
     ]);
@@ -1524,6 +1624,7 @@ describe('PATCH: Release request idempotency', () => {
   test('opposite party requests release while request exists → REJECTED', () => {
     const state = applyAll([
       { cmd: makeCmd('CreateCell', createCellPayload()) },
+      { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) },
       { cmd: makeCmd('FundCell', { funderId: PAYER, amount: AMOUNT }) },
       { cmd: makeCmd('RequestRelease', { requestedBy: PAYER }) },
     ]);
@@ -1544,6 +1645,7 @@ describe('PATCH: Release request idempotency', () => {
     // Settlement only through explicit ApproveRelease by opposite party.
     const state = applyAll([
       { cmd: makeCmd('CreateCell', createCellPayload()) },
+      { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) },
       { cmd: makeCmd('FundCell', { funderId: PAYER, amount: AMOUNT }) },
       { cmd: makeCmd('RequestRelease', { requestedBy: PAYER }) },
     ]);
@@ -1560,6 +1662,7 @@ describe('PATCH: Refund request idempotency', () => {
   test('payer requests refund twice → REJECTED', () => {
     const state = applyAll([
       { cmd: makeCmd('CreateCell', createCellPayload()) },
+      { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) },
       { cmd: makeCmd('FundCell', { funderId: PAYER, amount: AMOUNT }) },
       { cmd: makeCmd('RequestRefund', { requestedBy: PAYER }) },
     ]);

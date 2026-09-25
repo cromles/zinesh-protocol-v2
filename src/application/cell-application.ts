@@ -36,6 +36,7 @@ import type {
   Version,
 } from '../core/types';
 import {
+  CELL_DESCRIPTION_MAX_LENGTH,
   makeActorId,
   makeAmount,
   makeCellId,
@@ -58,9 +59,35 @@ import {
 import type { TrustedHandleCommandRequest, HandleCommandResult } from './types';
 import { isVerifiedFundingContext, isVerifiedPrincipal } from '../security/trusted-ingress';
 import type { FundingReceipt, VerifiedFundingContext } from '../funding/types';
+import type { FundingIntentDraft } from '../funding/funding-intent';
+import { createFundingIntent } from '../funding/funding-intent';
+import type { FundingRoute, FundingObservation, FundingReconciliationOutcome } from '../funding/funding-foundation';
+import { FundingReconciliationService } from '../funding/funding-reconciliation-service';
+import type { VerifiedPrincipal } from '../security/trusted-ingress';
+import type { FundingIntentCreateResult } from '../adapters/funding-intent-store';
+
+export interface ActorCellSummary {
+  readonly cellId: CellId;
+  readonly counterpartyId: ActorId;
+  readonly description?: string;
+  readonly amount: Amount;
+  readonly currency: 'TRY';
+  readonly status: CellState['status'];
+  readonly acceptanceStatus: CellState['acceptanceStatus'];
+  readonly fundingDeadline: Timestamp;
+  readonly completionDeadline: Timestamp;
+  readonly version: Version;
+}
+
+export interface ActorCellState {
+  readonly state: CellState;
+  readonly version: Version;
+}
 
 const RECOGNIZED_COMMAND_TYPES: ReadonlySet<DomainCommandType> = new Set([
   'CreateCell',
+  'AcceptCell',
+  'RejectCell',
   'FundCell',
   'RequestRelease',
   'ApproveRelease',
@@ -254,11 +281,89 @@ export class CellApplication {
   }
 
   async getCellState(cellId: CellId): Promise<CellState | null> {
+    return (await this.loadCell(cellId))?.state ?? null;
+  }
+
+  async listCellsForActor(principal: VerifiedPrincipal): Promise<ReadonlyArray<ActorCellSummary> | null> {
+    if (!isAuthorizedActorPrincipal(principal) || principal.actorId === undefined) return null;
+    const events = await this.persistence.eventStore.getEventsForActor(principal.actorId);
+    const streams = new Map<CellId, Event[]>();
+    for (const event of events) {
+      const stream = streams.get(event.cellId) ?? [];
+      stream.push(event);
+      streams.set(event.cellId, stream);
+    }
+    return [...streams.entries()].flatMap(([cellId, stream]): ActorCellSummary[] => {
+      const entry = this.reconstructCell(cellId, stream);
+      if (entry === null || (entry.state.payer !== principal.actorId && entry.state.payee !== principal.actorId)) return [];
+      return [{ cellId: entry.state.cellId,
+        counterpartyId: entry.state.payer === principal.actorId ? entry.state.payee : entry.state.payer,
+        ...(entry.state.description === undefined ? {} : { description: entry.state.description }),
+        amount: entry.state.amount, currency: entry.state.currency, status: entry.state.status,
+        acceptanceStatus: entry.state.acceptanceStatus,
+        fundingDeadline: entry.state.fundingDeadline, completionDeadline: entry.state.completionDeadline,
+        version: entry.version }];
+    });
+  }
+
+  async getCellStateForActor(principal: VerifiedPrincipal, cellId: CellId): Promise<ActorCellState | null> {
+    if (!isAuthorizedActorPrincipal(principal) || principal.actorId === undefined) return null;
+    const entry = await this.loadCell(cellId);
+    if (entry === null || (entry.state.payer !== principal.actorId && entry.state.payee !== principal.actorId)) return null;
+    return entry;
+  }
+
+  private async loadCell(cellId: CellId): Promise<ActorCellState | null> {
     const events = await this.persistence.eventStore.getEvents(cellId);
+    return this.reconstructCell(cellId, events);
+  }
+
+  private reconstructCell(cellId: CellId, events: ReadonlyArray<Event>): ActorCellState | null {
     if (events.length === 0) return null;
-    const evolved = this.kernel.evolve(cellId, events);
-    if (isKernelError(evolved)) throw new Error('Invalid authoritative cell stream');
-    return evolved;
+    const state = this.kernel.evolve(cellId, events);
+    if (isKernelError(state)) throw new Error('Invalid authoritative cell stream');
+    return { state, version: events[events.length - 1]!.version };
+  }
+
+  async createFundingIntent(principal: VerifiedPrincipal, draft: Omit<FundingIntentDraft,
+    'payer' | 'payee' | 'amount' | 'currency' | 'createdAt'>): Promise<FundingIntentCreateResult> {
+    if (!isVerifiedPrincipal(principal) || !principal.enabled || principal.type !== 'GATEWAY'
+      || !principal.capabilities.includes('CONFIRM_FUNDING')) return { kind: 'INVALID' };
+    const state = await this.getCellState(draft.cellId);
+    if (state === null || state.status !== 'CREATED') return { kind: 'INVALID' };
+    const createdAt = this.clock.now();
+    if (draft.expiresAt <= createdAt || draft.expiresAt > state.fundingDeadline) return { kind: 'INVALID' };
+    let intent;
+    try {
+      intent = createFundingIntent({ ...draft, createdAt, payer: state.payer, payee: state.payee,
+        amount: state.amount, currency: state.currency });
+    } catch { return { kind: 'INVALID' }; }
+    return this.persistence.fundingIntentStore.create(intent);
+  }
+
+  async createFundingRoute(principal: VerifiedPrincipal, route: FundingRoute): Promise<'CREATED' | 'DUPLICATE' | 'CONFLICT'> {
+    if (!isVerifiedPrincipal(principal) || !principal.enabled || principal.type !== 'GATEWAY'
+      || !principal.capabilities.includes('CONFIRM_FUNDING')) return 'CONFLICT';
+    return new FundingReconciliationService(this.persistence.providerFoundationStore,
+      this.persistence.fundingIntentStore).createRoute(route);
+  }
+
+  async reconcileFundingObservation(principal: VerifiedPrincipal,
+    observation: FundingObservation): Promise<FundingReconciliationOutcome | null> {
+    if (!isVerifiedPrincipal(principal) || !principal.enabled || principal.type !== 'GATEWAY'
+      || !principal.capabilities.includes('CONFIRM_FUNDING')) return null;
+    return new FundingReconciliationService(this.persistence.providerFoundationStore,
+      this.persistence.fundingIntentStore).reconcileObservation(observation);
+  }
+
+  async getFundingReceipt(principal: VerifiedPrincipal, cellId: CellId): Promise<FundingReceipt | null> {
+    if (!isVerifiedPrincipal(principal) || !principal.enabled) return null;
+    const state = await this.getCellState(cellId);
+    const authorized = principal.type === 'ACTOR'
+      ? principal.actorId === state?.payer || principal.actorId === state?.payee
+      : principal.type === 'GATEWAY' && principal.capabilities.includes('CONFIRM_FUNDING');
+    if (state === null || !authorized) return null;
+    return this.persistence.fundingReceiptStore.getByCellId(cellId);
   }
 
   getFundingIntent(intentId: string) {
@@ -293,6 +398,8 @@ function callerMatchesCommand(actorId: ActorId, command: Command): boolean {
   const payload = command.payload as unknown as Record<string, unknown>;
   const actorField: Record<DomainCommandType, string> = {
     CreateCell: 'payer',
+    AcceptCell: 'acceptedBy',
+    RejectCell: 'rejectedBy',
     FundCell: 'funderId',
     RequestRelease: 'requestedBy',
     ApproveRelease: 'approvedBy',
@@ -304,6 +411,11 @@ function callerMatchesCommand(actorId: ActorId, command: Command): boolean {
     ResolveDispute: 'resolvedBy',
   };
   return payload[actorField[command.type]] === actorId;
+}
+
+function isAuthorizedActorPrincipal(principal: VerifiedPrincipal): boolean {
+  return isVerifiedPrincipal(principal) && principal.enabled && principal.type === 'ACTOR'
+    && principal.actorId !== undefined && principal.capabilities.includes('ACT_AS_SELF');
 }
 
 function authorizePrincipal(
@@ -493,11 +605,25 @@ function validatePayload(
   }
 
   switch (type) {
+    case 'AcceptCell': {
+      const acceptedBy = parseActorId(field(payload, 'acceptedBy'), 'acceptedBy');
+      if (!acceptedBy.ok) return acceptedBy;
+      return { ok: true, value: { acceptedBy: acceptedBy.value } };
+    }
+
+    case 'RejectCell': {
+      const rejectedBy = parseActorId(field(payload, 'rejectedBy'), 'rejectedBy');
+      if (!rejectedBy.ok) return rejectedBy;
+      return { ok: true, value: { rejectedBy: rejectedBy.value } };
+    }
+
     case 'CreateCell': {
       const payer = parseActorId(field(payload, 'payer'), 'payer');
       if (!payer.ok) return payer;
       const payee = parseActorId(field(payload, 'payee'), 'payee');
       if (!payee.ok) return payee;
+      const description = parseCellDescription(field(payload, 'description'));
+      if (!description.ok) return description;
       const amount = parseAmount(field(payload, 'amount'), 'amount');
       if (!amount.ok) return amount;
       const currency = parseCurrency(field(payload, 'currency'));
@@ -517,6 +643,7 @@ function validatePayload(
           value: {
             payer: payer.value,
             payee: payee.value,
+            description: description.value,
             amount: amount.value,
             currency: currency.value,
             fundingDeadline: fundingDeadline.value,
@@ -531,6 +658,7 @@ function validatePayload(
         value: {
           payer: payer.value,
           payee: payee.value,
+          description: description.value,
           arbiter: arbiter.value,
           amount: amount.value,
           currency: currency.value,
@@ -660,6 +788,15 @@ function parseActorId(raw: unknown, fieldName: string): Parse<ActorId> {
   } catch {
     return failShape(`${fieldName} is not a valid actor id`);
   }
+}
+
+function parseCellDescription(raw: unknown): Parse<string> {
+  if (typeof raw !== 'string' || raw.trim().length === 0
+    || raw.length > CELL_DESCRIPTION_MAX_LENGTH
+    || /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(raw)) {
+    return failShape('description must be non-empty plain text within the supported length');
+  }
+  return { ok: true, value: raw };
 }
 
 function parseAmount(raw: unknown, fieldName: string): Parse<Amount> {

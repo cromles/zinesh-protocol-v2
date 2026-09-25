@@ -45,8 +45,11 @@ async function setup(result?: FundingVerificationResult) {
   async function create(cellName: string) {
     const cellId = makeCellId(cellName);
     await ingress.handle({ credential: actor.credential, command: { commandId: makeCommandId(`create-${cellName}`),
-      cellId, type: 'CreateCell', payload: { payer: PAYER, payee: PAYEE, amount: AMOUNT, currency: 'TRY',
+      cellId, type: 'CreateCell', payload: { payer: PAYER, payee: PAYEE, description: 'Funding test agreement.', amount: AMOUNT, currency: 'TRY',
         fundingDeadline: makeTimestamp(2_000_000), completionDeadline: makeTimestamp(3_000_000) } } });
+    const payeeIdentity = actorIdentity(PAYEE, 'phase2-payee');
+    await createTestIngress(app, [payeeIdentity]).handle({ credential: payeeIdentity.credential, command: {
+      commandId: makeCommandId('accept-' + cellName), cellId, type: 'AcceptCell', payload: { acceptedBy: PAYEE } } });
     await persistence.fundingIntentStore.create(createFundingIntent({
       intentId: intentIdFor(cellId), provider: 'test-provider', environment: 'SANDBOX', providerAccountScope: 'account-test', cellId, payer: PAYER, payee: PAYEE,
       amount: AMOUNT, currency: 'TRY', destinationId: 'test-custody',
@@ -73,7 +76,7 @@ describe('Funding Phase 2 verification and ingress', () => {
     expect(h.destinationBinding()).toEqual({ provider: 'test-provider', cellId, payer: PAYER,
       payee: PAYEE, amount: AMOUNT, currency: 'TRY' });
     expect((await h.persistence.eventStore.getEvents(cellId)).map((event) => event.type))
-      .toEqual(['CellCreated', 'CellFunded']);
+      .toEqual(['CellCreated', 'CellAccepted', 'CellFunded']);
   });
 
   test.each([
@@ -127,7 +130,7 @@ describe('Funding Phase 2 verification and ingress', () => {
       commandId: makeCommandId('phase3a-expired-fund'), cellId,
       evidence: { intentId: 'expired-intent', provider: 'test-provider', providerTransactionId: 'expired-tx' } });
     expect(result).toMatchObject({ outcome: 'APPLICATION_REJECTION', error: { code: 'FUNDING_EVIDENCE_INVALID' } });
-    expect((await h.persistence.eventStore.getEvents(cellId)).map((event) => event.type)).toEqual(['CellCreated']);
+    expect((await h.persistence.eventStore.getEvents(cellId)).map((event) => event.type)).toEqual(['CellCreated', 'CellAccepted']);
   });
 
   test.each([
@@ -140,7 +143,7 @@ describe('Funding Phase 2 verification and ingress', () => {
       commandId: makeCommandId(`fund-${_name}`), cellId,
       evidence: { intentId: intentIdFor(cellId), provider: 'test-provider', providerTransactionId: `tx-${_name}` } });
     expect(result).toMatchObject({ outcome: 'APPLICATION_REJECTION', error: { code } });
-    expect((await h.persistence.eventStore.getEvents(cellId)).map((event) => event.type)).toEqual(['CellCreated']);
+    expect((await h.persistence.eventStore.getEvents(cellId)).map((event) => event.type)).toEqual(['CellCreated', 'CellAccepted']);
   });
 
   test('unauthenticated, unauthorized and unknown-cell requests fail before verification', async () => {
@@ -166,6 +169,6 @@ describe('Funding Phase 2 verification and ingress', () => {
       commandId: makeCommandId('phase2-conflict'), cellId: second,
       evidence: { ...request.evidence, intentId: intentIdFor(second) } });
     expect(conflict).toMatchObject({ outcome: 'APPLICATION_REJECTION', error: { code: 'FUNDING_RECEIPT_CONFLICT' } });
-    expect((await h.persistence.eventStore.getEvents(second)).map((event) => event.type)).toEqual(['CellCreated']);
+    expect((await h.persistence.eventStore.getEvents(second)).map((event) => event.type)).toEqual(['CellCreated', 'CellAccepted']);
   });
 });

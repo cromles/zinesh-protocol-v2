@@ -21,10 +21,12 @@ import {
   loadRateLimitingConfig,
   loadSecurityObservabilityConfig,
   loadTransportConfig,
+  loadPrototypeFundingConfig,
   main,
   performShutdown,
 } from './main';
 import { CellApplication } from '../application/cell-application';
+import { composeDevelopmentRuntime } from '../development/prototype-runtime';
 import { PostgresPersistenceAdapter } from '../adapters/postgres-persistence-adapter';
 import { PostgresMigrator, SchemaVersionError } from '../adapters/postgres-migrator';
 import { InMemoryPersistenceAdapter } from '../adapters/in-memory-persistence-adapter';
@@ -289,6 +291,38 @@ describe('loadPostgresConfig', () => {
   });
 });
 
+describe('prototype funding environment isolation', () => {
+  test('defaults closed and enables only explicit development configuration', () => {
+    expect(loadPrototypeFundingConfig({})).toEqual({ environment: 'production', enabled: false });
+    expect(loadPrototypeFundingConfig({ ZINESH_RUNTIME_ENV: 'development', PROTOTYPE_FUNDING_ENABLED: 'true' }))
+      .toEqual({ environment: 'development', enabled: true });
+  });
+
+  test.each([
+    { ZINESH_RUNTIME_ENV: 'production', PROTOTYPE_FUNDING_ENABLED: 'true' },
+    { PROTOTYPE_FUNDING_ENABLED: 'true' },
+    { ZINESH_RUNTIME_ENV: 'staging', PROTOTYPE_FUNDING_ENABLED: 'false' },
+    { ZINESH_RUNTIME_ENV: 'development', PROTOTYPE_FUNDING_ENABLED: 'yes' },
+  ])('rejects unsafe or ambiguous configuration %#', (env) => {
+    expect(() => loadPrototypeFundingConfig(env)).toThrow(ConfigurationError);
+  });
+
+  test('runtime exposes prototype API only in development and rejects production enablement', async () => {
+    const db = { host: '127.0.0.1', port: 1, database: 'unused', user: 'unused', password: 'unused',
+      tls: { mode: 'verify-full' as const, ca: POSTGRES_CA_CONTENT } };
+    const production = composeRuntime(db);
+    const development = composeDevelopmentRuntime(db);
+    try {
+      expect(production.handlePrototypeFunding).toBeUndefined();
+      expect(typeof development.handlePrototypeFunding).toBe('function');
+      expect(() => composeRuntime(db, undefined, undefined, undefined,
+        { environment: 'production', enabled: true })).toThrow(ConfigurationError);
+    } finally {
+      await production.persistence.disconnect(); await development.persistence.disconnect();
+    }
+  });
+});
+
 describe('loadAuthenticationConfig', () => {
   test('loads a strict RS256 issuer/audience/JWKS policy', () => {
     expect(loadAuthenticationConfig(VALID_ENV)).toEqual({
@@ -547,7 +581,7 @@ describe('main configuration path', () => {
 });
 
 describe('composeRuntime wiring', () => {
-  test('constructs PostgresPersistenceAdapter and CellApplication without connect', async () => {
+  test('exposes lifecycle-only persistence and no funding stores without connect', async () => {
     const runtime = composeRuntime({
       host: '127.0.0.1',
       port: 1,
@@ -557,8 +591,18 @@ describe('composeRuntime wiring', () => {
       tls: { mode: 'verify-full', ca: POSTGRES_CA_CONTENT },
     });
     try {
-      expect(runtime.persistence).toBeInstanceOf(PostgresPersistenceAdapter);
+      expect(typeof runtime.persistence.connect).toBe('function');
+      expect('providerFoundationStore' in runtime.persistence).toBe(false);
+      expect('fundingReceiptStore' in runtime.persistence).toBe(false);
+      expect('migrate' in runtime.persistence.migrator).toBe(false);
+      expect('fundingReconciliation' in runtime).toBe(false);
       expect('application' in runtime).toBe(false);
+      await expect(runtime.reconcileFundingObservation({ credential: 'untrusted', evidence: {}, observation: {
+        observationId: 'untrusted-observation', provider: 'fake-provider', environment: 'SANDBOX',
+        providerAccountScope: 'fake-account', providerTransactionId: 'fake-transaction', direction: 'CREDIT',
+        amount: makeAmount(100n), currency: 'TRY', observedAt: makeTimestamp(1),
+        rawPayloadDigest: 'a'.repeat(64), state: 'FUNDS_HELD',
+      } })).resolves.toEqual({ outcome: 'REJECTED' });
     } finally {
       await runtime.persistence.disconnect();
     }
@@ -588,6 +632,7 @@ describe('in-flight gate with real CellApplication', () => {
         payload: {
           payer,
           payee: makeActorId('payee-1'),
+          description: 'Composition test agreement.',
           amount: makeAmount(10000n),
           currency: 'TRY',
           fundingDeadline: makeTimestamp(2_000_000),

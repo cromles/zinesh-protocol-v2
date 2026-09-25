@@ -114,7 +114,7 @@ function config(certificatePath: string, privateKeyPath: string, trustedProxies:
 function command(commandId = 'https-command') {
   return { command: {
     commandId, cellId: `cell-${commandId}`, type: 'CreateCell', payload: {
-      payer: PAYER, payee: PAYEE, amount: '900719925474099312345', currency: 'TRY',
+      payer: PAYER, payee: PAYEE, description: 'HTTPS test agreement.', amount: '900719925474099312345', currency: 'TRY',
       fundingDeadline: 2_000_000, completionDeadline: 5_000_000,
     },
   } };

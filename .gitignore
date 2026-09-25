@@ -1,6 +1,8 @@
 # Dependencies and generated output
 node_modules/
 dist/
+frontend/dist/
+dist-development/
 coverage/
 .npm-cache/
 *.tsbuildinfo

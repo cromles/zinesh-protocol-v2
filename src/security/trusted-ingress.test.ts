@@ -28,7 +28,7 @@ function createCommand(id = 'create-security', payer: ActorId = PAYER): Command 
   return {
     commandId: makeCommandId(id), cellId: CELL, type: 'CreateCell',
     payload: {
-      payer, payee: PAYEE, amount: AMOUNT, currency: 'TRY',
+      payer, payee: PAYEE, description: 'Security test agreement.', amount: AMOUNT, currency: 'TRY',
       fundingDeadline: makeTimestamp(2_000_000), completionDeadline: makeTimestamp(5_000_000),
     },
   };
@@ -125,7 +125,10 @@ describe('Phase 7B trusted principal boundary', () => {
     const persistence = new InMemoryPersistenceAdapter();
     const app = application(persistence);
     const actor = actorIdentity(PAYER);
-    await createTestIngress(app, [actor]).handle({ credential: actor.credential, command: createCommand() });
+    const actorIngress = createTestIngress(app, [actor]);
+    await actorIngress.handle({ credential: actor.credential, command: createCommand() });
+    const payee = actorIdentity(PAYEE);
+    await createTestIngress(app, [payee]).handle({ credential: payee.credential, command: { commandId: makeCommandId('accept-security'), cellId: CELL, type: 'AcceptCell', payload: { acceptedBy: PAYEE } } });
     await seedIntent(persistence);
     const gatewayIdentity = { credential: 'gateway-credential', subject: 'gateway-subject', principal: gateway };
     let current: VerifiedFundingContext | null = null;
@@ -152,7 +155,10 @@ describe('Phase 7B trusted principal boundary', () => {
     const persistence = new InMemoryPersistenceAdapter();
     const app = application(persistence);
     const actor = actorIdentity(PAYER);
-    await createTestIngress(app, [actor]).handle({ credential: actor.credential, command: createCommand('fingerprint-create') });
+    const actorIngress = createTestIngress(app, [actor]);
+    await actorIngress.handle({ credential: actor.credential, command: createCommand('fingerprint-create') });
+    const payee = actorIdentity(PAYEE);
+    await createTestIngress(app, [payee]).handle({ credential: payee.credential, command: { commandId: makeCommandId('accept-fingerprint'), cellId: CELL, type: 'AcceptCell', payload: { acceptedBy: PAYEE } } });
     await seedIntent(persistence);
     const gatewayIdentity = { credential: 'fingerprint-gateway', subject: 'fingerprint-subject', principal: gateway };
     let current = funding();

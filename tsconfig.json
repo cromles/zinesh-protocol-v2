@@ -16,7 +16,8 @@
     "forceConsistentCasingInFileNames": true,
     "declaration": true,
     "declarationMap": true,
-    "sourceMap": true
+    "sourceMap": true,
+    "types": ["node", "jest"]
   },
   "include": ["src/**/*"],
   "exclude": [
@@ -24,6 +25,7 @@
     "dist",
     "**/*.test.ts",
     "src/security/testing.ts",
+    "src/development/**/*",
     "src/transport/tls-test-certificate.ts"
   ]
 }

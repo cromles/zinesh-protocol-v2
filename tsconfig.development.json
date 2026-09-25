@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "dist-development",
+    "types": ["node", "jest"]
+  },
+  "exclude": [
+    "node_modules",
+    "dist",
+    "dist-development",
+    "**/*.test.ts",
+    "src/security/testing.ts",
+    "src/transport/tls-test-certificate.ts"
+  ]
+}

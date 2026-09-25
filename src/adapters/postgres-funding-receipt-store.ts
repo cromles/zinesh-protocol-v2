@@ -44,6 +44,16 @@ export class PostgresFundingReceiptStore implements FundingReceiptStore {
       || result.rows[0].provider_account_scope === null ? null : rowToReceipt(result.rows[0]);
   }
 
+  async getByCellId(cellId: FundingReceipt['cellId']): Promise<FundingReceipt | null> {
+    const result = await (this.transactionClient ?? this.pool).query<ReceiptRow>(
+      `SELECT receipt_id,intent_id,provider,environment,provider_account_scope,provider_transaction_id,cell_id,command_id,
+       funding_event_id,gateway_principal_id,payer,payee,amount,currency,destination_id,confirmed_at,finality,
+       evidence_digest,verified_at,created_at FROM funding_receipts WHERE cell_id=$1`, [cellId],
+    );
+    return result.rows[0] === undefined || result.rows[0].environment === null
+      || result.rows[0].provider_account_scope === null ? null : rowToReceipt(result.rows[0]);
+  }
+
   async claim(receipt: FundingReceipt): Promise<FundingReceiptClaimResult> {
     const queryable = this.transactionClient ?? this.pool;
     const inserted = await queryable.query(

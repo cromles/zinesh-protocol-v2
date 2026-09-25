@@ -6,7 +6,7 @@ import {
   makeActorId, makeAmount, makeCellId, makeCommandId, makeTimestamp,
 } from '../core/types';
 import type { HandleCommandResult } from '../application/types';
-import type { ExternalCommandRequest, FundingConfirmationRequest } from '../security/trusted-ingress';
+import type { ExternalCommandRequest, FundingConfirmationRequest, PrototypeFundingRequest, ActorCellListResult, ActorCellStateResult } from '../security/trusted-ingress';
 import type { RateLimiter } from '../security/rate-limiter';
 import { noOpSecurityTelemetry, serverCorrelationId } from '../security/security-observability';
 import type { SecurityTelemetry } from '../security/security-observability';
@@ -14,6 +14,9 @@ import type { SecurityTelemetry } from '../security/security-observability';
 export interface CommandDispatcher {
   handleCommand(request: ExternalCommandRequest): Promise<HandleCommandResult>;
   handleFundingConfirmation?(request: FundingConfirmationRequest): Promise<HandleCommandResult>;
+  handlePrototypeFunding?(request: PrototypeFundingRequest): Promise<HandleCommandResult>;
+  listActorCells?(credential: unknown): Promise<ActorCellListResult>;
+  getActorCellState?(credential: unknown, cellId: string): Promise<ActorCellStateResult>;
 }
 
 export interface TransportAuditRecord {
@@ -136,7 +139,11 @@ export class CommandHttpTransport {
       }
       const commandRoute = request.method === 'POST' && request.url === '/commands';
       const fundingRoute = request.method === 'POST' && request.url === '/funding-confirmations';
-      if (!commandRoute && !fundingRoute) {
+      const prototypeFundingRoute = request.method === 'POST' && request.url === '/prototype-funding'
+        && this.dispatcher.handlePrototypeFunding !== undefined;
+      const cellListRoute = request.method === 'GET' && request.url === '/cells';
+      const cellStateMatch = request.method === 'GET' ? /^\/cells\/([^/?]+)$/.exec(request.url ?? '') : null;
+      if (!commandRoute && !fundingRoute && !prototypeFundingRoute && !cellListRoute && cellStateMatch === null) {
         outcome = 'NOT_FOUND'; this.respond(response, 404, { error: { code: 'NOT_FOUND' } }); return;
       }
       const maximumConcurrent = this.config.maxConcurrentRequests ?? Number.MAX_SAFE_INTEGER;
@@ -167,10 +174,6 @@ export class CommandHttpTransport {
           this.respond(response, 503, { error: { code: 'RATE_LIMIT_UNAVAILABLE' } }); return;
         }
       }
-      const contentType = request.headers['content-type']?.split(';')[0]?.trim().toLowerCase();
-      if (contentType !== 'application/json') {
-        outcome = 'UNSUPPORTED_MEDIA_TYPE'; this.respond(response, 415, { error: { code: 'UNSUPPORTED_MEDIA_TYPE' } }); return;
-      }
       const credential = bearerCredential(request.headers.authorization);
       if (credential === null) {
         this.telemetry.record({
@@ -179,8 +182,37 @@ export class CommandHttpTransport {
         });
         outcome = 'UNAUTHENTICATED'; this.respond(response, 401, { error: { code: 'UNAUTHENTICATED' } }); return;
       }
+      if (cellListRoute || cellStateMatch !== null) {
+        if (cellListRoute) {
+          const result = this.dispatcher.listActorCells === undefined
+            ? { outcome: 'UNAVAILABLE' as const }
+            : await this.dispatcher.listActorCells(credential);
+          const mapped = mapActorCellListResult(result);
+          outcome = result.outcome;
+          this.respond(response, mapped.status, mapped.body);
+          return;
+        }
+        let cellId: string;
+        try { cellId = decodeURIComponent(cellStateMatch![1]!); }
+        catch { outcome = 'INVALID_CELL_ID'; this.respond(response, 400, { error: { code: 'INVALID_CELL_ID' } }); return; }
+        if (cellId.length === 0 || cellId.length > 128 || cellId.includes('/')) {
+          outcome = 'INVALID_CELL_ID'; this.respond(response, 400, { error: { code: 'INVALID_CELL_ID' } }); return;
+        }
+        const result = this.dispatcher.getActorCellState === undefined
+          ? { outcome: 'UNAVAILABLE' as const }
+          : await this.dispatcher.getActorCellState(credential, cellId);
+        const mapped = mapActorCellStateResult(result);
+        outcome = result.outcome;
+        this.respond(response, mapped.status, mapped.body);
+        return;
+      }
+      const contentType = request.headers['content-type']?.split(';')[0]?.trim().toLowerCase();
+      if (contentType !== 'application/json') {
+        outcome = 'UNSUPPORTED_MEDIA_TYPE'; this.respond(response, 415, { error: { code: 'UNSUPPORTED_MEDIA_TYPE' } }); return;
+      }
       const raw = await readBody(request, this.config.maxBodyBytes);
-      const decoded = commandRoute ? decodeRequest(raw) : decodeFundingRequest(raw);
+      const decoded = commandRoute ? decodeRequest(raw) : prototypeFundingRoute
+        ? decodePrototypeFundingRequest(raw) : decodeFundingRequest(raw);
       if (!decoded.ok) {
         outcome = decoded.code; this.respond(response, decoded.status, { error: { code: decoded.code } }); return;
       }
@@ -189,6 +221,13 @@ export class CommandHttpTransport {
           const command = (decoded as DecodeCommandSuccess).command;
           commandId = String(command.commandId); commandType = command.type;
           return this.dispatcher.handleCommand({ credential, command, correlationId });
+        })()
+        : prototypeFundingRoute
+        ? await (async () => {
+          const prototypeFunding = decoded as DecodePrototypeFundingSuccess;
+          commandId = String(prototypeFunding.commandId); commandType = 'FundCell';
+          return this.dispatcher.handlePrototypeFunding!({ credential, commandId: prototypeFunding.commandId,
+            cellId: prototypeFunding.cellId, correlationId });
         })()
         : await (async () => {
           const funding = decoded as DecodeFundingSuccess;
@@ -293,6 +332,17 @@ type DecodeResult =
 type DecodeCommandSuccess = Extract<DecodeResult, { readonly ok: true }>;
 type DecodeFundingSuccess = { readonly ok: true; readonly commandId: ReturnType<typeof makeCommandId>;
   readonly cellId: ReturnType<typeof makeCellId>; readonly evidence: import('../funding/types').FundingEvidence };
+type DecodePrototypeFundingSuccess = { readonly ok: true; readonly commandId: ReturnType<typeof makeCommandId>;
+  readonly cellId: ReturnType<typeof makeCellId> };
+
+function decodePrototypeFundingRequest(raw: string): DecodePrototypeFundingSuccess | DecodeFailure {
+  let value: unknown;
+  try { value = JSON.parse(raw); } catch { return bad('MALFORMED_JSON'); }
+  if (!plainObject(value) || Object.keys(value).some((key) => key !== 'commandId' && key !== 'cellId')
+    || !boundedString(value.commandId, 128) || !boundedString(value.cellId, 128)) return bad('INVALID_REQUEST');
+  try { return { ok: true, commandId: makeCommandId(value.commandId), cellId: makeCellId(value.cellId) }; }
+  catch { return bad('INVALID_REQUEST'); }
+}
 
 function decodeRequest(raw: string): DecodeResult {
   let value: unknown;
@@ -305,7 +355,7 @@ function decodeRequest(raw: string): DecodeResult {
   if (!boundedString(input.commandId, 128)) return bad('MISSING_COMMAND_ID');
   if (!boundedString(input.cellId, 128) || !boundedString(input.type, 64) || !plainObject(input.payload)) return bad('INVALID_COMMAND');
   const supported = new Set([
-    'CreateCell','FundCell','RequestRelease','ApproveRelease','RequestRefund',
+    'CreateCell','AcceptCell','RejectCell','FundCell','RequestRelease','ApproveRelease','RequestRefund',
     'ApproveRefund','ForceRefund','ExpireCell','OpenDispute','ResolveDispute',
   ]);
   if (!supported.has(input.type)) return bad('UNSUPPORTED_COMMAND');
@@ -353,7 +403,7 @@ function decodePayload(type: string, payload: Record<string, unknown>): Record<s
       result[field] = makeTimestamp(result[field]);
     }
   }
-  for (const field of ['payer','payee','arbiter','funderId','requestedBy','approvedBy','triggeredBy','openedBy','resolvedBy']) {
+  for (const field of ['payer','payee','acceptedBy','rejectedBy','arbiter','funderId','requestedBy','approvedBy','triggeredBy','openedBy','resolvedBy']) {
     if (field in result) {
       if (!boundedString(result[field], 128)) throw new Error();
       result[field] = makeActorId(result[field]);
@@ -382,6 +432,25 @@ function mapResult(result: HandleCommandResult): { status: number; body: unknown
     : result.outcome === 'PERSISTENCE_FAILURE' ? 503 : 403;
   return { status, body: { outcome: result.outcome, error: { code } },
     ...(result.error.retryAfterSeconds === undefined ? {} : { retryAfterSeconds: result.error.retryAfterSeconds }) };
+}
+
+function mapActorCellListResult(result: ActorCellListResult | { readonly outcome: 'UNAVAILABLE' }):
+  { readonly status: number; readonly body: unknown } {
+  if (result.outcome === 'SUCCESS') return { status: 200, body: { cells: result.cells } };
+  return queryFailure(result.outcome);
+}
+
+function mapActorCellStateResult(result: ActorCellStateResult | { readonly outcome: 'UNAVAILABLE' }):
+  { readonly status: number; readonly body: unknown } {
+  if (result.outcome === 'SUCCESS') return { status: 200, body: { cell: result.cell } };
+  return queryFailure(result.outcome);
+}
+
+function queryFailure(outcome: 'UNAUTHENTICATED' | 'FORBIDDEN' | 'NOT_FOUND' | 'UNAVAILABLE'):
+  { readonly status: number; readonly body: unknown } {
+  const status = outcome === 'UNAUTHENTICATED' ? 401
+    : outcome === 'FORBIDDEN' ? 403 : outcome === 'NOT_FOUND' ? 404 : 503;
+  return { status, body: { error: { code: outcome } } };
 }
 
 function bad(code: string): DecodeFailure { return { ok: false, status: 400, code }; }

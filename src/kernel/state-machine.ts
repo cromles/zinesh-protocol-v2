@@ -17,6 +17,7 @@
 
 import type {
   ActorId,
+  AcceptCellPayload,
   ApproveRefundPayload,
   ApproveReleasePayload,
   CellId,
@@ -31,9 +32,10 @@ import type {
   OpenDisputePayload,
   RequestRefundPayload,
   RequestReleasePayload,
+  RejectCellPayload,
   ResolveDisputePayload,
 } from '../core/types';
-import { kernelError, makeAmount, TERMINAL_STATUSES, ZERO_VERSION } from '../core/types';
+import { CELL_DESCRIPTION_MAX_LENGTH, kernelError, makeAmount, TERMINAL_STATUSES, ZERO_VERSION } from '../core/types';
 import type { CommandHandler, EventEmission, EventFolder, KernelHandlers } from './kernel';
 import type { Event } from '../core/types';
 
@@ -66,6 +68,7 @@ function initialState(cellId: CellId): CellState {
   return {
     cellId,
     status: 'CREATED',
+    acceptanceStatus: 'PENDING',
     // These fields will be populated by CellCreated event.
     // We use temporary sentinel values that are immediately overwritten.
     // The kernel enforces that CreateCell must be the first command.
@@ -89,8 +92,10 @@ const eventFolder: EventFolder = (state, event): CellState => {
       const created: CellState = {
         cellId:              state.cellId,
         status:              'CREATED',
+        acceptanceStatus:    p.acceptanceRequired === true ? 'PENDING' : 'ACCEPTED',
         payer:               p.payer,
         payee:               p.payee,
+        ...(p.description === undefined ? {} : { description: p.description }),
         amount:              p.amount,
         currency:            p.currency,
         fundingDeadline:     p.fundingDeadline,
@@ -113,6 +118,12 @@ const eventFolder: EventFolder = (state, event): CellState => {
         amount: p.amount,
       };
     }
+
+    case 'CellAccepted':
+      return { ...state, acceptanceStatus: 'ACCEPTED' };
+
+    case 'CellRejected':
+      return { ...state, acceptanceStatus: 'REJECTED' };
 
     case 'ReleaseRequested': {
       const p = event.payload as import('../core/types').ReleaseRequestedPayload;
@@ -209,6 +220,10 @@ const handleCreateCell: CommandHandler = (state, command): HandlerResult => {
   if (p.currency !== 'TRY') {
     return fail('INVARIANT_VIOLATION', 'Only TRY currency is supported');
   }
+  if (typeof p.description !== 'string' || p.description.trim().length === 0
+    || p.description.length > CELL_DESCRIPTION_MAX_LENGTH || /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(p.description)) {
+    return fail('INVARIANT_VIOLATION', 'description must be non-empty plain text within the supported length');
+  }
   if (p.fundingDeadline >= p.completionDeadline) {
     return fail('INVARIANT_VIOLATION', 'fundingDeadline must be before completionDeadline');
   }
@@ -224,6 +239,8 @@ const handleCreateCell: CommandHandler = (state, command): HandlerResult => {
     payload: {
       payer:               p.payer,
       payee:               p.payee,
+      description:         p.description,
+      acceptanceRequired:  true,
       arbiter:             p.arbiter,
       amount:              p.amount,
       currency:            p.currency,
@@ -233,9 +250,30 @@ const handleCreateCell: CommandHandler = (state, command): HandlerResult => {
   }]);
 };
 
+const handleAcceptCell: CommandHandler = (state, command): HandlerResult => {
+  const guard = assertStatus(state, 'CREATED');
+  if (guard !== null) return { ok: false, error: guard };
+  if (state.acceptanceStatus !== 'PENDING') return fail('ILLEGAL_TRANSITION', 'Cell is not awaiting acceptance');
+  const p = command.payload as AcceptCellPayload;
+  if (p.acceptedBy !== state.payee) return fail('AUTHORIZATION_DENIED', 'Only the payee may accept this cell');
+  return ok([{ eventType: 'CellAccepted', payload: { acceptedBy: p.acceptedBy } }]);
+};
+
+const handleRejectCell: CommandHandler = (state, command): HandlerResult => {
+  const guard = assertStatus(state, 'CREATED');
+  if (guard !== null) return { ok: false, error: guard };
+  if (state.acceptanceStatus !== 'PENDING') return fail('ILLEGAL_TRANSITION', 'Cell is not awaiting acceptance');
+  const p = command.payload as RejectCellPayload;
+  if (p.rejectedBy !== state.payee) return fail('AUTHORIZATION_DENIED', 'Only the payee may reject this cell');
+  return ok([{ eventType: 'CellRejected', payload: { rejectedBy: p.rejectedBy } }]);
+};
+
 const handleFundCell: CommandHandler = (state, command): HandlerResult => {
   const guard = assertStatus(state, 'CREATED');
   if (guard !== null) return { ok: false, error: guard };
+  if (state.acceptanceStatus !== 'ACCEPTED') {
+    return fail('ILLEGAL_TRANSITION', 'Cell must be accepted before funding');
+  }
 
   const p = command.payload as FundCellPayload;
 
@@ -487,6 +525,8 @@ export const cellKernelHandlers: KernelHandlers = {
   eventFolder,
   commandHandlers: {
     CreateCell:      handleCreateCell,
+    AcceptCell:      handleAcceptCell,
+    RejectCell:      handleRejectCell,
     FundCell:        handleFundCell,
     RequestRelease:  handleRequestRelease,
     ApproveRelease:  handleApproveRelease,

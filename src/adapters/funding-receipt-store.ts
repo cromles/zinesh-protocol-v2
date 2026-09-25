@@ -20,6 +20,7 @@ export type FundingReceiptClaimResult =
 export interface FundingReceiptStore {
   claim(receipt: FundingReceipt): Promise<FundingReceiptClaimResult>;
   getById(receiptId: string): Promise<FundingReceipt | null>;
+  getByCellId(cellId: FundingReceipt['cellId']): Promise<FundingReceipt | null>;
 }
 
 export function sameFundingReceiptIdentity(

@@ -14,11 +14,13 @@ import { makeActorId, makeAmount, makeCellId, makeTimestamp } from '../core/type
 import { SecurityTelemetry } from '../security/security-observability';
 import type { SecurityEvent } from '../security/security-observability';
 import { createFundingIntent } from '../funding/funding-intent';
+import { PrototypeFundingEvidence } from '../development/prototype-funding';
 
 const ISSUER = 'https://transport-issuer.test';
 const AUDIENCE = 'zinesh-transport';
 const PAYER = makeActorId('transport-payer');
 const PAYEE = makeActorId('transport-payee');
+const STRANGER = makeActorId('transport-stranger');
 
 function pair(kid = 'transport-key') {
   const generated = generateKeyPairSync('rsa', { modulusLength: 2048 });
@@ -40,7 +42,7 @@ function jwt(privateKey: KeyObject, claims: Record<string, unknown> = {}, header
 
 function command(commandId = 'transport-command', amount = '900719925474099312345') {
   return { commandId, cellId: `cell-${commandId}`, type: 'CreateCell', payload: {
-    payer: PAYER, payee: PAYEE, amount, currency: 'TRY',
+    payer: PAYER, payee: PAYEE, description: 'Logo tasarımı teslim edilecek.', amount, currency: 'TRY',
     fundingDeadline: 2_000_000, completionDeadline: 5_000_000,
   } };
 }
@@ -61,7 +63,7 @@ interface Harness {
   readonly securityEvents: SecurityEvent[];
 }
 
-async function harness(options: { providerFailure?: boolean } = {}): Promise<Harness> {
+async function harness(options: { providerFailure?: boolean; prototypeFunding?: boolean } = {}): Promise<Harness> {
   const key = pair();
   const authentication = new JwtAuthenticationAdapter(
     { issuers: [{ issuer: ISSUER, audiences: [AUDIENCE], algorithms: ['RS256'], jwksUrl: `${ISSUER}/jwks` }],
@@ -83,6 +85,8 @@ async function harness(options: { providerFailure?: boolean } = {}): Promise<Har
       actorId: PAYEE, capabilities: ['ACT_AS_SELF'], mappingVersion: 1 }],
     ['other-subject', { principalId: 'principal-other', type: 'ACTOR', enabled: true,
       actorId: PAYER, capabilities: ['ACT_AS_SELF'], mappingVersion: 1 }],
+    ['stranger-subject', { principalId: 'principal-stranger', type: 'ACTOR', enabled: true,
+      actorId: STRANGER, capabilities: ['ACT_AS_SELF'], mappingVersion: 1 }],
     ['gateway-subject', { principalId: 'principal-gateway', type: 'GATEWAY', enabled: true,
       capabilities: ['CONFIRM_FUNDING'], mappingVersion: 1 }],
   ]);
@@ -97,11 +101,16 @@ async function harness(options: { providerFailure?: boolean } = {}): Promise<Har
     provider: evidence.provider, providerTransactionId: evidence.providerTransactionId, ...expected,
     confirmedAt: makeTimestamp(900_000), finality: 'FUNDS_HELD', evidenceDigest: 'b'.repeat(64),
     verifiedAt: makeTimestamp(950_000),
-  } }; } }, undefined, telemetry, { async resolve() { return 'transport-custody'; } });
+  } }; } }, undefined, telemetry, { async resolve() { return 'transport-custody'; } }, undefined,
+    options.prototypeFunding ? new PrototypeFundingEvidence() : undefined);
   const audit = new Audit();
   const transport = new CommandHttpTransport(
     { handleCommand: (request) => ingress.handle(request),
-      handleFundingConfirmation: (request) => ingress.handleFundingConfirmation(request) },
+      handleFundingConfirmation: (request) => ingress.handleFundingConfirmation(request),
+      listActorCells: (credential) => ingress.listActorCells(credential),
+      getActorCellState: (credential, cellId) => ingress.getActorCellState(credential, cellId),
+      ...(options.prototypeFunding ? { handlePrototypeFunding: (request: import('../security/trusted-ingress').PrototypeFundingRequest) =>
+        ingress.handlePrototypeFunding(request) } : {}) },
     { host: '127.0.0.1', port: 0, maxBodyBytes: 2048, maxHeaderBytes: 4096,
       requestTimeoutMs: 2_000, headersTimeoutMs: 1_000 },
     audit, () => 'generated-correlation', undefined, undefined, undefined, telemetry,
@@ -123,10 +132,71 @@ async function postUrl(h: Harness, url: string, body: unknown, tokenValue = h.to
   return { response, json: await response.json() as Record<string, any> };
 }
 
+async function getPath(h: Harness, path: string, tokenValue?: string) {
+  const response = await fetch(new URL(path, h.url), { headers: tokenValue === undefined
+    ? {} : { authorization: `Bearer ${tokenValue}` } });
+  return { response, json: await response.json() as Record<string, any> };
+}
+
 describe('Phase 7E real HTTP trusted command transport', () => {
   let open: CommandHttpTransport[] = [];
   afterEach(async () => { await Promise.all(open.map((transport) => transport.close())); open = []; });
-  async function setup(options: { providerFailure?: boolean } = {}) { const h = await harness(options); open.push(h.transport); return h; }
+  async function setup(options: { providerFailure?: boolean; prototypeFunding?: boolean } = {}) { const h = await harness(options); open.push(h.transport); return h; }
+
+  test('prototype funding HTTP contract is absent by default and uses the authenticated actor when enabled', async () => {
+    const closed = await setup();
+    expect((await postUrl(closed, closed.url.replace('/commands', '/prototype-funding'), {
+      commandId: 'closed-prototype-command', cellId: 'cell-closed-prototype-command',
+    })).response.status).toBe(404);
+
+    const h = await harness({ prototypeFunding: true }); open.push(h.transport);
+    const created = await post(h, { command: command('prototype-http') });
+    expect(created.response.status).toBe(200);
+    const cellId = 'cell-prototype-http';
+    const accepted = await post(h, { command: { commandId: 'prototype-http-accept', cellId, type: 'AcceptCell', payload: { acceptedBy: PAYEE } } },
+      jwt(h.key.privateKey, { sub: 'payee-subject' }));
+    expect(accepted.response.status).toBe(200);
+    const funded = await postUrl(h, h.url.replace('/commands', '/prototype-funding'), {
+      commandId: 'prototype-http-fund', cellId,
+    });
+    expect(funded.response.status).toBe(200);
+    expect(funded.json).toMatchObject({ outcome: 'SUCCESS', nextState: { status: 'FUNDED' } });
+    expect((await h.persistence.fundingReceiptStore.getByCellId(makeCellId(cellId)))?.provider).toBe('zinesh-prototype');
+  });
+
+  test('actor-scoped GET cell list and state use CreateCell events and kernel-derived version', async () => {
+    const h = await setup();
+    const created = await post(h, { command: command('cell-query-http') });
+    expect(created.response.status).toBe(200);
+    const cellId = 'cell-cell-query-http';
+    const listed = await getPath(h, '/cells', h.token);
+    expect(listed.response.status).toBe(200);
+    expect(listed.json.cells).toEqual([expect.objectContaining({ cellId, counterpartyId: PAYEE,
+      description: 'Logo tasarımı teslim edilecek.', amount: '900719925474099312345',
+      currency: 'TRY', status: 'CREATED', version: 1 })]);
+    const state = await getPath(h, `/cells/${cellId}`, h.token);
+    expect(state.response.status).toBe(200);
+    expect(state.json.cell).toMatchObject({ version: 1, state: { cellId, payer: PAYER, payee: PAYEE,
+      description: 'Logo tasarımı teslim edilecek.', status: 'CREATED' } });
+  });
+
+  test('cell reads reject anonymous and gateway callers and conceal another actor cell', async () => {
+    const h = await setup();
+    await post(h, { command: command('cell-query-access') });
+    const anonymous = await getPath(h, '/cells');
+    expect(anonymous.response.status).toBe(401);
+    const gatewayToken = jwt(h.key.privateKey, { sub: 'gateway-subject' });
+    expect((await getPath(h, '/cells', gatewayToken)).response.status).toBe(403);
+    const strangerToken = jwt(h.key.privateKey, { sub: 'stranger-subject' });
+    expect((await getPath(h, '/cells', strangerToken)).json.cells).toEqual([]);
+    expect((await getPath(h, '/cells/cell-cell-query-access', strangerToken)).response.status).toBe(404);
+  });
+
+  test('malformed cell path is rejected and an unknown well-formed cell is not found', async () => {
+    const h = await setup();
+    expect((await getPath(h, '/cells/%2F', h.token)).response.status).toBe(400);
+    expect((await getPath(h, '/cells/no-such-cell', h.token)).response.status).toBe(404);
+  });
 
   test('valid real credential executes command and preserves bigint precision', async () => {
     const h = await setup();
@@ -145,6 +215,8 @@ describe('Phase 7E real HTTP trusted command transport', () => {
   test('dedicated funding route verifies and funds while generic FundCell is blocked', async () => {
     const h = await setup();
     await post(h, { command: command('funding-route', '4200') });
+    await post(h, { command: { commandId: 'accept-funding-route', cellId: 'cell-funding-route', type: 'AcceptCell', payload: { acceptedBy: PAYEE } } },
+      jwt(h.key.privateKey, { sub: 'payee-subject' }));
     await h.persistence.fundingIntentStore.create(createFundingIntent({
       intentId: 'transport-intent', provider: 'test-provider', environment: 'SANDBOX', providerAccountScope: 'account-test', cellId: makeCellId('cell-funding-route'),
       payer: PAYER, payee: PAYEE, amount: makeAmount(4200n), currency: 'TRY',
@@ -162,12 +234,14 @@ describe('Phase 7E real HTTP trusted command transport', () => {
     expect(dedicated.response.status).toBe(200);
     expect(dedicated.json.outcome).toBe('SUCCESS');
     expect((await h.persistence.eventStore.getEvents('cell-funding-route' as never)).map((event) => event.type))
-      .toEqual(['CellCreated', 'CellFunded']);
+      .toEqual(['CellCreated', 'CellAccepted', 'CellFunded']);
   });
 
   test('a provider dispute returns financial conflict and does not append settlement', async () => {
     const h = await setup();
     await post(h, { command: command('dispute-route', '4200') });
+    await post(h, { command: { commandId: 'accept-dispute-route', cellId: 'cell-dispute-route', type: 'AcceptCell', payload: { acceptedBy: PAYEE } } },
+      jwt(h.key.privateKey, { sub: 'payee-subject' }));
     const cellId = makeCellId('cell-dispute-route');
     await h.persistence.fundingIntentStore.create(createFundingIntent({
       intentId: 'transport-dispute-intent', provider: 'test-provider', environment: 'SANDBOX', providerAccountScope: 'account-test', cellId, payer: PAYER, payee: PAYEE,
@@ -198,7 +272,7 @@ describe('Phase 7E real HTTP trusted command transport', () => {
     expect(blocked.json).toMatchObject({ outcome: 'APPLICATION_REJECTION',
       error: { code: 'FUNDING_DISPUTE_BLOCKED' } });
     expect((await h.persistence.eventStore.getEvents(cellId)).map((event) => event.type))
-      .toEqual(['CellCreated', 'CellFunded', 'ReleaseRequested']);
+      .toEqual(['CellCreated', 'CellAccepted', 'CellFunded', 'ReleaseRequested']);
   });
 
   test('invalid credential, issuer, audience, unmapped and disabled principal fail closed', async () => {
@@ -225,6 +299,20 @@ describe('Phase 7E real HTTP trusted command transport', () => {
     const impersonation = command('impersonation');
     impersonation.payload.payer = 'different-actor' as never;
     expect((await post(h, { command: impersonation }, h.token, 'principal-payer')).response.status).toBe(403);
+  });
+
+  test('HTTP /commands accepts payee decision commands and rejects payer self-acceptance', async () => {
+    const h = await setup();
+    const cellId = 'cell-bilateral-http';
+    expect((await post(h, { command: { ...command('bilateral-create'), cellId } })).response.status).toBe(200);
+    const payerAccept = await post(h, { command: { commandId: 'payer-self-accept', cellId,
+      type: 'AcceptCell', payload: { acceptedBy: PAYEE } } });
+    expect(payerAccept.response.status).toBe(403);
+    const payeeToken = jwt(h.key.privateKey, { sub: 'payee-subject' });
+    const payeeAccept = await post(h, { command: { commandId: 'payee-accept', cellId,
+      type: 'AcceptCell', payload: { acceptedBy: PAYEE } } }, payeeToken);
+    expect(payeeAccept.response.status).toBe(200);
+    expect(payeeAccept.json.nextState).toMatchObject({ status: 'CREATED', acceptanceStatus: 'ACCEPTED' });
   });
 
   test('duplicate, changed payload, cross-principal and concurrent requests preserve Phase 7A semantics', async () => {

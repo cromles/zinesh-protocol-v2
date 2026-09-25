@@ -173,7 +173,7 @@ describe('Phase 7D production JWT authentication trust anchor', () => {
     const ingress = new TrustedCommandIngress(app, authentication, authority, rejectAllFundingEvidence);
     const command = {
       commandId: makeCommandId('jwt-command'), cellId: makeCellId('jwt-cell'), type: 'CreateCell' as const,
-      payload: { payer: actorId, payee: makeActorId('jwt-payee'), amount: makeAmount(10000n), currency: 'TRY' as const,
+      payload: { payer: actorId, payee: makeActorId('jwt-payee'), description: 'JWT test agreement.', amount: makeAmount(10000n), currency: 'TRY' as const,
         fundingDeadline: makeTimestamp(2_000_000), completionDeadline: makeTimestamp(5_000_000) },
     };
     const first = await ingress.handle({ credential: token(key.privateKey, { jti: 'token-a' }), command });
@@ -192,7 +192,7 @@ describe('Phase 7D production JWT authentication trust anchor', () => {
     const app = new CellApplication({ persistence: new InMemoryPersistenceAdapter(), kernel: cellKernel,
       clock: fixedClock(makeTimestamp(1)), eventIds: createEventIdFactory('disabled') });
     const command = { commandId: makeCommandId('x'), cellId: makeCellId('x'), type: 'CreateCell' as const,
-      payload: { payer: makeActorId('a'), payee: makeActorId('b'), amount: makeAmount(1n), currency: 'TRY' as const,
+      payload: { payer: makeActorId('a'), payee: makeActorId('b'), description: 'JWT test agreement.', amount: makeAmount(1n), currency: 'TRY' as const,
         fundingDeadline: makeTimestamp(2), completionDeadline: makeTimestamp(3) } };
     const unmapped = new TrustedCommandIngress(app, authentication, { async resolve() { return null; } }, rejectAllFundingEvidence);
     const unmappedResult = await unmapped.handle({ credential: token(key.privateKey), command });

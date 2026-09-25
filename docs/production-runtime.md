@@ -119,8 +119,16 @@ Release order:
 3. Only then start or replace serving replicas of that image.
 
 Serving replicas call `verifyExpectedVersion()` at startup and on `/ready`.
-Schema version equality is exact: this image requires `{1,2,3,4,5,6,7,8}`. A newer or
+Schema version equality is exact: this image requires `{1,2,3,4,5,6,7,8,9,10}`. A newer or
 older schema is not ready. There is no mixed-version compatibility window.
+
+Migration 9 removes the legacy provider-negative uniqueness constraint whose
+generated PostgreSQL name was not removed by migration 8, allowing negative
+observations to be unique within provider, environment, and account scope.
+Migration 10 adds environment/account-scope bindings to funding intents and
+receipts and persists separately authorized negative dispositions. These are
+required by the runtime's exact provider/account binding and settlement-blocker
+checks; they must be applied with the image before serving it.
 
 Concurrent apply jobs are serialized by the existing PostgreSQL advisory lock.
 A failed apply rolls back its transaction. There are **no down migrations**.

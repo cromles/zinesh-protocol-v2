@@ -81,6 +81,9 @@ export function makeTimestamp(ms: number): Timestamp {
 /** Only TRY is supported in this version. */
 export type Currency = 'TRY';
 
+/** Maximum plain-text agreement description length accepted by CreateCell. */
+export const CELL_DESCRIPTION_MAX_LENGTH = 256;
+
 /**
  * Monetary amount in kuruş (smallest TRY unit).
  * Must be a positive bigint. No floating point. No Decimal.
@@ -115,6 +118,8 @@ export type CellStatus =
   | 'REFUNDED'
   | 'EXPIRED';
 
+export type AcceptanceStatus = 'PENDING' | 'ACCEPTED' | 'REJECTED';
+
 export const TERMINAL_STATUSES: ReadonlySet<CellStatus> = new Set([
   'RELEASED',
   'REFUNDED',
@@ -128,6 +133,10 @@ export const TERMINAL_STATUSES: ReadonlySet<CellStatus> = new Set([
 export interface CellCreatedPayload {
   readonly payer: ActorId;
   readonly payee: ActorId;
+  /** Optional only when replaying historical events written before descriptions were added. */
+  readonly description?: string;
+  /** Absent on historical cells, which retain the pre-acceptance funding behavior. */
+  readonly acceptanceRequired?: boolean;
   readonly arbiter?: ActorId;
   readonly amount: Amount;
   readonly currency: Currency;
@@ -139,6 +148,9 @@ export interface CellFundedPayload {
   readonly fundedBy: ActorId;
   readonly amount: Amount;
 }
+
+export interface CellAcceptedPayload { readonly acceptedBy: ActorId }
+export interface CellRejectedPayload { readonly rejectedBy: ActorId }
 
 export interface ReleaseRequestedPayload {
   readonly requestedBy: ActorId;
@@ -179,6 +191,8 @@ export interface DisputeResolvedPayload {
 export type DomainEvent =
   | { readonly type: 'CellCreated';      readonly payload: CellCreatedPayload }
   | { readonly type: 'CellFunded';       readonly payload: CellFundedPayload }
+  | { readonly type: 'CellAccepted';     readonly payload: CellAcceptedPayload }
+  | { readonly type: 'CellRejected';     readonly payload: CellRejectedPayload }
   | { readonly type: 'ReleaseRequested'; readonly payload: ReleaseRequestedPayload }
   | { readonly type: 'Released';         readonly payload: ReleasedPayload }
   | { readonly type: 'RefundRequested';  readonly payload: RefundRequestedPayload }
@@ -218,10 +232,13 @@ export interface Event<T extends DomainEvent = DomainEvent> {
 export interface CellState {
   readonly cellId: CellId;
   readonly status: CellStatus;
+  readonly acceptanceStatus: AcceptanceStatus;
 
   // Immutable fields set at creation and never changed
   readonly payer: ActorId;
   readonly payee: ActorId;
+  /** Absent only for historical cells created before descriptions were added. */
+  readonly description?: string;
   readonly arbiter?: ActorId;
   readonly amount: Amount;
   readonly currency: Currency;
@@ -241,6 +258,7 @@ export interface CellState {
 export interface CreateCellPayload {
   readonly payer: ActorId;
   readonly payee: ActorId;
+  readonly description: string;
   readonly arbiter?: ActorId;
   readonly amount: Amount;
   readonly currency: Currency;
@@ -252,6 +270,9 @@ export interface FundCellPayload {
   readonly funderId: ActorId;
   readonly amount: Amount;
 }
+
+export interface AcceptCellPayload { readonly acceptedBy: ActorId }
+export interface RejectCellPayload { readonly rejectedBy: ActorId }
 
 export interface RequestReleasePayload {
   readonly requestedBy: ActorId;
@@ -295,6 +316,8 @@ export interface ResolveDisputePayload {
 
 export type DomainCommand =
   | { readonly type: 'CreateCell';      readonly payload: CreateCellPayload }
+  | { readonly type: 'AcceptCell';      readonly payload: AcceptCellPayload }
+  | { readonly type: 'RejectCell';      readonly payload: RejectCellPayload }
   | { readonly type: 'FundCell';        readonly payload: FundCellPayload }
   | { readonly type: 'RequestRelease';  readonly payload: RequestReleasePayload }
   | { readonly type: 'ApproveRelease';  readonly payload: ApproveReleasePayload }

@@ -16,7 +16,7 @@
  * append / getEvents calls it always produces the same result.
  */
 
-import type { CellId, Event, Version } from '../core/types';
+import type { ActorId, CellId, Event, Version } from '../core/types';
 import type { AppendResult, EventStore } from './event-store';
 
 export class InMemoryEventStore implements EventStore {
@@ -77,6 +77,15 @@ export class InMemoryEventStore implements EventStore {
     }
     // Return a shallow copy. Events are readonly objects so shallow copy is safe.
     return [...stream];
+  }
+
+  async getEventsForActor(actorId: ActorId): Promise<ReadonlyArray<Event>> {
+    return [...this.streams.entries()]
+      .filter(([, events]) => events.some((event) => event.type === 'CellCreated'
+        && ((event.payload as import('../core/types').CellCreatedPayload).payer === actorId
+          || (event.payload as import('../core/types').CellCreatedPayload).payee === actorId)))
+      .sort(([left], [right]) => String(left).localeCompare(String(right)))
+      .flatMap(([, events]) => [...events]);
   }
 
   async getEventsSince(cellId: CellId, afterVersion: Version): Promise<ReadonlyArray<Event>> {

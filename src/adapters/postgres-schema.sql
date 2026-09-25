@@ -11,7 +11,7 @@
 --   - event timestamps are caller-supplied (NO DEFAULT NOW(), NO CURRENT_TIMESTAMP)
 --   - UNIQUE(cell_id, version) enforces optimistic concurrency
 --   - snapshots allow UPSERT (event data does not)
---   - No cross-cell queries; all operations are cell-scoped by application code
+--   - History reads are cell-scoped; actor directory lookup is restricted to matching CellCreated participants
 
 -- ---------------------------------------------------------------------------
 -- events

@@ -121,6 +121,7 @@ export class FundingReconciliationService {
 
 function routeMatchesIntent(route:FundingRoute,intent:FundingIntent):boolean{
   return route.intentId===intent.intentId&&route.provider===intent.provider&&route.destinationReference===intent.destinationId
+    &&route.environment===intent.environment&&route.providerAccountScope===intent.providerAccountScope
     &&route.currency===intent.currency&&route.expectedAmount===intent.amount;
 }
 function isNegative(state:FundingObservation['state']):boolean{

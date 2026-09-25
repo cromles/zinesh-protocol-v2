@@ -9,7 +9,7 @@
  *   - Caller-supplied versions, timestamps, event_ids, and payloads are stored verbatim
  *   - Database never generates or modifies versions, timestamps, or event_ids
  *   - No SERIAL / IDENTITY / sequence for event versioning
- *   - Every query is scoped by cell_id — no cross-cell access
+ *   - History queries are scoped by cell_id; actor directory lookup is limited to participant CellCreated events
  *   - Multi-event append is atomic via a single transaction
  *   - Version conflict (UNIQUE violation) is translated to AppendResult { ok: false }
  *   - No SELECT FOR UPDATE, no pessimistic locking, no advisory locks
@@ -18,7 +18,7 @@
  */
 
 import type { Pool, PoolClient, QueryResult, QueryResultRow } from 'pg';
-import type { CellId, Event, Version } from '../core/types';
+import type { ActorId, CellId, Event, Version } from '../core/types';
 import { makeEventId, makeCellId, makeTimestamp } from '../core/types';
 import type { AppendResult, EventStore } from './event-store';
 
@@ -182,6 +182,20 @@ export class PostgresEventStore implements EventStore {
        WHERE cell_id = $1
        ORDER BY version ASC`,
       [cellId],
+    );
+    return result.rows.map(rowToEvent);
+  }
+
+  async getEventsForActor(actorId: ActorId): Promise<ReadonlyArray<Event>> {
+    const result = await (this.transactionClient ?? this.pool).query<EventRow>(
+      `SELECT e.event_id, e.cell_id, e.version, e.timestamp, e.type, e.payload
+       FROM events e
+       WHERE e.cell_id IN (
+         SELECT cell_id FROM events
+         WHERE type = 'CellCreated' AND (payload->>'payer' = $1 OR payload->>'payee' = $1)
+       )
+       ORDER BY e.cell_id ASC, e.version ASC`,
+      [actorId],
     );
     return result.rows.map(rowToEvent);
   }

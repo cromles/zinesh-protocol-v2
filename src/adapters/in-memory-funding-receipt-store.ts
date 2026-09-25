@@ -13,6 +13,10 @@ export class InMemoryFundingReceiptStore implements FundingReceiptStore {
     return this.receipts.find((item) => item.receiptId === receiptId) ?? null;
   }
 
+  async getByCellId(cellId: FundingReceipt['cellId']): Promise<FundingReceipt | null> {
+    return this.receipts.find((item) => item.cellId === cellId) ?? null;
+  }
+
   async claim(receipt: FundingReceipt): Promise<FundingReceiptClaimResult> {
     const matches = this.receipts.filter((existing) => conflictsWith(existing, receipt));
     if (matches.length === 0) {

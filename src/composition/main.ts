@@ -22,9 +22,19 @@ import type {
   ExternalCommandRequest,
   FundingEvidencePort,
   FundingConfirmationRequest,
+  FundingObservationEvidencePort,
+  FundingObservationIngressResult,
+  FundingObservationRequest,
+  ActorCellListResult,
+  ActorCellStateResult,
+  FundingIntentProvisionRequest,
+  FundingRouteProvisionRequest,
   FundingDestinationResolver,
   PrincipalAuthority,
+  PrototypeFundingPort,
 } from '../security/trusted-ingress';
+import type { FundingReceipt } from '../funding/types';
+import type { PrototypeFundingRequest } from '../security/trusted-ingress';
 import { TrustedNegativeResolutionIngress, rejectAllNegativeResolutionEvidence } from '../security/negative-resolution-ingress';
 import type { FundingNegativeResolutionRequest, NegativeResolutionEvidencePort, NegativeResolutionResult } from '../security/negative-resolution-ingress';
 import {
@@ -39,7 +49,7 @@ import { isIP } from 'net';
 import { X509Certificate } from 'crypto';
 import { lstatSync, readFileSync } from 'fs';
 import { PostgresFixedWindowRateLimiter } from '../adapters/postgres-rate-limit-store';
-import { FundingReconciliationService } from '../funding/funding-reconciliation-service';
+import type { FundingIntentCreateResult } from '../adapters/funding-intent-store';
 import { allowAllRateLimiter } from '../security/rate-limiter';
 import type { RateLimiter, RateLimitPolicy } from '../security/rate-limiter';
 import {
@@ -77,6 +87,27 @@ export class RuntimeUnavailableError extends Error {
 }
 
 export type EnvMap = NodeJS.ProcessEnv;
+
+export interface PrototypeFundingConfig {
+  readonly environment: 'development' | 'production';
+  readonly enabled: boolean;
+}
+
+export function loadPrototypeFundingConfig(env: EnvMap): PrototypeFundingConfig {
+  const environment = env['ZINESH_RUNTIME_ENV'] ?? 'production';
+  if (environment !== 'development' && environment !== 'production') {
+    throw new ConfigurationError('ZINESH_RUNTIME_ENV', 'must be development or production');
+  }
+  const enabledValue = env['PROTOTYPE_FUNDING_ENABLED'] ?? 'false';
+  if (enabledValue !== 'true' && enabledValue !== 'false') {
+    throw new ConfigurationError('PROTOTYPE_FUNDING_ENABLED', 'must be true or false');
+  }
+  const enabled = enabledValue === 'true';
+  if (enabled && environment !== 'development') {
+    throw new ConfigurationError('PROTOTYPE_FUNDING_ENABLED', 'is only allowed in development');
+  }
+  return { environment, enabled };
+}
 
 export function loadPostgresConfig(env: EnvMap): PostgresConfig {
   for (const name of FORBIDDEN_POSTGRES_VARS) {
@@ -412,7 +443,7 @@ export function createCommandGate(): CommandGate {
 
 export function createProcessProbes(
   gate: CommandGate,
-  persistence: PostgresPersistenceAdapter,
+  persistence: Pick<RuntimePersistence, 'readyCheck'>,
 ): ProcessProbes {
   return {
     shuttingDown: () => gate.shuttingDown,
@@ -421,23 +452,38 @@ export function createProcessProbes(
 }
 
 export interface ComposedRuntime {
-  readonly persistence: PostgresPersistenceAdapter;
+  readonly persistence: RuntimePersistence;
   readonly gate: CommandGate;
   readonly preAuthenticationRateLimiter: RateLimiter;
   readonly telemetry: SecurityTelemetry;
-  readonly fundingReconciliation: FundingReconciliationService;
   handleCommand(request: ExternalCommandRequest): Promise<HandleCommandResult>;
   handleFundingConfirmation(request: FundingConfirmationRequest): Promise<HandleCommandResult>;
   resolveFundingNegative(request: FundingNegativeResolutionRequest): Promise<NegativeResolutionResult>;
+  provisionFundingIntent(request: FundingIntentProvisionRequest): Promise<FundingIntentCreateResult>;
+  provisionFundingRoute(request: FundingRouteProvisionRequest): Promise<'CREATED' | 'DUPLICATE' | 'CONFLICT'>;
+  reconcileFundingObservation(request: FundingObservationRequest): Promise<FundingObservationIngressResult>;
+  getFundingReceipt(credential: unknown, cellId: import('../core/types').CellId): Promise<FundingReceipt | null>;
+  listActorCells(credential: unknown): Promise<ActorCellListResult>;
+  getActorCellState(credential: unknown, cellId: string): Promise<ActorCellStateResult>;
+  handlePrototypeFunding?(request: PrototypeFundingRequest): Promise<HandleCommandResult>;
+}
+
+export interface RuntimePersistence {
+  connect(): Promise<void>;
+  disconnect(): Promise<void>;
+  readyCheck(): Promise<boolean>;
+  readonly migrator: { verifyExpectedVersion(): Promise<void> };
 }
 
 export interface SecurityPorts {
   readonly authentication: AuthenticationPort;
   readonly principals: PrincipalAuthority;
   readonly fundingEvidence: FundingEvidencePort;
+  readonly fundingObservationEvidence: FundingObservationEvidencePort;
   readonly principalRateLimiter: RateLimiter;
   readonly fundingDestinations: FundingDestinationResolver;
   readonly negativeResolutionEvidence: NegativeResolutionEvidencePort;
+  readonly prototypeFundingEvidence: PrototypeFundingPort;
 }
 
 export function composeRuntime(
@@ -445,11 +491,15 @@ export function composeRuntime(
   security?: Partial<SecurityPorts>,
   rateLimiting?: RateLimitingConfig,
   telemetry: SecurityTelemetry = noOpSecurityTelemetry,
+  prototypeFundingConfig: PrototypeFundingConfig = { environment: 'production', enabled: false },
 ): ComposedRuntime {
+  if (prototypeFundingConfig.enabled && prototypeFundingConfig.environment !== 'development') {
+    throw new ConfigurationError('PROTOTYPE_FUNDING_ENABLED', 'is only allowed in development');
+  }
+  if (prototypeFundingConfig.enabled && security?.prototypeFundingEvidence === undefined) {
+    throw new ConfigurationError('PROTOTYPE_FUNDING_ENABLED', 'requires a development-only evidence adapter');
+  }
   const persistence = new PostgresPersistenceAdapter(config, telemetry);
-  const fundingReconciliation = new FundingReconciliationService(
-    persistence.providerFoundationStore,persistence.fundingIntentStore,
-  );
   const negativeResolution = new TrustedNegativeResolutionIngress(
     security?.authentication ?? failClosedAuthentication,
     security?.principals ?? persistence.principalAuthority,
@@ -479,14 +529,22 @@ export function composeRuntime(
     principalRateLimiter,
     telemetry,
     security?.fundingDestinations,
+    security?.fundingObservationEvidence,
+    prototypeFundingConfig.enabled ? security?.prototypeFundingEvidence : undefined,
   );
 
+  const runtimePersistence: RuntimePersistence = {
+    connect: () => persistence.connect(),
+    disconnect: () => persistence.disconnect(),
+    readyCheck: () => persistence.readyCheck(),
+    migrator: { verifyExpectedVersion: () => persistence.migrator.verifyExpectedVersion() },
+  };
+
   return {
-    persistence,
+    persistence: runtimePersistence,
     gate,
     preAuthenticationRateLimiter,
     telemetry,
-    fundingReconciliation,
     handleCommand(request: ExternalCommandRequest): Promise<HandleCommandResult> {
       return gate.run(() => ingress.handle(request));
     },
@@ -496,6 +554,27 @@ export function composeRuntime(
     resolveFundingNegative(request: FundingNegativeResolutionRequest): Promise<NegativeResolutionResult> {
       return gate.run(() => negativeResolution.resolve(request));
     },
+    provisionFundingIntent(request: FundingIntentProvisionRequest): Promise<FundingIntentCreateResult> {
+      return gate.run(() => ingress.provisionFundingIntent(request));
+    },
+    provisionFundingRoute(request: FundingRouteProvisionRequest): Promise<'CREATED' | 'DUPLICATE' | 'CONFLICT'> {
+      return gate.run(() => ingress.provisionFundingRoute(request));
+    },
+    reconcileFundingObservation(request: FundingObservationRequest): Promise<FundingObservationIngressResult> {
+      return gate.run(() => ingress.reconcileFundingObservation(request));
+    },
+    getFundingReceipt(credential: unknown, cellId: import('../core/types').CellId): Promise<FundingReceipt | null> {
+      return gate.run(() => ingress.getFundingReceipt(credential, cellId));
+    },
+    listActorCells(credential: unknown): Promise<ActorCellListResult> {
+      return gate.run(() => ingress.listActorCells(credential));
+    },
+    getActorCellState(credential: unknown, cellId: string): Promise<ActorCellStateResult> {
+      return gate.run(() => ingress.getActorCellState(credential, cellId));
+    },
+    ...(prototypeFundingConfig.enabled ? { handlePrototypeFunding(request: PrototypeFundingRequest): Promise<HandleCommandResult> {
+      return gate.run(() => ingress.handlePrototypeFunding(request));
+    } } : {}),
   };
 }
 
@@ -576,12 +655,17 @@ export async function main(
   let transportConfig: CommandHttpsConfig;
   let rateLimitingConfig: RateLimitingConfig;
   let observabilityConfig: SecurityObservabilityConfig;
+  let prototypeFundingConfig: PrototypeFundingConfig;
   try {
     config = loadPostgresConfig(env);
     authenticationConfig = loadAuthenticationConfig(env);
     transportConfig = loadPublicIngressConfig(env);
     rateLimitingConfig = loadRateLimitingConfig(env);
     observabilityConfig = loadSecurityObservabilityConfig(env);
+    prototypeFundingConfig = loadPrototypeFundingConfig(env);
+    if (prototypeFundingConfig.enabled) {
+      throw new ConfigurationError('PROTOTYPE_FUNDING_ENABLED', 'requires the separate development runtime');
+    }
   } catch (error) {
     if (error instanceof ConfigurationError) {
       reportConfigurationError(error);
@@ -601,7 +685,7 @@ export async function main(
       authenticationConfig.jwksTimeoutMs,
     ),
   );
-  const runtime = composeRuntime(config, { authentication }, rateLimitingConfig, telemetry);
+  const runtime = composeRuntime(config, { authentication }, rateLimitingConfig, telemetry, prototypeFundingConfig);
   let transport: CommandHttpsTransport | undefined;
 
   try {

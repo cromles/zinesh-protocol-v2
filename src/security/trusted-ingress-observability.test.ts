@@ -20,7 +20,8 @@ function createCommand(id = 'observability-command', amount = 100n, payer = PAYE
   return {
     commandId: makeCommandId(id), cellId: makeCellId(`cell-${id}`), type: 'CreateCell' as const,
     payload: {
-      payer, payee: makeActorId('observability-payee'), amount: makeAmount(amount), currency: 'TRY' as const,
+      payer, payee: makeActorId('observability-payee'), description: 'Observability test agreement.',
+      amount: makeAmount(amount), currency: 'TRY' as const,
       fundingDeadline: makeTimestamp(2_000_000), completionDeadline: makeTimestamp(3_000_000),
     },
   };

@@ -9,7 +9,15 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
+    "typecheck:frontend": "tsc -p frontend/tsconfig.json --noEmit",
     "build": "node scripts/clean-dist.cjs && tsc",
+    "build:development": "tsc -p tsconfig.development.json",
+    "dev": "node scripts/dev-stack.cjs",
+    "dev:backend": "npm run build:development && node dist-development/development/development-launcher.js",
+    "dev:frontend": "vite frontend --host localhost --port 5173 --strictPort --configLoader native",
+    "build:frontend": "vite build frontend --configLoader native --outDir frontend/dist",
+    "test:frontend": "vitest run --config ./frontend/vitest.config.ts --configLoader native",
+    "dev:provision-actors": "npm run build:development && node dist-development/development/provision-development-actors.js",
     "artifact:smoke": "node scripts/verify-artifact.cjs",
     "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js --runInBand",
     "test:coverage": "node --experimental-vm-modules node_modules/jest/bin/jest.js --runInBand --coverage"
@@ -21,8 +29,16 @@
     "@types/jest": "^29.5.14",
     "@types/node": "^22.0.0",
     "@types/pg": "^8.23.1",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^5.0.0",
     "jest": "^29.7.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-router-dom": "^7.0.0",
     "ts-jest": "^29.2.0",
-    "typescript": "^5.5.0"
+    "typescript": "^5.5.0",
+    "vite": "^7.0.0",
+    "vitest": "^3.2.0"
   }
 }

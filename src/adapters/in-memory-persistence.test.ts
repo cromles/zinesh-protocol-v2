@@ -116,6 +116,7 @@ function makeSnapshot(cellId: CellId, version: Version): Snapshot {
   const state: CellState = {
     cellId,
     status:             'FUNDED',
+    acceptanceStatus:   'ACCEPTED',
     payer:              PAYER,
     payee:              PAYEE,
     amount:             AMOUNT,
@@ -132,6 +133,25 @@ function makeSnapshot(cellId: CellId, version: Version): Snapshot {
 // ---------------------------------------------------------------------------
 
 describe('EventStore — InMemoryEventStore', () => {
+  test('actor directory lookup returns only cells created with the actor as payer or payee', async () => {
+    const store = new InMemoryEventStore();
+    const outsider = makeActorId('outsider-1');
+    const unrelatedEvent = makeEvent(CELL_B, V1);
+    const unrelated = { ...unrelatedEvent, payload: {
+      ...(unrelatedEvent.payload as import('../core/types').CellCreatedPayload),
+      payer: outsider, payee: outsider,
+    } };
+    const payeeEvent = makeEvent(CELL_C, V1);
+    await store.append(CELL_A, [makeEvent(CELL_A, V1)]);
+    await store.append(CELL_B, [unrelated]);
+    await store.append(CELL_C, [{ ...payeeEvent, payload: {
+      ...(payeeEvent.payload as import('../core/types').CellCreatedPayload), payee: PAYER,
+    } }]);
+    await expect(store.getEventsForActor(PAYER)).resolves.toEqual([
+      ...await store.getEvents(CELL_A), ...await store.getEvents(CELL_C),
+    ]);
+  });
+
 
   test('1. append single event → getEvents returns it', async () => {
     const store = new InMemoryEventStore();
