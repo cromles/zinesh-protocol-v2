@@ -1,15 +1,20 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Link, Navigate, Route, Routes, useNavigate, useParams } from 'react-router-dom';
-import { acceptCell, ApiError, approveRelease, createCell, currentSession, getCell, getCells,
-  prototypeFunding, rejectCell, requestRelease, switchRole } from './api';
+import { acceptCell, approveRelease, createCell, currentRole, getCell, getCells,
+  prototypeFunding, rejectCell, requestRelease, subscribeToRole, switchRole, userMessage } from './api';
 import type { CellState, CellSummary, Role } from './api';
+import { formatTryAmount } from './money';
 
 export function App() {
-  const [role, setRole] = useState<Role | null>(currentSession()?.role ?? null);
+  const [role, setRole] = useState<Role | null>(currentRole());
   const [authError, setAuthError] = useState('');
+  useEffect(() => subscribeToRole((nextRole) => {
+    setRole(nextRole);
+    if (nextRole === null) setAuthError('Oturum sona erdi. Devam etmek için rolünüzü yeniden seçin.');
+  }), []);
   const chooseRole = async (next: Role) => {
-    try { await switchRole(next); setRole(next); setAuthError(''); }
-    catch (error) { setAuthError(errorMessage(error)); }
+    try { await switchRole(next); setAuthError(''); }
+    catch (error) { setAuthError(userMessage(error)); }
   };
   if (!role) return <main className="shell narrow"><p className="eyebrow">ZINESH · DEVELOPMENT</p><h1>Nasıl devam ediyorsun?</h1>
     <p>İki taraflı anlaşma akışını denemek için bir rol seç.</p><div className="role-switch">
@@ -28,24 +33,24 @@ function AgreementList() {
   const [cells, setCells] = useState<CellSummary[]>([]); const [error, setError] = useState(''); const [loading, setLoading] = useState(true);
   const load = useCallback(async () => { try { setCells(await getCells()); setError(''); } catch (e) { setError(errorMessage(e)); } finally { setLoading(false); } }, []);
   useEffect(() => { void load(); }, [load]);
-  const role = currentSession()?.role;
+  const role = currentRole();
   return <main className="shell"><div className="page-heading"><div><p className="eyebrow">ANLAŞMALAR</p><h1>Anlaşmalar</h1></div>{role === 'payer' && <Link className="button" to="/agreements/new">Yeni anlaşma</Link>}</div>
     {error && <ErrorMessage message={error} />}{loading ? <p className="muted">Yükleniyor…</p> : cells.length === 0
       ? <section className="empty"><h2>Henüz anlaşma yok</h2><p>İlk anlaşmanı oluşturup diğer tarafı davet et.</p>{role === 'payer' && <Link className="button" to="/agreements/new">Anlaşma oluştur</Link>}</section>
       : <ul className="agreement-list">{cells.map((cell) => <li key={cell.cellId}><Link to={`/agreements/${encodeURIComponent(cell.cellId)}`}>
         <span className="agreement-main"><strong>{cell.description || 'Anlaşma'}</strong><small>Karşı taraf · {cell.counterpartyId}</small></span>
-        <span className="agreement-side"><strong>{formatAmount(cell.amount)} {cell.currency}</strong><small>{statusLabel(cell.status, cell.acceptanceStatus)}</small></span>
+        <span className="agreement-side"><strong>{formatTryAmount(cell.amount)}</strong><small>{statusLabel(cell.status, cell.acceptanceStatus)}</small></span>
       </Link></li>)}</ul>}
   </main>;
 }
 
 function NewAgreement() {
-  const role = currentSession()?.role ?? 'payer';
+  const role = currentRole();
   const navigate = useNavigate(); const [payee, setPayee] = useState('development-payee'); const [amount, setAmount] = useState('');
   const [description, setDescription] = useState(''); const [error, setError] = useState(''); const [busy, setBusy] = useState(false);
   const submit = async (event: React.FormEvent) => {
     event.preventDefault(); setBusy(true); setError('');
-    try { const result = await createCell({ payer: 'development-payer', payee, amount, description });
+    try { const result = await createCell({ payer: 'development-payer', payee, amountTry: amount, description });
       if (result.outcome !== 'SUCCESS') throw new Error(result.error?.code ?? 'CREATE_FAILED');
       navigate(`/agreements/${encodeURIComponent(result.cellId)}`);
     } catch (e) { setError(errorMessage(e)); } finally { setBusy(false); }
@@ -54,7 +59,7 @@ function NewAgreement() {
     <h1>Yeni anlaşmayı PAYER oluşturur</h1><p>Development rolünü Payer olarak değiştirip yeniden dene.</p></main>;
   return <main className="shell narrow"><Link className="back-link" to="/agreements">← Anlaşmalar</Link><p className="eyebrow">YENİ ANLAŞMA</p><h1>Ne üzerinde anlaşıyorsunuz?</h1>
     <form className="form" onSubmit={(e) => void submit(e)}><label>Karşı taraf ID<input value={payee} onChange={(e) => setPayee(e.target.value)} required maxLength={128} /></label>
-      <label>Tutar (TRY)<input inputMode="numeric" pattern="[1-9][0-9]{0,30}" value={amount} onChange={(e) => setAmount(e.target.value)} required /></label>
+      <label>Tutar (TRY)<input inputMode="decimal" placeholder="100,00" value={amount} onChange={(e) => setAmount(e.target.value)} required /></label>
       <label>Açıklama<textarea value={description} onChange={(e) => setDescription(e.target.value)} required maxLength={256} rows={4} /></label>
       {error && <ErrorMessage message={error} />}<button disabled={busy}>{busy ? 'Gönderiliyor…' : 'Anlaşmayı gönder'}</button></form>
   </main>;
@@ -69,7 +74,7 @@ function AgreementRoom({ role }: { role: Role }) {
   if (!cell) return <main className="shell"><p className="muted">Yükleniyor…</p></main>;
   const counterparty = role === 'payer' ? cell.payee : cell.payer;
   return <main className="shell narrow"><Link className="back-link" to="/agreements">← Anlaşmalar</Link><p className="eyebrow">ANLAŞMA ODASI</p>
-    <h1>{cell.description || 'Anlaşma'}</h1><dl className="details"><div><dt>Karşı taraf</dt><dd>{counterparty}</dd></div><div><dt>Tutar</dt><dd>{formatAmount(cell.amount)} {cell.currency}</dd></div>
+    <h1>{cell.description || 'Anlaşma'}</h1><dl className="details"><div><dt>Karşı taraf</dt><dd>{counterparty}</dd></div><div><dt>Tutar</dt><dd>{formatTryAmount(cell.amount)}</dd></div>
       <div><dt>Durum</dt><dd>{statusLabel(cell.status, cell.acceptanceStatus)}</dd></div></dl>
     {error && <ErrorMessage message={error} />}{cell.acceptanceStatus === 'PENDING' && <section className="next-step"><h2>Karşı tarafın yanıtı bekleniyor</h2>
       {role === 'payee' && <div className="actions"><button disabled={busy} onClick={() => void act(() => acceptCell(cell.cellId))}>Kabul et</button>
@@ -86,20 +91,12 @@ function AgreementRoom({ role }: { role: Role }) {
 }
 
 function ErrorMessage({ message }: { message: string }) {
-  return <p role="alert" className="error">{message === 'UNAUTHENTICATED' ? 'Oturum yenilenemedi. Geliştirme sunucusunu kontrol et.'
-    : message === 'FORBIDDEN' || message === 'COMMAND_NOT_PERMITTED' ? 'Bu işlem için yetkin yok.'
-    : message === 'NOT_FOUND' || message === 'CELL_NOT_FOUND' ? 'Anlaşma bulunamadı.'
-    : message === 'IDEMPOTENCY_CONFLICT' ? 'Bu istek kimliği farklı bir işlem için kullanılmış.'
-    : message === 'PROTOTYPE_FUNDING_ENABLED' ? 'Demo funding development ortamında kullanılamıyor.'
-    : message === 'BACKEND_UNAVAILABLE' ? 'Development backend bağlantısı kurulamadı.'
-    : message}</p>;
+  return <p role="alert" className="error">{message}</p>;
 }
 
 function errorMessage(error: unknown): string {
-  if (error instanceof ApiError) return error.code;
-  return error instanceof Error ? error.message : 'İstek tamamlanamadı.';
+  return userMessage(error);
 }
-function formatAmount(amount: string | number | bigint): string { return BigInt(amount).toLocaleString('tr-TR'); }
 function statusLabel(status: string, acceptance: string): string {
   if (acceptance === 'REJECTED') return 'Reddedildi'; if (acceptance === 'PENDING') return 'Yanıt bekleniyor';
   return ({ CREATED: 'Kabul edildi', FUNDED: 'Devam ediyor', RELEASED: 'Tamamlandı', REFUNDED: 'İade edildi', DISPUTED: 'İncelemede', EXPIRED: 'Süresi doldu' } as Record<string, string>)[status] ?? status;

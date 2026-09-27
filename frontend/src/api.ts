@@ -1,3 +1,5 @@
+import { AmountInputError, tryAmountToKurus } from './money';
+
 export type Role = 'payer' | 'payee';
 export type CellStatus = 'CREATED' | 'FUNDED' | 'RELEASED' | 'REFUNDED' | 'DISPUTED' | 'EXPIRED';
 export type AcceptanceStatus = 'PENDING' | 'ACCEPTED' | 'REJECTED';
@@ -6,7 +8,7 @@ export interface CellSummary {
   cellId: string;
   counterpartyId: string;
   description?: string;
-  amount: string | number | bigint;
+  amount: string;
   currency: 'TRY';
   status: CellStatus;
   acceptanceStatus: AcceptanceStatus;
@@ -21,7 +23,7 @@ export interface CellState {
   payer: string;
   payee: string;
   description?: string;
-  amount: string | number | bigint;
+  amount: string;
   currency: 'TRY';
   status: CellStatus;
   acceptanceStatus: AcceptanceStatus;
@@ -35,27 +37,35 @@ interface CommandResponse { outcome: string; error?: { code: string }; nextState
 export interface Session { role: Role; token: string; expiresAt: number }
 
 let session: Session | null = null;
+let selectedRole: Role | null = null;
+const roleListeners = new Set<(role: Role | null) => void>();
 
 export function currentSession(): Session | null {
   if (session && session.expiresAt <= Date.now()) session = null;
   return session;
 }
 
+export function currentRole(): Role | null {
+  return selectedRole;
+}
+
+export function subscribeToRole(listener: (role: Role | null) => void): () => void {
+  roleListeners.add(listener);
+  return () => roleListeners.delete(listener);
+}
+
 export async function switchRole(role: Role): Promise<Session> {
   session = null;
-  const response = await fetch('/api/development/auth/token', {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ role }),
-  });
-  if (!response.ok) throw new ApiError(await readCode(response), response.status);
-  const result = await response.json() as TokenResponse;
-  session = { role, token: result.token, expiresAt: Date.now() + result.expiresIn * 1000 };
-  return session;
+  selectedRole = role;
+  return requestRoleToken(role);
 }
 
 async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   let active = currentSession();
-  if (!active) active = await switchRole('payer');
+  if (!active) {
+    if (selectedRole === null) throw new ApiError('UNAUTHENTICATED', 401);
+    active = await requestRoleToken(selectedRole);
+  }
   const send = (token: string) => fetch(`/api${path}`, {
     ...init,
     headers: { ...(init.body ? { 'content-type': 'application/json' } : {}),
@@ -63,11 +73,35 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   });
   let response = await send(active.token);
   if (response.status === 401) {
-    active = await switchRole(active.role);
+    active = await requestRoleToken(active.role);
     response = await send(active.token);
   }
   if (!response.ok) throw new ApiError(await readCode(response), response.status);
   return response.json() as Promise<T>;
+}
+
+async function requestRoleToken(role: Role): Promise<Session> {
+  try {
+    const response = await fetch('/api/development/auth/token', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ role }),
+    });
+    if (!response.ok) throw new ApiError(await readCode(response), response.status);
+    const result = await response.json() as TokenResponse;
+    session = { role, token: result.token, expiresAt: Date.now() + result.expiresIn * 1000 };
+    selectedRole = role;
+    publishRole(role);
+    return session;
+  } catch (error) {
+    session = null;
+    selectedRole = null;
+    publishRole(null);
+    throw error;
+  }
+}
+
+function publishRole(role: Role | null): void {
+  for (const listener of roleListeners) listener(role);
 }
 
 async function readCode(response: Response): Promise<string> {
@@ -81,6 +115,31 @@ export class ApiError extends Error {
   constructor(readonly code: string, readonly status: number) { super(code); }
 }
 
+export function userMessage(error: unknown): string {
+  if (error instanceof AmountInputError) return 'Geçerli bir TRY tutarı girin (en fazla iki ondalık basamak).';
+  if (error instanceof ApiError) {
+    if (error.status === 401 || error.code === 'UNAUTHENTICATED') return 'Oturum doğrulanamadı. Lütfen rolünüzü yeniden seçin.';
+    if (error.status === 403 || ['FORBIDDEN', 'COMMAND_NOT_PERMITTED', 'AUTHORIZATION_DENIED', 'PRINCIPAL_DISABLED'].includes(error.code)) {
+      return 'Bu işlem için yetkiniz yok.';
+    }
+    if (error.status === 404 || ['NOT_FOUND', 'CELL_NOT_FOUND'].includes(error.code)) return 'Anlaşma bulunamadı.';
+    if (error.status === 409 || ['IDEMPOTENCY_CONFLICT', 'FUNDING_RECEIPT_CONFLICT', 'FUNDING_DISPUTE_BLOCKED'].includes(error.code)) {
+      return error.code === 'IDEMPOTENCY_CONFLICT'
+        ? 'İstek başka bir işlemle çakıştı. Lütfen sayfayı yenileyip tekrar deneyin.'
+        : 'Anlaşmanın mevcut durumu bu işleme izin vermiyor.';
+    }
+    if (error.status === 429 || error.code === 'RATE_LIMITED') return 'Çok fazla istek gönderildi. Lütfen biraz bekleyip tekrar deneyin.';
+    if (error.status >= 500 || ['BACKEND_UNAVAILABLE', 'RUNTIME_UNAVAILABLE', 'UNAVAILABLE',
+      'RATE_LIMIT_UNAVAILABLE', 'FUNDING_DEPENDENCY_UNAVAILABLE'].includes(error.code)) {
+      return 'Hizmet şu anda kullanılamıyor. Lütfen daha sonra tekrar deneyin.';
+    }
+    if (error.status === 400 || error.status === 422 || ['INVALID_INPUT', 'INVALID_COMMAND', 'INVALID_REQUEST',
+      'FUNDING_NOT_FINAL'].includes(error.code)) return 'Bilgiler geçersiz veya işlem şu an için uygun değil. Lütfen kontrol edin.';
+  }
+  if (error instanceof TypeError) return 'Hizmete bağlanılamadı. Bağlantınızı kontrol edip tekrar deneyin.';
+  return 'İşlem tamamlanamadı. Lütfen tekrar deneyin.';
+}
+
 export async function getCells(): Promise<CellSummary[]> {
   return (await api<{ cells: CellSummary[] }>('/cells')).cells;
 }
@@ -89,11 +148,12 @@ export async function getCell(cellId: string): Promise<CellState> {
   return (await api<{ cell: { state: CellState } }>('/cells/' + encodeURIComponent(cellId))).cell.state;
 }
 
-export async function createCell(input: { payer: string; payee: string; amount: string; description: string }): Promise<CommandResponse & { cellId: string }> {
+export async function createCell(input: { payer: string; payee: string; amountTry: string; description: string }): Promise<CommandResponse & { cellId: string }> {
   const cellId = crypto.randomUUID();
+  const amount = tryAmountToKurus(input.amountTry);
   const result = await api<CommandResponse>('/commands', { method: 'POST', body: JSON.stringify({ command: {
     commandId: crypto.randomUUID(), cellId, type: 'CreateCell',
-    payload: { payer: input.payer, payee: input.payee, amount: input.amount,
+    payload: { payer: input.payer, payee: input.payee, amount,
       currency: 'TRY', description: input.description,
       fundingDeadline: Date.now() + 7 * 24 * 60 * 60 * 1000,
       completionDeadline: Date.now() + 14 * 24 * 60 * 60 * 1000 },
@@ -114,11 +174,11 @@ export function prototypeFunding(cellId: string): Promise<CommandResponse> {
 }
 
 export function requestRelease(cellId: string): Promise<CommandResponse> {
-  return command(cellId, 'RequestRelease', { requestedBy: currentSession()?.role === 'payer' ? 'development-payer' : 'development-payee' });
+  return command(cellId, 'RequestRelease', { requestedBy: selectedRole === 'payer' ? 'development-payer' : 'development-payee' });
 }
 
 export function approveRelease(cellId: string): Promise<CommandResponse> {
-  return command(cellId, 'ApproveRelease', { approvedBy: currentSession()?.role === 'payer' ? 'development-payer' : 'development-payee' });
+  return command(cellId, 'ApproveRelease', { approvedBy: selectedRole === 'payer' ? 'development-payer' : 'development-payee' });
 }
 
 function command(cellId: string, type: string, payload: Record<string, string>): Promise<CommandResponse> {
