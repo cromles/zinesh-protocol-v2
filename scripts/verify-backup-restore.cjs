@@ -9,6 +9,7 @@ const { spawnSync } = require('node:child_process');
 const Module = require('node:module');
 const ts = require('typescript');
 const { Pool } = require('pg');
+const { PostgresPrincipalAuthority } = require('../dist/adapters/postgres-principal-authority');
 
 const image = process.argv[2];
 assert.ok(image, 'usage: node scripts/verify-backup-restore.cjs <image>');
@@ -20,12 +21,9 @@ assert.equal(process.env.PGPASSWORD, undefined, 'PGPASSWORD is not accepted for 
 assert.equal(process.env.PG_TLS_MODE ?? 'verify-full', 'verify-full');
 
 const distMain = join(__dirname, '..', 'dist', 'composition', 'main.js');
-const distKernel = join(__dirname, '..', 'dist', 'kernel', 'index.js');
 assert.equal(require('node:fs').existsSync(distMain), true, 'compiled composition root is missing');
-assert.equal(require('node:fs').existsSync(distKernel), true, 'compiled kernel is missing');
 
 const { composeRuntime, loadPostgresConfig } = require(distMain);
-const { cellKernel } = require(distKernel);
 
 const suffix = `${process.pid}-${Date.now()}`;
 const sourceDatabase = `zinesh_backup_src_${process.pid}_${Date.now()}`;
@@ -121,9 +119,10 @@ async function execute() {
 }
 
 async function seedAndCapture(databaseName) {
-  const runtime = runtimeFor(databaseName);
+  const { runtime, principalAuthority, closePrincipalAuthority } = runtimeFor(databaseName);
+  const pool = new Pool(postgresConfig(databaseName));
   try {
-    const created = await runtime.persistence.principalAuthority.create({
+    const created = await principalAuthority.create({
       principalId: PRINCIPAL_ID,
       type: 'ACTOR',
       actorId: 'backup-payer-1',
@@ -139,39 +138,38 @@ async function seedAndCapture(databaseName) {
     const replay = await runtime.handleCommand({ credential: 'backup-credential', command });
     assert.equal(replay.outcome, 'SUCCESS', `idempotent replay failed: ${encode(replay)}`);
 
-    const events = await runtime.persistence.eventStore.getEvents(CELL_ID);
+    const events = await readPersistedEvents(pool);
     assert.equal(events.length, 1, 'replay must not append a second event');
-    const evolved = cellKernel.evolve(CELL_ID, events);
-    assert.equal(evolved.status, 'CREATED');
-    assert.equal(String(evolved.amount), '10000');
+    const stateResult = await runtime.getActorCellState('backup-credential', CELL_ID);
+    assert.equal(stateResult.outcome, 'SUCCESS', `created cell state unavailable: ${encode(stateResult)}`);
+    const state = stateResult.cell.state;
+    assert.equal(state.status, 'CREATED');
+    assert.equal(String(state.amount), '10000');
 
-    const pool = new Pool(postgresConfig(databaseName));
-    try {
-      return {
-        evolved: encode(evolved),
-        events: encode(events),
-        schema: (await pool.query('SELECT version FROM schema_migrations ORDER BY version')).rows,
-        commands: (await pool.query(
-          'SELECT command_id, fingerprint FROM command_executions WHERE command_id=$1', [COMMAND_ID],
-        )).rows,
-        principals: (await pool.query(
-          'SELECT principal_id, principal_type FROM principals WHERE principal_id=$1', [PRINCIPAL_ID],
-        )).rows,
-        audit: (await pool.query(
-          'SELECT count(*)::int AS count FROM principal_audit WHERE principal_id=$1', [PRINCIPAL_ID],
-        )).rows[0].count,
-        snapshot: (await pool.query(
-          'SELECT version FROM snapshots WHERE cell_id=$1', [CELL_ID],
-        )).rows[0] ?? null,
-        maxEventVersion: Number((await pool.query(
-          'SELECT max(version) AS version FROM events WHERE cell_id=$1', [CELL_ID],
-        )).rows[0].version),
-      };
-    } finally {
-      await pool.end();
-    }
+    return {
+      evolved: encode(state),
+      events: encode(events),
+      schema: (await pool.query('SELECT version FROM schema_migrations ORDER BY version')).rows,
+      commands: (await pool.query(
+        'SELECT command_id, fingerprint FROM command_executions WHERE command_id=$1', [COMMAND_ID],
+      )).rows,
+      principals: (await pool.query(
+        'SELECT principal_id, principal_type FROM principals WHERE principal_id=$1', [PRINCIPAL_ID],
+      )).rows,
+      audit: (await pool.query(
+        'SELECT count(*)::int AS count FROM principal_audit WHERE principal_id=$1', [PRINCIPAL_ID],
+      )).rows[0].count,
+      snapshot: (await pool.query(
+        'SELECT version FROM snapshots WHERE cell_id=$1', [CELL_ID],
+      )).rows[0] ?? null,
+      maxEventVersion: Number((await pool.query(
+        'SELECT max(version) AS version FROM events WHERE cell_id=$1', [CELL_ID],
+      )).rows[0].version),
+    };
   } finally {
+    await pool.end();
     await runtime.persistence.disconnect();
+    await closePrincipalAuthority();
   }
 }
 
@@ -220,19 +218,23 @@ async function verifyRestoredDatabase(databaseName, expected) {
     await pool.end();
   }
 
-  const runtime = runtimeFor(databaseName);
+  const { runtime, closePrincipalAuthority } = runtimeFor(databaseName);
+  const runtimePool = new Pool(postgresConfig(databaseName));
   try {
-    const events = await runtime.persistence.eventStore.getEvents(CELL_ID);
+    const events = await readPersistedEvents(runtimePool);
     assert.equal(encode(events), expected.events);
-    const evolved = cellKernel.evolve(CELL_ID, events);
-    assert.equal(encode(evolved), expected.evolved);
+    const state = await runtime.getActorCellState('backup-credential', CELL_ID);
+    assert.equal(state.outcome, 'SUCCESS', `restored cell state unavailable: ${encode(state)}`);
+    assert.equal(encode(state.cell.state), expected.evolved);
     const replay = await runtime.handleCommand({ credential: 'backup-credential', command: createCellCommand() });
     assert.equal(replay.outcome, 'SUCCESS', `restored replay failed: ${encode(replay)}`);
-    const after = await runtime.persistence.eventStore.getEvents(CELL_ID);
+    const after = await readPersistedEvents(runtimePool);
     assert.equal(after.length, 1, 'restored replay must not append events');
     assert.equal(encode(after), expected.events);
   } finally {
+    await runtimePool.end();
     await runtime.persistence.disconnect();
+    await closePrincipalAuthority();
   }
 }
 
@@ -286,13 +288,28 @@ function runtimeFor(databaseName) {
     PG_TLS_MODE: 'verify-full',
     PG_TLS_CA_PATH: process.env.PG_TLS_CA_PATH,
   });
-  return composeRuntime(config, {
+  const principalPool = new Pool(config);
+  const principalAuthority = new PostgresPrincipalAuthority(principalPool);
+  const runtime = composeRuntime(config, {
     authentication: {
       async authenticate() {
         return { ok: true, identity: { issuer: ISSUER, subject: SUBJECT } };
       },
     },
+    principals: principalAuthority,
   });
+  return {
+    runtime,
+    principalAuthority,
+    closePrincipalAuthority: () => principalPool.end(),
+  };
+}
+
+async function readPersistedEvents(pool) {
+  return (await pool.query(
+    'SELECT event_id, cell_id, version, timestamp, type, payload FROM events WHERE cell_id=$1 ORDER BY version',
+    [CELL_ID],
+  )).rows;
 }
 
 function createCellCommand() {
