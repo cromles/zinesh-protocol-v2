@@ -71,6 +71,8 @@ jobs:
 
       - name: Full PostgreSQL test suite with success gate
         shell: bash
+        env:
+          NODE_OPTIONS: --dns-result-order=ipv4first
         run: |
           set -o pipefail
           npm test 2>&1 | tee test-output.log
@@ -121,6 +123,8 @@ jobs:
         run: node scripts/verify-container-startup.cjs "$IMAGE_TAG"
 
       - name: Backup and restore verification
+        env:
+          NODE_OPTIONS: --dns-result-order=ipv4first
         run: node scripts/verify-backup-restore.cjs "$IMAGE_TAG"
 
       - name: Build two clean attested OCI artifacts

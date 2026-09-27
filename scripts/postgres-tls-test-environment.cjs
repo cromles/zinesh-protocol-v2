@@ -52,7 +52,7 @@ function start(directory, statePath, envPath) {
     const invalidChain = launch('invalid-chain', invalidChainServer, password, suffix, directory, state);
     writeFileSync(statePath, JSON.stringify(state));
     writeFileSync(envPath, [
-      'ZINESH_POSTGRES_TESTS=true', 'NODE_OPTIONS=--dns-result-order=ipv4first',
+      'ZINESH_POSTGRES_TESTS=true',
       'PGHOST=localhost', `PGPORT=${valid.port}`,
       'PGDATABASE=zinesh_tls_test', 'PGUSER=zinesh_tls_test',
       `PG_PASSWORD_FILE=${join(directory, 'database-password')}`,
