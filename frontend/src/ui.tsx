@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, Navigate, Route, Routes, useNavigate, useParams } from 'react-router-dom';
-import { acceptCell, approveRelease, createCell, currentRole, getCell, getCells,
+import { acceptCell, approveRelease, createCell, currentRole, DEVELOPMENT_PAYEE_ID, getCell, getCells,
   prototypeFunding, rejectCell, requestRelease, subscribeToRole, switchRole, userMessage } from './api';
 import type { CellState, CellSummary, Role } from './api';
 import { formatTryAmount } from './money';
@@ -46,47 +46,67 @@ function AgreementList() {
 
 function NewAgreement() {
   const role = currentRole();
-  const navigate = useNavigate(); const [payee, setPayee] = useState('development-payee'); const [amount, setAmount] = useState('');
+  const navigate = useNavigate(); const [amount, setAmount] = useState('');
   const [description, setDescription] = useState(''); const [error, setError] = useState(''); const [busy, setBusy] = useState(false);
   const submit = async (event: React.FormEvent) => {
     event.preventDefault(); setBusy(true); setError('');
-    try { const result = await createCell({ payer: 'development-payer', payee, amountTry: amount, description });
+    try { const result = await createCell({ payee: DEVELOPMENT_PAYEE_ID, amountTry: amount, description });
       if (result.outcome !== 'SUCCESS') throw new Error(result.error?.code ?? 'CREATE_FAILED');
       navigate(`/agreements/${encodeURIComponent(result.cellId)}`);
     } catch (e) { setError(errorMessage(e)); } finally { setBusy(false); }
   };
-  if (role !== 'payer') return <main className="shell narrow"><Link className="back-link" to="/agreements">← Anlaşmalar</Link><p className="eyebrow">YENİ ANLAŞMA</p>
+  if (!canCreateAgreement(role)) return <main className="shell narrow"><Link className="back-link" to="/agreements">← Anlaşmalar</Link><p className="eyebrow">YENİ ANLAŞMA</p>
     <h1>Yeni anlaşmayı PAYER oluşturur</h1><p>Development rolünü Payer olarak değiştirip yeniden dene.</p></main>;
   return <main className="shell narrow"><Link className="back-link" to="/agreements">← Anlaşmalar</Link><p className="eyebrow">YENİ ANLAŞMA</p><h1>Ne üzerinde anlaşıyorsunuz?</h1>
-    <form className="form" onSubmit={(e) => void submit(e)}><label>Karşı taraf ID<input value={payee} onChange={(e) => setPayee(e.target.value)} required maxLength={128} /></label>
+    <form className="form" onSubmit={(e) => void submit(e)}><p className="demo-note">Development/demo sınırı: Bu akış yalnızca sabit development-payee kimliğini kullanır.</p>
+      <label>Payee ID (sabit)<input value={DEVELOPMENT_PAYEE_ID} readOnly /></label>
       <label>Tutar (TRY)<input inputMode="decimal" placeholder="100,00" value={amount} onChange={(e) => setAmount(e.target.value)} required /></label>
       <label>Açıklama<textarea value={description} onChange={(e) => setDescription(e.target.value)} required maxLength={256} rows={4} /></label>
       {error && <ErrorMessage message={error} />}<button disabled={busy}>{busy ? 'Gönderiliyor…' : 'Anlaşmayı gönder'}</button></form>
   </main>;
 }
 
+export function canCreateAgreement(role: Role | null): boolean {
+  return role === 'payer';
+}
+
 function AgreementRoom({ role }: { role: Role }) {
-  const { cellId = '' } = useParams(); const [cell, setCell] = useState<CellState | null>(null); const [error, setError] = useState(''); const [busy, setBusy] = useState(false);
-  const load = useCallback(async () => { try { setCell(await getCell(cellId)); setError(''); } catch (e) { setError(errorMessage(e)); } }, [cellId]);
-  useEffect(() => { void load(); }, [load]);
-  const act = async (action: () => Promise<unknown>) => { setBusy(true); setError(''); try { await action(); await load(); } catch (e) { setError(errorMessage(e)); } finally { setBusy(false); } };
-  if (error && !cell) return <main className="shell narrow"><Link className="back-link" to="/agreements">← Anlaşmalar</Link><ErrorMessage message={error} /></main>;
-  if (!cell) return <main className="shell"><p className="muted">Yükleniyor…</p></main>;
+  const { cellId = '' } = useParams(); const [view, setView] = useState<AgreementRoomView>({ scope: null, cell: null, loading: true, error: '' });
+  const [busy, setBusy] = useState(false); const requestId = useRef(0);
+  const scope = `${role}:${cellId}`;
+  const load = useCallback(async () => {
+    const currentRequest = ++requestId.current;
+    setView(agreementRoomViewOnLoad(scope));
+    try {
+      const nextCell = await loadAgreementRoomCell(cellId, role);
+      if (currentRequest === requestId.current) setView(agreementRoomViewOnSuccess(scope, nextCell));
+    } catch (e) {
+      if (currentRequest === requestId.current) setView(agreementRoomViewOnFailure(scope, e));
+    }
+  }, [cellId, role, scope]);
+  useEffect(() => {
+    void load();
+    return () => { requestId.current += 1; };
+  }, [load]);
+  const act = async (action: () => Promise<unknown>) => { setBusy(true); try { await action(); await load(); } catch (e) { setView((current) => ({ ...current, error: errorMessage(e) })); } finally { setBusy(false); } };
+  if (agreementRoomIsLoading(view, scope)) return <main className="shell"><p className="muted">Anlaşma yükleniyor…</p></main>;
+  if (!view.cell) return <main className="shell narrow"><Link className="back-link" to="/agreements">← Anlaşmalar</Link><ErrorMessage message={view.error} /></main>;
+  const cell = view.cell;
   const counterparty = role === 'payer' ? cell.payee : cell.payer;
+  const actions = visibleAgreementActions(cell, role);
+  const stateMessage = agreementStateMessage(cell);
   return <main className="shell narrow"><Link className="back-link" to="/agreements">← Anlaşmalar</Link><p className="eyebrow">ANLAŞMA ODASI</p>
     <h1>{cell.description || 'Anlaşma'}</h1><dl className="details"><div><dt>Karşı taraf</dt><dd>{counterparty}</dd></div><div><dt>Tutar</dt><dd>{formatTryAmount(cell.amount)}</dd></div>
       <div><dt>Durum</dt><dd>{statusLabel(cell.status, cell.acceptanceStatus)}</dd></div></dl>
-    {error && <ErrorMessage message={error} />}{cell.acceptanceStatus === 'PENDING' && <section className="next-step"><h2>Karşı tarafın yanıtı bekleniyor</h2>
-      {role === 'payee' && <div className="actions"><button disabled={busy} onClick={() => void act(() => acceptCell(cell.cellId))}>Kabul et</button>
-        <button className="secondary" disabled={busy} onClick={() => void act(() => rejectCell(cell.cellId))}>Reddet</button></div>}</section>}
-    {cell.acceptanceStatus === 'ACCEPTED' && cell.status === 'CREATED' && role === 'payer' && <section className="next-step"><h2>Anlaşma kabul edildi</h2>
+    {view.error && <ErrorMessage message={view.error} />}{actions.accept && <section className="next-step"><h2>Karşı tarafın yanıtı bekleniyor</h2>
+      <div className="actions"><button disabled={busy} onClick={() => void act(() => acceptCell(cell.cellId))}>Kabul et</button>
+        <button className="secondary" disabled={busy} onClick={() => void act(() => rejectCell(cell.cellId))}>Reddet</button></div></section>}
+    {actions.demoFunding && <section className="next-step"><h2>Anlaşma kabul edildi</h2>
       <p className="demo-note">Demo funding — gerçek para kullanılmaz.</p><button disabled={busy} onClick={() => void act(() => prototypeFunding(cell.cellId))}>Demo funding</button></section>}
     {cell.status === 'FUNDED' && <section className="next-step"><h2>Anlaşma devam ediyor</h2><p>İş tamamlandığında taraflardan biri teslimi onay isteği olarak iletebilir.</p>
-      <div className="actions">{cell.releaseRequestedBy === undefined && <button disabled={busy} onClick={() => void act(() => requestRelease(cell.cellId))}>Tamamlanma iste</button>}
-      {cell.releaseRequestedBy !== undefined && cell.releaseRequestedBy !== (role === 'payer' ? 'development-payer' : 'development-payee')
-        && <button className="secondary" disabled={busy} onClick={() => void act(() => approveRelease(cell.cellId))}>Tamamlanmayı onayla</button>}</div></section>}
-    {cell.status === 'RELEASED' && <section className="next-step"><h2>Tamamlandı</h2></section>}
-    {cell.acceptanceStatus === 'REJECTED' && <section className="next-step"><h2>Reddedildi</h2></section>}
+      <div className="actions">{actions.requestRelease && <button disabled={busy} onClick={() => void act(() => requestRelease(cell.cellId))}>Tamamlanma iste</button>}
+      {actions.approveRelease && <button className="secondary" disabled={busy} onClick={() => void act(() => approveRelease(cell.cellId))}>Tamamlanmayı onayla</button>}</div></section>}
+    {stateMessage && <section className="next-step"><h2>{stateMessage}</h2></section>}
   </main>;
 }
 
@@ -97,7 +117,73 @@ function ErrorMessage({ message }: { message: string }) {
 function errorMessage(error: unknown): string {
   return userMessage(error);
 }
-function statusLabel(status: string, acceptance: string): string {
-  if (acceptance === 'REJECTED') return 'Reddedildi'; if (acceptance === 'PENDING') return 'Yanıt bekleniyor';
-  return ({ CREATED: 'Kabul edildi', FUNDED: 'Devam ediyor', RELEASED: 'Tamamlandı', REFUNDED: 'İade edildi', DISPUTED: 'İncelemede', EXPIRED: 'Süresi doldu' } as Record<string, string>)[status] ?? status;
+export function visibleAgreementActions(cell: CellState, role: Role): {
+  accept: boolean; demoFunding: boolean; requestRelease: boolean; approveRelease: boolean;
+} {
+  const actor = role === 'payer' ? 'development-payer' : 'development-payee';
+  const isParticipant = actor === cell.payer || actor === cell.payee;
+  return {
+    accept: cell.status === 'CREATED' && cell.acceptanceStatus === 'PENDING' && role === 'payee' && actor === cell.payee,
+    demoFunding: cell.status === 'CREATED' && cell.acceptanceStatus === 'ACCEPTED' && role === 'payer' && actor === cell.payer,
+    requestRelease: cell.status === 'FUNDED' && isParticipant && cell.releaseRequestedBy === undefined,
+    approveRelease: cell.status === 'FUNDED' && isParticipant && cell.releaseRequestedBy !== undefined
+      && cell.releaseRequestedBy !== actor,
+  };
+}
+
+export interface AgreementRoomView {
+  scope: string | null;
+  cell: CellState | null;
+  loading: boolean;
+  error: string;
+}
+
+export function agreementRoomIsLoading(view: AgreementRoomView, currentScope: string): boolean {
+  return view.loading || view.scope !== currentScope;
+}
+
+export function agreementRoomViewOnLoad(scope: string): AgreementRoomView {
+  return { scope, cell: null, loading: true, error: '' };
+}
+
+export function agreementRoomViewOnSuccess(scope: string, cell: CellState): AgreementRoomView {
+  return { scope, cell, loading: false, error: '' };
+}
+
+export function agreementRoomViewOnFailure(scope: string, error: unknown): AgreementRoomView {
+  return { scope, cell: null, loading: false, error: errorMessage(error) };
+}
+
+export function loadAgreementRoomCell(
+  cellId: string,
+  role: Role,
+  fetchCell: (id: string) => Promise<CellState> = getCell,
+): Promise<CellState> {
+  // The active role is held by the API client; this argument scopes the component's reload lifecycle.
+  void role;
+  return fetchCell(cellId);
+}
+
+export function statusLabel(status: string, acceptance: string): string {
+  const statusLabels: Record<string, string> = {
+    RELEASED: 'Tamamlandı', REFUNDED: 'İade edildi', EXPIRED: 'Süresi doldu', DISPUTED: 'İncelemede',
+  };
+  if (statusLabels[status] !== undefined) return statusLabels[status]!;
+  if (acceptance === 'REJECTED') return 'Reddedildi';
+  if (acceptance === 'PENDING') return 'Yanıt bekleniyor';
+  return ({ CREATED: 'Kabul edildi', FUNDED: 'Devam ediyor' } as Record<string, string>)[status] ?? status;
+}
+
+export function agreementStateMessage(cell: CellState): string | null {
+  if (cell.status === 'RELEASED') return 'Anlaşma tamamlandı.';
+  if (cell.status === 'REFUNDED') return 'İade edildi. Tutar Payer’a iade edildi.';
+  if (cell.status === 'EXPIRED') return 'Anlaşmanın funding süresi doldu.';
+  if (cell.status === 'DISPUTED') return 'Anlaşma incelemede.';
+  if (cell.acceptanceStatus === 'REJECTED') return 'Anlaşma Payee tarafından reddedildi.';
+  if (cell.refundRequestedBy !== undefined) {
+    return cell.refundRequestedBy === cell.payer
+      ? 'İade talebi bekliyor. Payee onayı bekleniyor.'
+      : 'İade talebi bekliyor.';
+  }
+  return null;
 }

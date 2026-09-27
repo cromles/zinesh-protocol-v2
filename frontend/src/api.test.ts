@@ -110,10 +110,12 @@ describe('frontend development API client', () => {
       }, version: 1 })));
     vi.stubGlobal('fetch', fetchMock);
     await switchRole('payer');
-    await createCell({ payer: 'development-payer', payee: 'development-payee', amountTry: '100,00', description: 'Test' });
+    await createCell({ payee: 'development-payee', amountTry: '100,00', description: 'Test' });
     const body = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body));
     expect(body.command.payload.amount).toBe('10000');
     expect(typeof body.command.payload.amount).toBe('string');
+    expect(body.command.payload.payer).toBe('development-payer');
+    expect(body.command.payload.payee).toBe('development-payee');
   });
 
   test('reads the real actor-scoped list and detail response shapes', async () => {
@@ -147,7 +149,7 @@ describe('frontend development API client', () => {
     vi.stubGlobal('fetch', fetchMock);
     await switchRole('payer');
 
-    await expect(createCell({ payer: 'development-payer', payee: 'development-payee', amountTry: '100,00', description: 'Test' }))
+    await expect(createCell({ payee: 'development-payee', amountTry: '100,00', description: 'Test' }))
       .resolves.toMatchObject({ outcome: 'SUCCESS', events: [event], nextState, version: 1 });
   });
 
@@ -159,8 +161,30 @@ describe('frontend development API client', () => {
     vi.stubGlobal('fetch', fetchMock);
     await switchRole('payer');
 
-    await expect(createCell({ payer: 'development-payer', payee: 'development-payee', amountTry: '100,00', description: 'Test' }))
+    await expect(createCell({ payee: 'development-payee', amountTry: '100,00', description: 'Test' }))
       .rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED', status: 403 });
+  });
+
+  test('rejects a non-development Payee before sending a CreateCell API request', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({ token: 'jwt-payer', expiresIn: 300, role: 'payer' })));
+    vi.stubGlobal('fetch', fetchMock);
+    await switchRole('payer');
+
+    await expect(createCell({ payee: 'some-other-actor', amountTry: '100,00', description: 'Test' }))
+      .rejects.toMatchObject({ code: 'INVALID_INPUT', status: 400 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/development/auth/token');
+  });
+
+  test('rejects CreateCell for the Payee session before sending a command request', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({ token: 'jwt-payee', expiresIn: 300, role: 'payee' })));
+    vi.stubGlobal('fetch', fetchMock);
+    await switchRole('payee');
+
+    await expect(createCell({ payee: 'development-payee', amountTry: '100,00', description: 'Test' }))
+      .rejects.toMatchObject({ code: 'COMMAND_NOT_PERMITTED', status: 403 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/development/auth/token');
   });
 });
 

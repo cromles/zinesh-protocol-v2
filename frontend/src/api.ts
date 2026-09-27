@@ -1,6 +1,8 @@
 import { AmountInputError, tryAmountToKurus } from './money';
 
 export type Role = 'payer' | 'payee';
+export const DEVELOPMENT_PAYER_ID = 'development-payer';
+export const DEVELOPMENT_PAYEE_ID = 'development-payee';
 export type CellStatus = 'CREATED' | 'FUNDED' | 'RELEASED' | 'REFUNDED' | 'DISPUTED' | 'EXPIRED';
 export type AcceptanceStatus = 'PENDING' | 'ACCEPTED' | 'REJECTED';
 
@@ -153,12 +155,14 @@ export async function getCell(cellId: string): Promise<CellState> {
   return (await api<{ cell: { state: CellState } }>('/cells/' + encodeURIComponent(cellId))).cell.state;
 }
 
-export async function createCell(input: { payer: string; payee: string; amountTry: string; description: string }): Promise<CommandResponse & { cellId: string }> {
+export async function createCell(input: { payee: string; amountTry: string; description: string }): Promise<CommandResponse & { cellId: string }> {
+  if (selectedRole !== 'payer') throw new ApiError('COMMAND_NOT_PERMITTED', 403);
+  if (input.payee !== DEVELOPMENT_PAYEE_ID) throw new ApiError('INVALID_INPUT', 400);
   const cellId = crypto.randomUUID();
   const amount = tryAmountToKurus(input.amountTry);
   const result = await api<CommandResponse>('/commands', { method: 'POST', body: JSON.stringify({ command: {
     commandId: crypto.randomUUID(), cellId, type: 'CreateCell',
-    payload: { payer: input.payer, payee: input.payee, amount,
+    payload: { payer: DEVELOPMENT_PAYER_ID, payee: DEVELOPMENT_PAYEE_ID, amount,
       currency: 'TRY', description: input.description,
       fundingDeadline: Date.now() + 7 * 24 * 60 * 60 * 1000,
       completionDeadline: Date.now() + 14 * 24 * 60 * 60 * 1000 },
