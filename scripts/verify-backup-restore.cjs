@@ -320,6 +320,7 @@ function createCellCommand() {
     payload: {
       payer: 'backup-payer-1',
       payee: 'backup-payee-1',
+      description: 'Backup restore verification agreement.',
       amount: 10000n,
       currency: 'TRY',
       fundingDeadline: 2_000_000,
