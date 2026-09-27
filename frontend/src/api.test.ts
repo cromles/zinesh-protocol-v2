@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test, vi } from 'vitest';
-import { ApiError, currentRole, currentSession, createCell, getCells, subscribeToRole, switchRole, userMessage } from './api';
+import { ApiError, currentRole, currentSession, createCell, getCell, getCells, subscribeToRole, switchRole, userMessage } from './api';
 import { formatTryAmount, tryAmountToKurus } from './money';
 
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); vi.useRealTimers(); });
@@ -104,13 +104,63 @@ describe('frontend development API client', () => {
   test('converts user-entered TRY to the backend integer-string amount', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({ token: 'jwt-payer', expiresIn: 300, role: 'payer' })))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ outcome: 'SUCCESS' })));
+      .mockResolvedValueOnce(new Response(JSON.stringify({ outcome: 'SUCCESS', events: [], nextState: {
+        cellId: 'cell-1', payer: 'development-payer', payee: 'development-payee', description: 'Test', amount: '10000',
+        currency: 'TRY', status: 'CREATED', acceptanceStatus: 'PENDING', fundingDeadline: 100, completionDeadline: 200,
+      }, version: 1 })));
     vi.stubGlobal('fetch', fetchMock);
     await switchRole('payer');
     await createCell({ payer: 'development-payer', payee: 'development-payee', amountTry: '100,00', description: 'Test' });
     const body = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body));
     expect(body.command.payload.amount).toBe('10000');
     expect(typeof body.command.payload.amount).toBe('string');
+  });
+
+  test('reads the real actor-scoped list and detail response shapes', async () => {
+    const summary = { cellId: 'cell-1', counterpartyId: 'development-payee', description: 'Test', amount: '10000',
+      currency: 'TRY', status: 'FUNDED', acceptanceStatus: 'ACCEPTED', fundingDeadline: 100,
+      completionDeadline: 200, version: 3 };
+    const state = { cellId: 'cell-1', payer: 'development-payer', payee: 'development-payee', description: 'Test',
+      amount: '10000', currency: 'TRY', status: 'FUNDED', acceptanceStatus: 'ACCEPTED', fundedAt: 150,
+      fundingDeadline: 100, completionDeadline: 200, releaseRequestedBy: 'development-payer',
+      refundRequestedBy: 'development-payer', arbiter: 'development-arbiter' };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ token: 'jwt-payer', expiresIn: 300, role: 'payer' })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ cells: [summary] })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ cell: { state, version: 3 } })));
+    vi.stubGlobal('fetch', fetchMock);
+    await switchRole('payer');
+
+    await expect(getCells()).resolves.toEqual([summary]);
+    await expect(getCell('cell-1')).resolves.toEqual(state);
+  });
+
+  test('keeps the successful command response version, event, and nextState contract', async () => {
+    const nextState = { cellId: 'cell-1', payer: 'development-payer', payee: 'development-payee', description: 'Test',
+      amount: '10000', currency: 'TRY', status: 'CREATED', acceptanceStatus: 'PENDING', fundingDeadline: 100,
+      completionDeadline: 200 };
+    const event = { eventId: 'event-1', cellId: 'cell-1', version: 1, timestamp: 50, type: 'CellCreated',
+      payload: { payer: 'development-payer', payee: 'development-payee', amount: '10000', currency: 'TRY' } };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ token: 'jwt-payer', expiresIn: 300, role: 'payer' })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ outcome: 'SUCCESS', events: [event], nextState, version: 1 })));
+    vi.stubGlobal('fetch', fetchMock);
+    await switchRole('payer');
+
+    await expect(createCell({ payer: 'development-payer', payee: 'development-payee', amountTry: '100,00', description: 'Test' }))
+      .resolves.toMatchObject({ outcome: 'SUCCESS', events: [event], nextState, version: 1 });
+  });
+
+  test('matches the command rejection response shape without a success state or version', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ token: 'jwt-payer', expiresIn: 300, role: 'payer' })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ outcome: 'KERNEL_REJECTION', error: { code: 'AUTHORIZATION_DENIED' } }),
+        { status: 403 }));
+    vi.stubGlobal('fetch', fetchMock);
+    await switchRole('payer');
+
+    await expect(createCell({ payer: 'development-payer', payee: 'development-payee', amountTry: '100,00', description: 'Test' }))
+      .rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED', status: 403 });
   });
 });
 

@@ -12,7 +12,6 @@ export interface CellSummary {
   currency: 'TRY';
   status: CellStatus;
   acceptanceStatus: AcceptanceStatus;
-  releaseRequestedBy?: string;
   fundingDeadline: number;
   completionDeadline: number;
   version: number;
@@ -28,12 +27,18 @@ export interface CellState {
   status: CellStatus;
   acceptanceStatus: AcceptanceStatus;
   releaseRequestedBy?: string;
+  refundRequestedBy?: string;
+  arbiter?: string;
+  fundedAt?: number;
   fundingDeadline: number;
   completionDeadline: number;
 }
 
 interface TokenResponse { token: string; expiresIn: number; role: Role }
-interface CommandResponse { outcome: string; error?: { code: string }; nextState?: unknown }
+interface CommandEvent { eventId: string; cellId: string; version: number; timestamp: number; type: string; payload: Record<string, unknown> }
+export type CommandResponse =
+  | { outcome: 'SUCCESS'; events: CommandEvent[]; nextState: CellState; version: number }
+  | { outcome: 'KERNEL_REJECTION' | 'APPLICATION_REJECTION' | 'PERSISTENCE_FAILURE'; error: { code: string } };
 export interface Session { role: Role; token: string; expiresAt: number }
 
 let session: Session | null = null;
