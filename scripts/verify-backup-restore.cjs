@@ -288,7 +288,7 @@ function runtimeFor(databaseName) {
     PG_TLS_MODE: 'verify-full',
     PG_TLS_CA_PATH: process.env.PG_TLS_CA_PATH,
   });
-  const principalPool = new Pool(config);
+  const principalPool = new Pool(postgresConfig(databaseName));
   const principalAuthority = new PostgresPrincipalAuthority(principalPool);
   const runtime = composeRuntime(config, {
     authentication: {
