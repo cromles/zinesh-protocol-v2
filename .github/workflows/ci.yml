@@ -195,3 +195,38 @@ jobs:
       - name: Remove isolated PostgreSQL TLS environment
         if: always()
         run: node scripts/postgres-tls-test-environment.cjs stop "$RUNNER_TEMP/zinesh-postgres-tls-state.json"
+
+  frontend-quality:
+    name: Frontend quality gate / Node 24
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Set up pinned Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+
+      - name: Verify runtime pin
+        shell: bash
+        run: |
+          test "$(node --version)" = "v$(tr -d '\r\n' < .node-version)"
+          test "$(npm --version)" = "$(tr -d '\r\n' < .npm-version)"
+
+      - name: Clean install from lockfile
+        run: npm ci
+
+      - name: Frontend TypeScript check
+        run: npm run typecheck:frontend
+
+      - name: Frontend tests
+        run: npm run test:frontend
+
+      - name: Frontend production build
+        run: npm run build:frontend
