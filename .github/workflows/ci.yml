@@ -14,6 +14,46 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  open-protocol:
+    name: Standalone open protocol / Node 24
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    defaults:
+      run:
+        working-directory: packages/open-protocol
+
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Set up pinned Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: packages/open-protocol/package-lock.json
+
+      - name: Verify runtime pin
+        shell: bash
+        run: |
+          test "$(node --version)" = "v$(tr -d '\r\n' < ../../.node-version)"
+          test "$(npm --version)" = "$(tr -d '\r\n' < ../../.npm-version)"
+
+      - name: Install standalone development toolchain
+        run: npm ci
+
+      - name: Typecheck standalone boundary
+        run: npm run typecheck
+
+      - name: Run deterministic protocol tests
+        run: npm test
+
+      - name: Verify publish artifact boundary
+        run: npm run pack:check
+
   production-verification:
     name: PostgreSQL 16 / Node 24 production verification
     runs-on: ubuntu-24.04

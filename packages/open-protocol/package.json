@@ -1,0 +1,33 @@
+{
+  "name": "@zinesh/open-protocol",
+  "version": "0.1.0-development",
+  "private": true,
+  "description": "Deterministic, I/O-free Zinesh agreement protocol kernel",
+  "type": "commonjs",
+  "main": "dist/packages/open-protocol/src/index.js",
+  "types": "dist/packages/open-protocol/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/packages/open-protocol/src/index.d.ts",
+      "require": "./dist/packages/open-protocol/src/index.js",
+      "default": "./dist/packages/open-protocol/src/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "PROVENANCE.md",
+    "DEPENDENCY_LICENSES.md"
+  ],
+  "scripts": {
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true});require('node:fs').rmSync('.test-dist',{recursive:true,force:true})\"",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "build": "npm run clean && tsc -p tsconfig.json",
+    "test": "npm run build && tsc -p tsconfig.test.json && node --test .test-dist/packages/open-protocol/test/*.test.js",
+    "pack:check": "npm pack --dry-run"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  }
+}
