@@ -2,7 +2,7 @@ name: CI
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, grant/nlnet-restack-2026]
   push:
     branches: [main]
 
