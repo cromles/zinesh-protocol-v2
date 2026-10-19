@@ -7,6 +7,7 @@ NLnet's policy (https://nlnet.nl/foundation/policies/generativeAI/) requires dis
 ## Known AI assistance
 - ChatGPT, 14 October 2026 (exact model identifier to be verified from the exported conversation record): helped scope the NLnet Restack funding request, identify application requirements, draft budget, and prepare GitHub grant documentation. Full prompt and unedited output exports must be attached or otherwise supplied where required; this summary does not replace them.
 - OpenAI Codex (model/version and timestamps not yet independently verified): reportedly prepared an earlier English grant draft and assisted with software development. Exact logs and outputs must be recovered before claiming complete provenance.
+- OpenAI Codex in ChatGPT Work Mode, 14 October 2026: created the `feat/open-protocol-package` development extraction, package/build configuration, focused protocol tests, release-audit notes and pull-request material in response to the user's explicit extraction request. The original conversation transcript and tool outputs, rather than this summary, are the authoritative unedited record. Human review remains required and this work must not be billed as unaided human development.
 
 ## Review checklist
 - [ ] Applicant writes/reviews final answers in their own words.
