@@ -1,6 +1,6 @@
 # Open protocol release audit
 
-Status: blocked for public release as of 14 October 2026.
+Status: blocked for public release as of 19 October 2026.
 
 ## Code ownership
 

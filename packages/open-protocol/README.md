@@ -70,4 +70,5 @@ const result = cellKernel.applyCommand(
 
 Persistence-level command-ID idempotency and optimistic concurrency remain
 adapter responsibilities. The protocol itself rejects repeated pending
-release/refund requests and validates replay version ordering.
+release/refund requests, enforces the funding deadline from its deterministic
+context, and fails closed on replay version gaps or unsupported event types.

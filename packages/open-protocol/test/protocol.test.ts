@@ -167,3 +167,39 @@ test('replay rejects version gaps', () => {
   assert.ok('code' in result);
   if ('code' in result) assert.equal(result.code, 'STREAM_INTEGRITY_ERROR');
 });
+
+test('replay rejects unsupported event types', () => {
+  const executed = run([create()]);
+  const unsupported = {
+    ...executed.events[0]!,
+    eventId: makeEventId('unsupported'),
+    type: 'FutureEvent',
+  } as unknown as Event;
+  const result = cellKernel.evolve(cellId, [unsupported]);
+  assert.ok('code' in result);
+  if ('code' in result) assert.equal(result.code, 'STREAM_INTEGRITY_ERROR');
+});
+
+test('acceptance and funding fail after the funding deadline', () => {
+  const created = run([create()]);
+  const lateContext: DeterministicContext = {
+    now: makeTimestamp(2_001),
+    nextEventId: (index) => makeEventId(`late-${index}`),
+  };
+  const lateAcceptance = cellKernel.applyCommand(
+    created.state,
+    accepted,
+    created.nextVersion,
+    lateContext,
+  );
+  expectError(lateAcceptance, 'DEADLINE_VIOLATION');
+
+  const acceptedOnTime = run([create(), accepted]);
+  const lateFunding = cellKernel.applyCommand(
+    acceptedOnTime.state,
+    funded,
+    acceptedOnTime.nextVersion,
+    lateContext,
+  );
+  expectError(lateFunding, 'DEADLINE_VIOLATION');
+});

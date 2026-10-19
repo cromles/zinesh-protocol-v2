@@ -199,6 +199,19 @@ describe('1. CreateCell', () => {
     expect(accepted.nextState.status).toBe('CREATED');
   });
 
+  test('rejects acceptance after fundingDeadline', () => {
+    const state = applyAll([{ cmd: makeCmd('CreateCell', createCellPayload()) }]);
+    const result = cellKernel.applyCommand(
+      state,
+      makeCmd('AcceptCell', { acceptedBy: PAYEE }),
+      (ZERO_VERSION + 2) as typeof ZERO_VERSION,
+      makeCtx(T_AFTER_FUNDING_DL),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.code).toBe('DEADLINE_VIOLATION');
+  });
+
   test.each([
     ['payer', PAYER], ['third party', STRANGER],
   ])('%s cannot accept or reject the invitation', (_name, actor) => {
@@ -315,6 +328,22 @@ describe('2. FundCell', () => {
     const state = fundedState();
     expectFail(state, makeCmd('FundCell', { funderId: PAYER, amount: AMOUNT }), 'ILLEGAL_TRANSITION',
       (nextVersion(ZERO_VERSION) + 2) as typeof ZERO_VERSION);
+  });
+
+  test('rejects funding after fundingDeadline', () => {
+    const state = applyAll([
+      { cmd: makeCmd('CreateCell', createCellPayload()) },
+      { cmd: makeCmd('AcceptCell', { acceptedBy: PAYEE }) },
+    ]);
+    const result = cellKernel.applyCommand(
+      state,
+      makeCmd('FundCell', { funderId: PAYER, amount: AMOUNT }),
+      (ZERO_VERSION + 3) as typeof ZERO_VERSION,
+      makeCtx(T_AFTER_FUNDING_DL),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.code).toBe('DEADLINE_VIOLATION');
   });
 });
 
@@ -1409,6 +1438,24 @@ describe('22. Version gaps', () => {
     ];
 
     const result = cellKernel.evolve(CELL_A, events);
+    expect('code' in result).toBe(true);
+    if (!('code' in result)) return;
+    expect(result.code).toBe('STREAM_INTEGRITY_ERROR');
+  });
+});
+
+describe('22b. Unknown event types', () => {
+  test('evolve fails closed instead of silently ignoring an unsupported event', () => {
+    const unknown = {
+      eventId: makeEventId('unknown-event'),
+      cellId: CELL_A,
+      version: nextVersion(ZERO_VERSION),
+      timestamp: T0,
+      type: 'FutureEvent',
+      payload: {},
+    } as unknown as Event;
+
+    const result = cellKernel.evolve(CELL_A, [unknown]);
     expect('code' in result).toBe(true);
     if (!('code' in result)) return;
     expect(result.code).toBe('STREAM_INTEGRITY_ERROR');

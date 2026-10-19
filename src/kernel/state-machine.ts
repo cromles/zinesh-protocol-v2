@@ -157,10 +157,8 @@ const eventFolder: EventFolder = (state, event): CellState => {
       return state;
     }
 
-    default: {
-      // Unknown event types are silently ignored in fold (forward-compatibility).
+    default:
       return state;
-    }
   }
 };
 
@@ -250,10 +248,13 @@ const handleCreateCell: CommandHandler = (state, command): HandlerResult => {
   }]);
 };
 
-const handleAcceptCell: CommandHandler = (state, command): HandlerResult => {
+const handleAcceptCell: CommandHandler = (state, command, ctx): HandlerResult => {
   const guard = assertStatus(state, 'CREATED');
   if (guard !== null) return { ok: false, error: guard };
   if (state.acceptanceStatus !== 'PENDING') return fail('ILLEGAL_TRANSITION', 'Cell is not awaiting acceptance');
+  if (ctx.now > state.fundingDeadline) {
+    return fail('DEADLINE_VIOLATION', 'Cell cannot be accepted after fundingDeadline');
+  }
   const p = command.payload as AcceptCellPayload;
   if (p.acceptedBy !== state.payee) return fail('AUTHORIZATION_DENIED', 'Only the payee may accept this cell');
   return ok([{ eventType: 'CellAccepted', payload: { acceptedBy: p.acceptedBy } }]);
@@ -268,11 +269,14 @@ const handleRejectCell: CommandHandler = (state, command): HandlerResult => {
   return ok([{ eventType: 'CellRejected', payload: { rejectedBy: p.rejectedBy } }]);
 };
 
-const handleFundCell: CommandHandler = (state, command): HandlerResult => {
+const handleFundCell: CommandHandler = (state, command, ctx): HandlerResult => {
   const guard = assertStatus(state, 'CREATED');
   if (guard !== null) return { ok: false, error: guard };
   if (state.acceptanceStatus !== 'ACCEPTED') {
     return fail('ILLEGAL_TRANSITION', 'Cell must be accepted before funding');
+  }
+  if (ctx.now > state.fundingDeadline) {
+    return fail('DEADLINE_VIOLATION', 'Cell cannot be funded after fundingDeadline');
   }
 
   const p = command.payload as FundCellPayload;
@@ -521,6 +525,11 @@ const handleResolveDispute: CommandHandler = (state, command): HandlerResult => 
 // ---------------------------------------------------------------------------
 
 export const cellKernelHandlers: KernelHandlers = {
+  supportedEventTypes: new Set([
+    'CellCreated', 'CellAccepted', 'CellRejected', 'CellFunded',
+    'ReleaseRequested', 'Released', 'RefundRequested', 'Refunded',
+    'CellExpired', 'DisputeOpened', 'DisputeResolved',
+  ]),
   initialState,
   eventFolder,
   commandHandlers: {
