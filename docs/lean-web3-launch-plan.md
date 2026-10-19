@@ -2,8 +2,9 @@
 
 **Status:** Working plan — not a promise of launch date, funding, or legal status.  
 **Owner:** Zinesh Protocol  
-**Starting point:** Existing V2 repository and its deterministic escrow/application infrastructure.  
-**Primary objective:** Produce a verifiable, low-cost testnet MVP and evidence package that can support user discovery and non-dilutive funding applications, without handling real customer funds before the legal and security gates are passed.
+**Starting point:** Hardened V2 reference protocol plus the separate V3.2 Solidity prototype in `cromles/zinesh-protocol`.
+
+**Primary objective:** Turn the existing Base Sepolia prototype into a reproducible, verifiable end-to-end testnet pilot and evidence package, without handling real customer funds before the legal and security gates are passed.
 
 ## Operating rules
 
@@ -16,22 +17,23 @@
 
 ## Phase 0 — Repository and product reality check (Week 1)
 
-- [ ] Confirm the canonical repository, current default branch, CI status, and reproducible local setup.
-- [ ] Map existing V2 agreement states, authorization boundaries, evidence handling, dispute/refund/expiry paths, and persistence.
-- [ ] Identify what is implemented in the existing TypeScript application versus what would need to execute on-chain.
-- [ ] Write the smallest end-to-end acceptance scenario: create agreement → both parties acknowledge terms → test-token funding → evidence/condition submission → authorized release/refund or explicit unresolved-dispute state.
-- [ ] Record security assumptions and out-of-scope items.
+- [x] Confirm the V2 repository, default branch, CI status, and deterministic package boundary.
+- [x] Map existing V2 agreement states, authorization boundaries, dispute/refund/expiry paths, and persistence.
+- [x] Identify the separate V3.2 Solidity implementation and its repository boundary.
+- [x] Define the minimum flow: create → dual acceptance → testnet funding → evidence hash → release/refund/dispute timeout.
+- [x] Record security assumptions and out-of-scope items in the design and gap-audit documents.
 
 **Exit gate:** A written gap audit separates verified existing capabilities from missing EVM functionality. Do not describe an off-chain transition as an on-chain escrow.
 
 ## Phase 1 — Testnet MVP (Month 1–2)
 
-- [ ] Select Base Sepolia as the first target network; record chain ID, test-token assumptions, RPC configuration, and explorer links.
-- [ ] Design a minimal on-chain escrow contract or adapter only after reviewing the existing state machine and authorization model.
-- [ ] Keep the contract surface minimal: create agreement, fund with a supported test token, release/refund under explicit rules, expiry handling, and events for indexing.
-- [ ] Decide and document dispute handling before implementation. Do not imply that a smart contract can determine real-world truth without a defined evidence/arbitration mechanism.
-- [ ] Add unit tests, adversarial tests, and state-transition parity tests against the existing deterministic kernel.
-- [ ] Deploy only to testnet; publish contract address, verified source, deployment commit, test results, and known limitations.
+- [x] Select Base Sepolia as the first target network and configure chain ID `84532` in the deployment console.
+- [x] Implement the minimal V3.2 native-asset escrow contract in the separate application repository.
+- [x] Implement dual acceptance, funding, evidence, release/refund, expiry, resolver fallback, and timeout recovery paths.
+- [x] Add 20 Solidity tests plus a compiled-bytecode consistency check in the V3.2 repository.
+- [ ] Add the V3.2 suite to required CI and independently review adversarial and V2-difference cases.
+- [ ] Publish a deployment manifest containing canonical address, deployment transaction, chain ID, exact source commit, compiler settings, bytecode hash, verified explorer source, and known limitations.
+- [ ] Record one reproducible two-wallet Base Sepolia flow through settlement.
 - [ ] Keep wallet onboarding and gas sponsorship optional until the core flow is reliable.
 
 **Exit gate:** A third party can reproduce the testnet demo and inspect the source and test evidence. No real assets or production fee collection.

@@ -1,7 +1,16 @@
 # Base Sepolia Escrow MVP — Design Notes
 
-**Status:** Pre-implementation design; no contract is deployed by this document.  
-**Source of domain rules:** `src/core/types.ts` and `src/kernel/state-machine.ts` on the V2 `main` branch, reviewed 2026-10-09.
+**Status:** Historical V2-to-EVM design input, reconciled 2026-10-19. The EVM prototype is now implemented separately in `cromles/zinesh-protocol` as `contracts/ZineshEscrowV3_2.sol`, with `test/ZineshEscrowV3_2.t.sol`, Hardhat configuration, and a Base Sepolia deployment console. This document does not attest to a deployed address, verified explorer source, audit, or production readiness.
+
+**Source of domain rules:** `src/core/types.ts` and `src/kernel/state-machine.ts` on the V2 `main` branch; cross-repository implementation evidence reviewed 2026-10-19.
+
+## Current implementation boundary
+
+- V2 remains the TypeScript/PostgreSQL reference protocol and now also exposes a standalone deterministic package under `packages/open-protocol`.
+- V3.2 is a separate Solidity implementation in `cromles/zinesh-protocol`; it uses native test ETH rather than V2's TRY/kuruş model.
+- The V3.2 contract implements dual acceptance, funding and work deadlines, evidence hashing, release/refund paths, primary and backup resolvers, timeout recovery, and a reentrancy guard.
+- Its repository includes 20 Foundry-style Solidity tests and a bytecode consistency check. Those tests are implementation evidence, not an independent security review.
+- The remaining work is deployment provenance, explorer source verification, adversarial review, frontend integration, key/resolver operations, and a reproducible end-to-end testnet run.
 
 ## Critical compatibility decisions
 
@@ -25,11 +34,11 @@
 - Only the configured arbiter can resolve a dispute; resolution in favour of the payee releases funds, while resolution in favour of the payer refunds funds.
 - RELEASED, REFUNDED, and EXPIRED are terminal states in the V2 kernel.
 
-These rules are the starting reference, not a claim that the EVM implementation already exists.
+These rules remain the V2 reference. V3.2 intentionally differs in several places, including native-asset custody, dual acceptance, evidence/review windows, and primary/backup resolver timeouts. Any claimed parity must therefore be explicit and tested transition by transition.
 
-## Proposed minimum contract surface
+## Original proposed minimum contract surface
 
-This is a proposal for design review, not a final ABI.
+This is retained as historical design input. It is not the current V3.2 ABI.
 
 - `createAgreement(payee, arbiter, asset, amount, fundingDeadline, completionDeadline, termsHash)`
 - `acceptAgreement(agreementId)`
@@ -45,7 +54,7 @@ This is a proposal for design review, not a final ABI.
 
 Each successful action should emit indexed events containing the agreement ID and enough metadata for independent reconstruction. Terms should be committed by immutable fields and/or a terms hash; funded terms must not be editable.
 
-## Design questions that must be settled before Solidity
+## Questions that remain before a production pilot
 
 ### Identity and signatures
 - Are payer, payee, and arbiter represented by EVM addresses, and how are they bound to the existing V2 actor IDs?
@@ -69,7 +78,7 @@ Each successful action should emit indexed events containing the agreement ID an
 - Decide whether any pause role exists. A pause can protect users but can also block withdrawals; specify which actions remain possible during a pause.
 - Avoid upgradeability for the first testnet prototype unless there is a clear need and a reviewed admin model.
 
-## Test matrix before testnet deployment
+## Test and review matrix before a reproducible public pilot
 
 - Happy path: create → accept → exact funding → release request → other party approves → payee receives exact amount.
 - Refund path: payer requests refund → payee approves → payer receives exact amount.
@@ -84,9 +93,10 @@ Each successful action should emit indexed events containing the agreement ID an
 
 ## Exit criteria
 
-Do not write deployment scripts or claim a testnet MVP until:
-- the settlement asset model is decided;
-- all on-chain versus off-chain responsibilities are documented;
-- the arbiter/dispute and expiry semantics are approved;
-- the proposed state machine has tests for every terminal and adversarial path;
-- no real assets, production fees, or uncapped gas sponsorship are in scope.
+Do not claim production or mainnet readiness until:
+- the deployed address, chain ID, transaction, source commit, compiler settings, and explorer verification are recorded together;
+- the native-asset settlement model and differences from V2 TRY semantics are disclosed;
+- all on-chain versus off-chain responsibilities and resolver operations are documented;
+- every terminal path and deadline boundary has adversarial tests;
+- an independent security review is complete and critical/high findings are resolved;
+- no real assets, production fees, or uncapped gas sponsorship are enabled before the legal and operational gates pass.
