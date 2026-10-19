@@ -712,7 +712,7 @@ maybeDescribe('PostgreSQL Persistence', () => {
         type: 'CreateCell',
         payload: {
           payer: PAYER, payee: PAYEE, description: 'Postgres replay agreement.', amount: AMOUNT, currency: 'TRY',
-          fundingDeadline: T1, completionDeadline: T3,
+          fundingDeadline: T2, completionDeadline: T3,
         },
       },
       nextVersion(ZERO_VERSION),
