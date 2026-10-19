@@ -629,6 +629,38 @@ describe('8. Deadline command uses Application clock', () => {
   });
 });
 
+describe('8b. Funding lifecycle uses the authoritative Application clock', () => {
+  test('AcceptCell is rejected after fundingDeadline', async () => {
+    const harness = makeApp(T0);
+    const cellId = nextCellId();
+    await expectSuccess(await harness.app.handleCommand(
+      request(cmd('CreateCell', createCellPayload(), cellId)),
+    ));
+    harness.setNow(T_AFTER_FUNDING_DL);
+
+    const result = await harness.app.handleCommand(request(
+      cmd('AcceptCell', { acceptedBy: PAYEE }, cellId), { actor: PAYEE },
+    ));
+    expect(result).toMatchObject({ outcome: 'KERNEL_REJECTION',
+      error: { code: 'DEADLINE_VIOLATION' } });
+  });
+
+  test('FundCell is rejected after fundingDeadline', async () => {
+    const harness = makeApp(T0);
+    const cellId = nextCellId();
+    await createCell(harness, cellId);
+    harness.setNow(T_AFTER_FUNDING_DL);
+
+    const result = await harness.app.handleCommand(
+      request(cmd('FundCell', { funderId: PAYER, amount: AMOUNT }, cellId), {
+        gateway: gateway(),
+      }),
+    );
+    expect(result).toMatchObject({ outcome: 'KERNEL_REJECTION',
+      error: { code: 'DEADLINE_VIOLATION' } });
+  });
+});
+
 describe('9. ExpireCell receives the same timestamp as context.now', () => {
   test('payload.currentTime is aligned to the Application clock', async () => {
     const harness = makeApp(T0);

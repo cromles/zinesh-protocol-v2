@@ -75,6 +75,8 @@ export type EventFolder = (state: Readonly<CellState>, event: Event) => CellStat
  */
 export interface KernelHandlers {
   readonly commandHandlers: Readonly<Record<string, CommandHandler>>;
+  /** Event types this kernel version can safely replay. */
+  readonly supportedEventTypes: ReadonlySet<string>;
   readonly eventFolder: EventFolder;
   readonly initialState: (cellId: CellId) => CellState;
 }
@@ -144,6 +146,15 @@ export function createKernel(handlers: KernelHandlers): Kernel {
           return kernelError(
             'STREAM_INTEGRITY_ERROR',
             `Version sequence broken: expected ${expectedVersion}, got ${event.version}`,
+          );
+        }
+
+        // Unknown events must never be ignored: doing so would reconstruct a
+        // state that does not represent the authoritative event stream.
+        if (!handlers.supportedEventTypes.has(event.type)) {
+          return kernelError(
+            'STREAM_INTEGRITY_ERROR',
+            `Unsupported event type at version ${event.version}`,
           );
         }
 
