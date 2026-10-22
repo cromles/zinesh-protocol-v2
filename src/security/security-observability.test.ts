@@ -4,6 +4,7 @@ import {
   JsonLineSecurityMetricSink,
   SecurityTelemetry,
   serverCorrelationId,
+  startSecurityTelemetryHeartbeat,
 } from './security-observability';
 import type {
   SecurityAlert, SecurityEvent, SecurityEventInput, SecurityLogSink, SecurityMetric,
@@ -63,6 +64,7 @@ describe('Phase 7H security observability contracts', () => {
     });
     new JsonLineSecurityAlertSink((line) => output.push(line)).emit({
       name: 'BRUTE_FORCE_AUTHENTICATION', severity: 'WARNING',
+      state: 'FIRING',
       occurredAt: event.occurredAt, instanceId: 'instance-a', observed: 2, threshold: 2, windowMs: 60_000,
     });
     expect(output).toHaveLength(3);
@@ -152,9 +154,58 @@ describe('Phase 7H security observability contracts', () => {
     }).telemetry;
     expect(() => telemetry.record(authenticationFailure())).not.toThrow();
     expect(telemetry.health()).toEqual({
+      status: 'DEGRADED',
       pipelineFailures: 1,
+      consecutivePipelineFailures: 1,
+      lastFailureAt: '2026-08-19T00:00:00.000Z',
       retention: { securityLogDays: 30, metricDays: 14, securityAuditDays: 365 },
     });
+  });
+
+  test('heartbeat proves pipeline activity and resolves inactive alerts', () => {
+    let now = new Date('2026-08-19T00:00:00.000Z');
+    const events: SecurityEvent[] = [];
+    const alerts: SecurityAlert[] = [];
+    const telemetry = new SecurityTelemetry({
+      instanceId: 'instance-heartbeat', log: { write(event) { events.push(event); } },
+      metrics: { record() {} }, alerts: { emit(alert) { alerts.push(alert); } }, thresholds,
+      retention: { securityLogDays: 30, metricDays: 14, securityAuditDays: 365 },
+      now: () => now,
+    });
+    telemetry.record(authenticationFailure());
+    telemetry.record(authenticationFailure());
+    expect(alerts.at(-1)).toEqual(expect.objectContaining({
+      name: 'BRUTE_FORCE_AUTHENTICATION', state: 'FIRING',
+    }));
+
+    now = new Date('2026-08-19T00:01:00.001Z');
+    expect(telemetry.heartbeat()).toBe(true);
+    expect(events.at(-1)).toEqual(expect.objectContaining({
+      category: 'TELEMETRY', action: 'HEARTBEAT', outcome: 'SUCCESS',
+    }));
+    expect(alerts.at(-1)).toEqual(expect.objectContaining({
+      name: 'BRUTE_FORCE_AUTHENTICATION', state: 'RESOLVED', observed: 0,
+    }));
+    expect(telemetry.health()).toEqual(expect.objectContaining({
+      status: 'HEALTHY', consecutivePipelineFailures: 0,
+      lastHeartbeatAt: '2026-08-19T00:01:00.001Z',
+    }));
+  });
+
+  test('heartbeat scheduler emits immediately, repeats, and stops idempotently', () => {
+    jest.useFakeTimers();
+    try {
+      const { telemetry, events } = harness();
+      const heartbeat = startSecurityTelemetryHeartbeat(telemetry, 1_000);
+      expect(events.filter((event) => event.action === 'HEARTBEAT')).toHaveLength(1);
+      jest.advanceTimersByTime(2_000);
+      expect(events.filter((event) => event.action === 'HEARTBEAT')).toHaveLength(3);
+      heartbeat.stop(); heartbeat.stop();
+      jest.advanceTimersByTime(2_000);
+      expect(events.filter((event) => event.action === 'HEARTBEAT')).toHaveLength(3);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   test('high-volume concurrent events remain independent and bounded', async () => {

@@ -96,6 +96,15 @@ is `404`). `Authorization` is ignored and not parsed.
 Bodies are opaque: `{"status":"ok"}` or `{"status":"unavailable"}`. They never
 include schema version, host, path, pool state, driver errors, or telemetry.
 
+Security telemetry is deliberately not a readiness dependency. A collector or
+alerting outage must not cause an otherwise healthy replica to restart or alter
+an escrow decision. Each serving process emits a bounded telemetry heartbeat
+immediately after startup and every 60 seconds. The external collector must
+treat 150 seconds without a heartbeat from an expected instance as a critical
+dead-man condition. Alert lifecycle events use `FIRING` and `RESOLVED`; they do
+not contain credentials, request bodies, payment evidence, or arbitrary labels.
+See [security operations](security-operations.md).
+
 `GET /ready` becoming `503` is the drain signal. `POST /commands` after
 `beginShutdown()` returns `503 {"error":{"code":"RUNTIME_UNAVAILABLE"}}`.
 Liveness stays `200` until the process exits.
