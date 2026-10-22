@@ -5,6 +5,9 @@ on:
     branches: [main, grant/nlnet-restack-2026]
   push:
     branches: [main]
+  schedule:
+    - cron: "17 1 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
