@@ -179,6 +179,19 @@ export function createKernel(handlers: KernelHandlers): Kernel {
       expectedNextVersion: Version,
       ctx: DeterministicContext,
     ): KernelResult {
+      // Context binding: a command may only be evaluated against the state
+      // belonging to the same cell. Without this guard, a caller could load
+      // one cell and accidentally emit an event scoped to another cell.
+      if (command.cellId !== state.cellId) {
+        return {
+          ok: false,
+          error: kernelError(
+            'INVARIANT_VIOLATION',
+            `Command cellId mismatch: state belongs to ${state.cellId}, command targets ${command.cellId}`,
+          ),
+        };
+      }
+
       // Terminal state guard — commands cannot be applied to terminal cells
       if (TERMINAL_STATUSES.has(state.status)) {
         return {
