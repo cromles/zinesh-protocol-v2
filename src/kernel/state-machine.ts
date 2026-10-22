@@ -174,6 +174,13 @@ function assertUninitialized(state: CellState): KernelError | null {
   return null;
 }
 
+function assertInitialized(state: CellState): KernelError | null {
+  if (state.payer === ('' as ActorId)) {
+    return kernelError('ILLEGAL_TRANSITION', 'Cell must be created before other commands are accepted');
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Guard: cell must be in specific status
 // ---------------------------------------------------------------------------
@@ -436,6 +443,9 @@ const handleForceRefund: CommandHandler = (state, command): HandlerResult => {
 };
 
 const handleExpireCell: CommandHandler = (state, command): HandlerResult => {
+  const initializationGuard = assertInitialized(state);
+  if (initializationGuard !== null) return { ok: false, error: initializationGuard };
+
   const guard = assertStatus(state, 'CREATED');
   if (guard !== null) return { ok: false, error: guard };
 
