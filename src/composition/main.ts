@@ -54,10 +54,10 @@ import { allowAllRateLimiter } from '../security/rate-limiter';
 import type { RateLimiter, RateLimitPolicy } from '../security/rate-limiter';
 import {
   JsonLineSecurityAlertSink, JsonLineSecurityLogSink, JsonLineSecurityMetricSink,
-  SecurityTelemetry, noOpSecurityTelemetry,
+  SecurityTelemetry, noOpSecurityTelemetry, startSecurityTelemetryHeartbeat,
 } from '../security/security-observability';
 import type {
-  SecurityAlertThresholds, TelemetryRetentionPolicy,
+  SecurityAlertThresholds, SecurityTelemetryHeartbeat, TelemetryRetentionPolicy,
 } from '../security/security-observability';
 
 /** Operational shutdown bound. Not a domain rule. Not configurable. */
@@ -687,6 +687,7 @@ export async function main(
   );
   const runtime = composeRuntime(config, { authentication }, rateLimitingConfig, telemetry, prototypeFundingConfig);
   let transport: CommandHttpsTransport | undefined;
+  let telemetryHeartbeat: SecurityTelemetryHeartbeat | undefined;
 
   try {
     transport = await CommandHttpsTransport.create(
@@ -697,7 +698,9 @@ export async function main(
     await runtime.persistence.connect();
     await runtime.persistence.migrator.verifyExpectedVersion();
     await transport.listen();
+    telemetryHeartbeat = startSecurityTelemetryHeartbeat(telemetry);
   } catch {
+    telemetryHeartbeat?.stop();
     try {
       await transport?.close();
       await runtime.persistence.disconnect();
@@ -718,6 +721,7 @@ export async function main(
     void performShutdown({
       gate: runtime.gate,
       disconnect: async () => {
+        telemetryHeartbeat?.stop();
         await transport?.close();
         await runtime.persistence.disconnect();
       },

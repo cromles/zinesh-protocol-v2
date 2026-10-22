@@ -59,6 +59,7 @@ export interface SecurityMetricSink { record(metric: SecurityMetric): void }
 export interface SecurityAlert {
   readonly name: string;
   readonly severity: 'WARNING' | 'CRITICAL';
+  readonly state: 'FIRING' | 'RESOLVED';
   readonly occurredAt: string;
   readonly instanceId: string;
   readonly observed: number;
@@ -113,7 +114,7 @@ const METRIC_ACTIONS = new Set([
   'VERIFY', 'RESOLVE', 'POST_AUTH', 'PRE_AUTH', 'COMMAND', 'IDEMPOTENCY', 'TRANSACTION',
   'PRINCIPAL_QUERY', 'CREDENTIAL', 'REQUEST', 'CONFIGURATION', 'HANDSHAKE', 'PIPELINE',
   'LEGACY_AUDIT', 'CREATE', 'ENABLE', 'DISABLE', 'ACTOR_MAPPING', 'CAPABILITY_ASSIGN',
-  'CAPABILITY_REVOKE', 'IDENTITY_ATTACH', 'SECURITY_AUDIT',
+  'CAPABILITY_REVOKE', 'IDENTITY_ATTACH', 'SECURITY_AUDIT', 'HEARTBEAT',
 ]);
 const METRIC_REASONS = new Set([
   'MALFORMED_CREDENTIAL', 'INVALID_SIGNATURE', 'INVALID_ISSUER', 'INVALID_AUDIENCE',
@@ -159,6 +160,9 @@ export class SecurityTelemetry {
   private readonly now: () => Date;
   private readonly evaluator?: AlertConditionEvaluator;
   private pipelineFailureCount = 0;
+  private consecutivePipelineFailures = 0;
+  private lastFailureAt: string | undefined;
+  private lastHeartbeatAt: string | undefined;
 
   constructor(private readonly options: SecurityTelemetryOptions) {
     validateOptions(options);
@@ -172,31 +176,94 @@ export class SecurityTelemetry {
 
   record(input: SecurityEventInput): void {
     const event = safeEvent(input, this.options.instanceId, this.now());
+    const failed = this.writeEvent(event);
+    if (failed) {
+      this.notePipelineFailure(event.correlationId, event.category !== 'TELEMETRY');
+    } else {
+      this.consecutivePipelineFailures = 0;
+    }
+  }
+
+  heartbeat(correlationId = 'security-telemetry-heartbeat'): boolean {
+    const event = safeEvent({
+      category: 'TELEMETRY', action: 'HEARTBEAT', outcome: 'SUCCESS', correlationId,
+    }, this.options.instanceId, this.now());
+    this.lastHeartbeatAt = event.occurredAt;
+    const failed = this.writeEvent(event);
+    if (failed) {
+      this.notePipelineFailure(correlationId, false);
+    } else {
+      this.consecutivePipelineFailures = 0;
+    }
+    return !failed;
+  }
+
+  health(): {
+    readonly status: 'HEALTHY' | 'DEGRADED';
+    readonly pipelineFailures: number;
+    readonly consecutivePipelineFailures: number;
+    readonly retention: TelemetryRetentionPolicy;
+    readonly lastFailureAt?: string;
+    readonly lastHeartbeatAt?: string;
+  } {
+    return {
+      status: this.consecutivePipelineFailures === 0 ? 'HEALTHY' : 'DEGRADED',
+      pipelineFailures: this.pipelineFailureCount,
+      consecutivePipelineFailures: this.consecutivePipelineFailures,
+      retention: this.options.retention,
+      ...(this.lastFailureAt === undefined ? {} : { lastFailureAt: this.lastFailureAt }),
+      ...(this.lastHeartbeatAt === undefined ? {} : { lastHeartbeatAt: this.lastHeartbeatAt }),
+    };
+  }
+
+  private writeEvent(event: SecurityEvent): boolean {
     let failed = false;
     try { this.options.log.write(event); } catch { failed = true; }
     try {
       for (const metric of toMetrics(event)) this.options.metrics.record(metric);
     } catch { failed = true; }
     try { this.evaluator?.observe(event); } catch { failed = true; }
-    if (failed && event.category !== 'TELEMETRY') this.recordPipelineFailure(event.correlationId);
+    return failed;
   }
 
-  health(): { readonly pipelineFailures: number; readonly retention: TelemetryRetentionPolicy } {
-    return { pipelineFailures: this.pipelineFailureCount, retention: this.options.retention };
+  private notePipelineFailure(correlationId: string, report: boolean): void {
+    this.pipelineFailureCount += 1;
+    this.consecutivePipelineFailures += 1;
+    this.lastFailureAt = this.now().toISOString();
+    if (report) this.recordPipelineFailure(correlationId);
   }
 
   private recordPipelineFailure(correlationId: string): void {
-    this.pipelineFailureCount += 1;
     const event = safeEvent({
       category: 'TELEMETRY', action: 'PIPELINE', outcome: 'DEPENDENCY_FAILURE',
       correlationId, reason: 'TELEMETRY_FAILURE',
     }, this.options.instanceId, this.now());
-    try { this.options.log.write(event); } catch { /* Failure-isolated by design. */ }
-    try {
-      for (const metric of toMetrics(event)) this.options.metrics.record(metric);
-    } catch { /* Failure-isolated by design. */ }
-    try { this.evaluator?.observe(event); } catch { /* Failure-isolated by design. */ }
+    this.writeEvent(event);
   }
+}
+
+export const SECURITY_TELEMETRY_HEARTBEAT_INTERVAL_MS = 60_000;
+
+export interface SecurityTelemetryHeartbeat { stop(): void }
+
+export function startSecurityTelemetryHeartbeat(
+  telemetry: SecurityTelemetry,
+  intervalMs = SECURITY_TELEMETRY_HEARTBEAT_INTERVAL_MS,
+): SecurityTelemetryHeartbeat {
+  if (!Number.isSafeInteger(intervalMs) || intervalMs < 1_000 || intervalMs > 86_400_000) {
+    throw new Error('Invalid security telemetry heartbeat interval');
+  }
+  telemetry.heartbeat();
+  const timer = setInterval(() => telemetry.heartbeat(), intervalMs);
+  timer.unref();
+  let stopped = false;
+  return {
+    stop(): void {
+      if (stopped) return;
+      stopped = true;
+      clearInterval(timer);
+    },
+  };
 }
 
 export const noOpSecurityTelemetry = new SecurityTelemetry({
@@ -284,7 +351,7 @@ type SignalName = Exclude<keyof SecurityAlertThresholds, 'windowMs'>;
 
 class AlertConditionEvaluator {
   private readonly observations = new Map<SignalName, number[]>();
-  private readonly lastAlertAt = new Map<SignalName, number>();
+  private readonly activeSignals = new Set<SignalName>();
 
   constructor(
     private readonly instanceId: string,
@@ -296,6 +363,7 @@ class AlertConditionEvaluator {
   observe(event: SecurityEvent): void {
     const signals = signalsFor(event);
     const nowMs = this.now().getTime();
+    this.resolveInactiveSignals(nowMs);
     for (const signal of signals) {
       const current = this.observations.get(signal) ?? [];
       const retained = current.filter((time) => time > nowMs - this.thresholds.windowMs);
@@ -303,15 +371,30 @@ class AlertConditionEvaluator {
       retained.push(nowMs);
       this.observations.set(signal, retained);
       const threshold = this.thresholds[signal];
-      const last = this.lastAlertAt.get(signal) ?? Number.NEGATIVE_INFINITY;
-      if (retained.length >= threshold && nowMs - last >= this.thresholds.windowMs) {
+      if (retained.length >= threshold && !this.activeSignals.has(signal)) {
         this.sink.emit({
-          name: alertName(signal), severity: severity(signal), occurredAt: this.now().toISOString(),
+          name: alertName(signal), severity: severity(signal), state: 'FIRING',
+          occurredAt: this.now().toISOString(),
           instanceId: this.instanceId, observed: retained.length, threshold,
           windowMs: this.thresholds.windowMs,
         });
-        this.lastAlertAt.set(signal, nowMs);
+        this.activeSignals.add(signal);
       }
+    }
+  }
+
+  private resolveInactiveSignals(nowMs: number): void {
+    for (const signal of this.activeSignals) {
+      const retained = (this.observations.get(signal) ?? [])
+        .filter((time) => time > nowMs - this.thresholds.windowMs);
+      this.observations.set(signal, retained);
+      if (retained.length > 0) continue;
+      this.sink.emit({
+        name: alertName(signal), severity: severity(signal), state: 'RESOLVED',
+        occurredAt: this.now().toISOString(), instanceId: this.instanceId,
+        observed: 0, threshold: this.thresholds[signal], windowMs: this.thresholds.windowMs,
+      });
+      this.activeSignals.delete(signal);
     }
   }
 }

@@ -81,10 +81,12 @@ The production security model is built around:
 - non-root container execution
 - read-only filesystem hardening
 - mounted TLS and database secrets
-- security observability
+- security observability with heartbeat and alert lifecycle
 - backup and restore verification
 
 Secrets are expected to be supplied through the runtime environment or mounted secret files rather than committed to the repository.
+Operational collection, alert response, containment, recovery, and drill requirements are defined in
+[the security operations contract](docs/security-operations.md).
 
 ## Frontend
 
