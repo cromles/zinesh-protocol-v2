@@ -14,7 +14,7 @@ Every candidate policy returns one bounded decision:
 | `ALLOW` | Continue to the existing authorization and kernel boundaries. It does not grant authority. |
 | `LIMIT` | Reject with the existing opaque rate-limit contract and a bounded retry interval. |
 | `CHALLENGE` | Reject until a separate, explicitly implemented proof protocol exists. |
-| `QUARANTINE` | Reject this command. Persistent, time-bounded quarantine storage is a later phase. |
+| `QUARANTINE` | Reject this command while an active, time-bounded quarantine exists. |
 | `DENY` | Reject with the opaque command-not-permitted contract. |
 
 The policy receives only principal identity, principal type, bounded capabilities, mapping version, and command type.
@@ -52,7 +52,10 @@ immutable release record; it never edits or deletes the issuance. A registry fai
 controller and fails closed in `ENFORCE` mode. Quarantine can only narrow access and cannot grant capabilities or decide
 an escrow outcome.
 
-There is intentionally no public quarantine mutation endpoint and no online learner with write authority. Trusted
-operator lifecycle authorization, behavioral feature storage, promotion automation, and chaos reports remain separate
-increments. Read-only actor queries and non-command funding administration retain their existing authorization
-boundaries until admission contracts are defined for those endpoint classes.
+There is intentionally no public quarantine mutation endpoint and no online learner with write authority. An internal
+trusted lifecycle requires an authenticated, enabled `SYSTEM` principal with the dedicated
+`MANAGE_ADMISSION_QUARANTINE` capability. Actor and gateway principals cannot receive that capability, and all issue,
+release, rejection, and dependency-failure outcomes emit bounded security telemetry. Behavioral feature storage,
+promotion automation, and chaos reports remain separate increments. Read-only actor queries and non-command funding
+administration retain their existing authorization boundaries until admission contracts are defined for those endpoint
+classes.

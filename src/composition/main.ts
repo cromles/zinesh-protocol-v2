@@ -61,6 +61,10 @@ import type {
 } from '../security/security-observability';
 import { AdaptiveAdmissionController } from '../security/adaptive-admission';
 import { QuarantineAdmissionPolicy } from '../security/admission-quarantine';
+import { TrustedAdmissionQuarantineLifecycle } from '../security/admission-quarantine-lifecycle';
+import type {
+  AdmissionQuarantineLifecycleResult, IssueAdmissionQuarantineRequest, ReleaseAdmissionQuarantineRequest,
+} from '../security/admission-quarantine-lifecycle';
 
 /** Operational shutdown bound. Not a domain rule. Not configurable. */
 export const SHUTDOWN_TIMEOUT_MS = 10_000;
@@ -467,6 +471,8 @@ export interface ComposedRuntime {
   getFundingReceipt(credential: unknown, cellId: import('../core/types').CellId): Promise<FundingReceipt | null>;
   listActorCells(credential: unknown): Promise<ActorCellListResult>;
   getActorCellState(credential: unknown, cellId: string): Promise<ActorCellStateResult>;
+  issueAdmissionQuarantine(request: IssueAdmissionQuarantineRequest): Promise<AdmissionQuarantineLifecycleResult>;
+  releaseAdmissionQuarantine(request: ReleaseAdmissionQuarantineRequest): Promise<AdmissionQuarantineLifecycleResult>;
   handlePrototypeFunding?(request: PrototypeFundingRequest): Promise<HandleCommandResult>;
 }
 
@@ -503,9 +509,11 @@ export function composeRuntime(
     throw new ConfigurationError('PROTOTYPE_FUNDING_ENABLED', 'requires a development-only evidence adapter');
   }
   const persistence = new PostgresPersistenceAdapter(config, telemetry);
+  const authentication = security?.authentication ?? failClosedAuthentication;
+  const principals = security?.principals ?? persistence.principalAuthority;
   const negativeResolution = new TrustedNegativeResolutionIngress(
-    security?.authentication ?? failClosedAuthentication,
-    security?.principals ?? persistence.principalAuthority,
+    authentication,
+    principals,
     security?.negativeResolutionEvidence ?? rejectAllNegativeResolutionEvidence,
     persistence.providerFoundationStore,persistence.fundingReceiptStore,
   );
@@ -527,10 +535,13 @@ export function composeRuntime(
   const admission = security?.admission ?? new AdaptiveAdmissionController(
     new QuarantineAdmissionPolicy(persistence.admissionQuarantineStore),
   );
+  const quarantineLifecycle = new TrustedAdmissionQuarantineLifecycle(
+    authentication, principals, persistence.admissionQuarantineStore, telemetry,
+  );
   const ingress = new TrustedCommandIngress(
     application,
-    security?.authentication ?? failClosedAuthentication,
-    security?.principals ?? persistence.principalAuthority,
+    authentication,
+    principals,
     security?.fundingEvidence ?? rejectAllFundingEvidence,
     principalRateLimiter,
     telemetry,
@@ -578,6 +589,12 @@ export function composeRuntime(
     },
     getActorCellState(credential: unknown, cellId: string): Promise<ActorCellStateResult> {
       return gate.run(() => ingress.getActorCellState(credential, cellId));
+    },
+    issueAdmissionQuarantine(request: IssueAdmissionQuarantineRequest): Promise<AdmissionQuarantineLifecycleResult> {
+      return gate.run(() => quarantineLifecycle.issue(request));
+    },
+    releaseAdmissionQuarantine(request: ReleaseAdmissionQuarantineRequest): Promise<AdmissionQuarantineLifecycleResult> {
+      return gate.run(() => quarantineLifecycle.release(request));
     },
     ...(prototypeFundingConfig.enabled ? { handlePrototypeFunding(request: PrototypeFundingRequest): Promise<HandleCommandResult> {
       return gate.run(() => ingress.handlePrototypeFunding(request));

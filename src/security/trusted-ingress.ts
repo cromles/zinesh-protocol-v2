@@ -21,7 +21,11 @@ const PROTOTYPE_PROVIDER = 'zinesh-prototype';
 const PROTOTYPE_ACCOUNT_SCOPE = 'prototype-only';
 
 export type PrincipalType = 'ACTOR' | 'GATEWAY' | 'SYSTEM';
-export type Capability = 'ACT_AS_SELF' | 'CONFIRM_FUNDING' | 'RESOLVE_FUNDING_NEGATIVE';
+export type Capability =
+  | 'ACT_AS_SELF'
+  | 'CONFIRM_FUNDING'
+  | 'RESOLVE_FUNDING_NEGATIVE'
+  | 'MANAGE_ADMISSION_QUARANTINE';
 
 export interface PrincipalRecord {
   readonly principalId: string;

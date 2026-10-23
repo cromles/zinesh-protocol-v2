@@ -56,7 +56,7 @@ export class PostgresAdmissionQuarantineStore implements AdmissionQuarantineStor
     } catch (error) {
       if (!constraintConflict(error)) throw error;
       const existing = await this.findIssued(quarantine.quarantineId, quarantine.correlationId);
-      return existing !== null && sameQuarantine(existing, quarantine) ? 'DUPLICATE' : 'CONFLICT';
+      return existing !== null && sameQuarantineIntent(existing, quarantine) ? 'DUPLICATE' : 'CONFLICT';
     }
   }
 
@@ -75,7 +75,7 @@ export class PostgresAdmissionQuarantineStore implements AdmissionQuarantineStor
     } catch (error) {
       if (!constraintConflict(error)) throw error;
       const existing = await this.findRelease(release.quarantineId, release.correlationId);
-      return existing !== null && sameRelease(existing, release) ? 'DUPLICATE' : 'CONFLICT';
+      return existing !== null && sameReleaseIntent(existing, release) ? 'DUPLICATE' : 'CONFLICT';
     }
   }
 
@@ -123,14 +123,14 @@ function validRelease(value: QuarantineRelease): boolean {
     && safeId(value.releasedBy) && safeId(value.correlationId);
 }
 
-function sameQuarantine(left: AdmissionQuarantine, right: AdmissionQuarantine): boolean {
+function sameQuarantineIntent(left: AdmissionQuarantine, right: AdmissionQuarantine): boolean {
   return left.quarantineId === right.quarantineId && left.principalId === right.principalId
-    && left.reason === right.reason && left.issuedAt === right.issuedAt && left.expiresAt === right.expiresAt
+    && left.reason === right.reason && left.expiresAt === right.expiresAt
     && left.issuedBy === right.issuedBy && left.correlationId === right.correlationId;
 }
 
-function sameRelease(left: QuarantineRelease, right: QuarantineRelease): boolean {
-  return left.quarantineId === right.quarantineId && left.releasedAt === right.releasedAt
+function sameReleaseIntent(left: QuarantineRelease, right: QuarantineRelease): boolean {
+  return left.quarantineId === right.quarantineId
     && left.releasedBy === right.releasedBy && left.correlationId === right.correlationId;
 }
 

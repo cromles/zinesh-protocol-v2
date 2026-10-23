@@ -228,6 +228,12 @@ maybeDescribe('Phase 7C PostgreSQL Principal Authority', () => {
     expect(revoked).toMatchObject({ ok: true, principal: { capabilities: [], mappingVersion: 3 } });
     await authority.create(actorInput('actor-cap', 'actor-cap', ACTOR));
     expect(await authority.assignCapability('actor-cap', 'CONFIRM_FUNDING', 1, context('wrong'))).toMatchObject({ ok: false, kind: 'CONFLICT' });
+    expect(await authority.assignCapability('actor-cap', 'MANAGE_ADMISSION_QUARANTINE', 1, context('operator-wrong-type')))
+      .toMatchObject({ ok: false, kind: 'CONFLICT' });
+    expect(await authority.create({
+      principalId: 'system-operator', type: 'SYSTEM', identity: { issuer: 'system', subject: 'operator' },
+      capabilities: ['MANAGE_ADMISSION_QUARANTINE'], context: context('system-operator-create'),
+    })).toMatchObject({ ok: true, principal: { capabilities: ['MANAGE_ADMISSION_QUARANTINE'] } });
     await expect(pool.query(
       `INSERT INTO principal_capabilities(principal_id,capability) VALUES('actor-cap','*')`,
     )).rejects.toMatchObject({ code: '23514' });
@@ -494,7 +500,7 @@ maybeDescribe('Phase 7C migrations', () => {
     await migrator.migrate();
     await expect(migrator.verifyExpectedVersion()).resolves.toBeUndefined();
     expect((await db.pool.query('SELECT version FROM schema_migrations ORDER BY version')).rows)
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }]);
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }]);
     await db.pool.end();
   });
 
