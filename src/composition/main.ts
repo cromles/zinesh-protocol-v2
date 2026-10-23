@@ -484,6 +484,7 @@ export interface SecurityPorts {
   readonly fundingDestinations: FundingDestinationResolver;
   readonly negativeResolutionEvidence: NegativeResolutionEvidencePort;
   readonly prototypeFundingEvidence: PrototypeFundingPort;
+  readonly admission: import('../security/adaptive-admission').AdaptiveAdmissionController;
 }
 
 export function composeRuntime(
@@ -531,6 +532,7 @@ export function composeRuntime(
     security?.fundingDestinations,
     security?.fundingObservationEvidence,
     prototypeFundingConfig.enabled ? security?.prototypeFundingEvidence : undefined,
+    security?.admission,
   );
 
   const runtimePersistence: RuntimePersistence = {

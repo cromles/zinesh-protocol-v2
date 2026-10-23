@@ -119,3 +119,7 @@ export function rateLimitUnavailable(): import('./types').HandleCommandResult {
     type: 'ApplicationError', code: 'RATE_LIMIT_UNAVAILABLE', message: 'Request cannot be admitted',
   } };
 }
+
+export function admissionRejection(): import('./types').HandleCommandResult {
+  return securityRejection('COMMAND_NOT_PERMITTED');
+}
