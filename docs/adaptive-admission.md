@@ -42,7 +42,17 @@ replay, and signed deployment remain mandatory. Automatic settlement authority i
 
 ## Current implementation boundary
 
-The first increment integrates adaptive admission into authenticated command ingress with a baseline allow policy that
-preserves current behavior. It provides the versioned policy interface, immutable minimal context, bounded decisions,
-shadow isolation, enforcement failure safety, and structured observability. Durable quarantine, behavioral feature
-storage, promotion automation, and chaos reports are intentionally separate increments.
+Adaptive admission is integrated into authenticated command ingress. It provides the versioned policy interface,
+immutable minimal context, bounded decisions, shadow isolation, enforcement failure safety, and structured
+observability.
+
+Production composition also evaluates an append-only PostgreSQL quarantine registry before command execution. An
+issuance has a maximum 30-day TTL and becomes ineffective automatically at expiry. Early release creates a separate
+immutable release record; it never edits or deletes the issuance. A registry failure propagates to the admission
+controller and fails closed in `ENFORCE` mode. Quarantine can only narrow access and cannot grant capabilities or decide
+an escrow outcome.
+
+There is intentionally no public quarantine mutation endpoint and no online learner with write authority. Trusted
+operator lifecycle authorization, behavioral feature storage, promotion automation, and chaos reports remain separate
+increments. Read-only actor queries and non-command funding administration retain their existing authorization
+boundaries until admission contracts are defined for those endpoint classes.

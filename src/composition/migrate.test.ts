@@ -242,14 +242,16 @@ maybeDescribe('one-shot schema apply against PostgreSQL', () => {
     });
     try {
       expect((await pool.query('SELECT version FROM schema_migrations ORDER BY version')).rows)
-        .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }]);
-      expect(EXPECTED_SCHEMA_VERSION).toBe(10);
+        .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }]);
+      expect(EXPECTED_SCHEMA_VERSION).toBe(11);
       expect((await pool.query('SELECT name FROM schema_migrations WHERE version=6')).rows)
         .toEqual([{ name: 'funding-intents-held-semantics-disputes' }]);
       expect((await pool.query('SELECT name FROM schema_migrations WHERE version=7')).rows)
         .toEqual([{ name: 'provider-neutral-evidence-reconciliation' }]);
       expect((await pool.query('SELECT name FROM schema_migrations WHERE version=8')).rows)
         .toEqual([{ name: 'funding-route-observation-inbox-lifecycle' }]);
+      expect((await pool.query('SELECT name FROM schema_migrations WHERE version=11')).rows)
+        .toEqual([{ name: 'append-only-admission-quarantine-memory' }]);
     } finally {
       await pool.end();
     }
