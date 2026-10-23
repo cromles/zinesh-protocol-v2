@@ -10,11 +10,12 @@ import type { FundingObservation, FundingReconciliationOutcome, FundingRoute } f
 import { hasValidFundingObservation } from '../funding/funding-foundation';
 import type { FundingReceipt } from '../funding/types';
 import type { HandleCommandResult, TrustedHandleCommandRequest } from '../application/types';
-import { rateLimitRejection, rateLimitUnavailable, securityRejection } from '../application/errors';
+import { admissionRejection, rateLimitRejection, rateLimitUnavailable, securityRejection } from '../application/errors';
 import { allowAllRateLimiter } from './rate-limiter';
 import type { RateLimiter } from './rate-limiter';
 import { noOpSecurityTelemetry, serverCorrelationId } from './security-observability';
 import type { SecurityTelemetry } from './security-observability';
+import { AdaptiveAdmissionController } from './adaptive-admission';
 const PROTOTYPE_GATEWAY_PRINCIPAL_ID = 'zinesh-prototype-gateway';
 const PROTOTYPE_PROVIDER = 'zinesh-prototype';
 const PROTOTYPE_ACCOUNT_SCOPE = 'prototype-only';
@@ -164,6 +165,7 @@ export class TrustedCommandIngress {
     private readonly fundingDestinations: FundingDestinationResolver = rejectAllFundingDestinations,
     private readonly fundingObservationEvidence: FundingObservationEvidencePort = rejectAllFundingObservationEvidence,
     private readonly prototypeFundingEvidence?: PrototypeFundingPort,
+    private readonly admission: AdaptiveAdmissionController = new AdaptiveAdmissionController(),
   ) {}
 
   async handlePrototypeFunding(request: PrototypeFundingRequest): Promise<HandleCommandResult> {
@@ -396,6 +398,23 @@ export class TrustedCommandIngress {
     }
 
     const principal = verifyPrincipal(record);
+    const admission = await this.admission.evaluate(principal, command);
+    this.telemetry.record({
+      category: 'ADMISSION', action: 'EVALUATE',
+      outcome: admission.policyFailed ? 'DEPENDENCY_FAILURE'
+        : admission.effective === 'ALLOW' ? 'ALLOWED' : 'REJECTED',
+      reason: admission.observed.reason,
+      policyVersion: admission.policyVersion,
+      admissionMode: admission.mode,
+      admissionDisposition: admission.observed.disposition,
+      ...principalContext,
+    });
+    if (admission.effective === 'REJECT') {
+      if (admission.observed.disposition === 'LIMIT') {
+        return rateLimitRejection(admission.observed.retryAfterSeconds!);
+      }
+      return admissionRejection();
+    }
     let fundingContext: VerifiedFundingContext | undefined;
     if (command.type === 'FundCell') {
       if (principal.type !== 'GATEWAY' || !principal.capabilities.includes('CONFIRM_FUNDING')) {

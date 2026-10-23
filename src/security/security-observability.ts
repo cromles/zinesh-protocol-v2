@@ -8,6 +8,7 @@ export type SecurityEventCategory =
   | 'RATE_LIMIT'
   | 'PERSISTENCE'
   | 'TLS'
+  | 'ADMISSION'
   | 'TELEMETRY';
 
 export type SecurityEventOutcome =
@@ -31,6 +32,9 @@ export interface SecurityEvent {
   readonly principalId?: string;
   readonly commandType?: string;
   readonly durationMs?: number;
+  readonly policyVersion?: string;
+  readonly admissionMode?: 'ENFORCE' | 'SHADOW';
+  readonly admissionDisposition?: 'ALLOW' | 'LIMIT' | 'CHALLENGE' | 'QUARANTINE' | 'DENY';
 }
 
 export interface SecurityEventInput {
@@ -43,6 +47,9 @@ export interface SecurityEventInput {
   readonly principalId?: string;
   readonly commandType?: string;
   readonly durationMs?: number;
+  readonly policyVersion?: string;
+  readonly admissionMode?: 'ENFORCE' | 'SHADOW';
+  readonly admissionDisposition?: 'ALLOW' | 'LIMIT' | 'CHALLENGE' | 'QUARANTINE' | 'DENY';
 }
 
 export interface SecurityLogSink { write(event: SecurityEvent): void }
@@ -99,7 +106,7 @@ export interface SecurityTelemetryOptions {
 
 const CATEGORIES = new Set<SecurityEventCategory>([
   'AUTHENTICATION', 'PRINCIPAL', 'AUTHORIZATION', 'INGRESS',
-  'RATE_LIMIT', 'PERSISTENCE', 'TLS', 'TELEMETRY',
+  'RATE_LIMIT', 'PERSISTENCE', 'TLS', 'ADMISSION', 'TELEMETRY',
 ]);
 const OUTCOMES = new Set<SecurityEventOutcome>([
   'SUCCESS', 'FAILURE', 'ALLOWED', 'REJECTED', 'ACCEPTED', 'DEPENDENCY_FAILURE',
@@ -110,11 +117,13 @@ const COMMAND_TYPES = new Set([
   'CreateCell', 'AcceptCell', 'RejectCell', 'FundCell', 'RequestRelease', 'ApproveRelease', 'RequestRefund',
   'ApproveRefund', 'ForceRefund', 'ExpireCell', 'OpenDispute', 'ResolveDispute',
 ]);
+const ADMISSION_MODES = new Set(['ENFORCE', 'SHADOW']);
+const ADMISSION_DISPOSITIONS = new Set(['ALLOW', 'LIMIT', 'CHALLENGE', 'QUARANTINE', 'DENY']);
 const METRIC_ACTIONS = new Set([
   'VERIFY', 'RESOLVE', 'POST_AUTH', 'PRE_AUTH', 'COMMAND', 'IDEMPOTENCY', 'TRANSACTION',
   'PRINCIPAL_QUERY', 'CREDENTIAL', 'REQUEST', 'CONFIGURATION', 'HANDSHAKE', 'PIPELINE',
   'LEGACY_AUDIT', 'CREATE', 'ENABLE', 'DISABLE', 'ACTOR_MAPPING', 'CAPABILITY_ASSIGN',
-  'CAPABILITY_REVOKE', 'IDENTITY_ATTACH', 'SECURITY_AUDIT', 'HEARTBEAT',
+  'CAPABILITY_REVOKE', 'IDENTITY_ATTACH', 'SECURITY_AUDIT', 'HEARTBEAT', 'EVALUATE',
 ]);
 const METRIC_REASONS = new Set([
   'MALFORMED_CREDENTIAL', 'INVALID_SIGNATURE', 'INVALID_ISSUER', 'INVALID_AUDIENCE',
@@ -130,6 +139,8 @@ const METRIC_REASONS = new Set([
   'INTERNAL_FAILURE', 'RUNTIME_UNAVAILABLE', 'INVALID_INPUT', 'ILLEGAL_TRANSITION', 'INVARIANT_VIOLATION',
   'UNKNOWN_COMMAND', 'PRECONDITION_FAILED', 'DEADLINE_VIOLATION', 'STREAM_INTEGRITY_ERROR',
   'TELEMETRY_FAILURE', 'CONFLICT', 'NOT_FOUND', 'INVALID',
+  'BASELINE_ALLOW', 'RISK_LIMIT', 'ADDITIONAL_PROOF_REQUIRED', 'PRINCIPAL_QUARANTINED',
+  'POLICY_DENY', 'ADMISSION_POLICY_FAILURE', 'INVALID_ADMISSION_DECISION',
 ]);
 
 export class JsonLineSecurityLogSink implements SecurityLogSink {
@@ -300,6 +311,11 @@ function safeEvent(input: SecurityEventInput, instanceId: string, now: Date): Se
       ? { commandType: input.commandType } : {}),
     ...(input.durationMs !== undefined && Number.isSafeInteger(input.durationMs) && input.durationMs >= 0
       ? { durationMs: input.durationMs } : {}),
+    ...(safeIdentifier(input.policyVersion) === undefined ? {} : { policyVersion: safeIdentifier(input.policyVersion)! }),
+    ...(input.admissionMode !== undefined && ADMISSION_MODES.has(input.admissionMode)
+      ? { admissionMode: input.admissionMode } : {}),
+    ...(input.admissionDisposition !== undefined && ADMISSION_DISPOSITIONS.has(input.admissionDisposition)
+      ? { admissionDisposition: input.admissionDisposition } : {}),
   };
 }
 

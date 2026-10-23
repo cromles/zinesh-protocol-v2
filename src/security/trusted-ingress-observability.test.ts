@@ -9,6 +9,7 @@ import type { SecurityEvent } from './security-observability';
 import { TrustedCommandIngress, rejectAllFundingEvidence } from './trusted-ingress';
 import type { AuthenticationPort, PrincipalAuthority, PrincipalRecord } from './trusted-ingress';
 import type { RateLimiter } from './rate-limiter';
+import { AdaptiveAdmissionController } from './adaptive-admission';
 
 const PAYER = makeActorId('observability-payer');
 const principal: PrincipalRecord = {
@@ -40,6 +41,7 @@ function setup(options: {
   limiter?: RateLimiter;
   telemetry?: SecurityTelemetry;
   persistence?: InMemoryPersistenceAdapter;
+  admission?: AdaptiveAdmissionController;
 } = {}) {
   const events: SecurityEvent[] = [];
   const telemetry = options.telemetry ?? new SecurityTelemetry({
@@ -60,6 +62,10 @@ function setup(options: {
     rejectAllFundingEvidence,
     options.limiter ?? { async consume() { return { allowed: true, retryAfterSeconds: 0 }; } },
     telemetry,
+    undefined,
+    undefined,
+    undefined,
+    options.admission,
   );
   return { ingress, events, persistence };
 }
@@ -180,6 +186,52 @@ describe('Phase 7H trusted ingress observability', () => {
       category: 'RATE_LIMIT', outcome: 'DEPENDENCY_FAILURE', reason: 'FAIL_CLOSED',
     }));
     expect(JSON.stringify(failed.events)).not.toContain('password=secret');
+  });
+
+  test('enforced quarantine rejects before application mutation and emits a bounded decision', async () => {
+    const admission = new AdaptiveAdmissionController({ version: 'quarantine-v1', async evaluate() {
+      return { disposition: 'QUARANTINE', reason: 'PRINCIPAL_QUARANTINED' };
+    } });
+    const { ingress, events, persistence } = setup({ admission });
+    const result = await ingress.handle({
+      credential: 'token', command: createCommand('quarantined'), correlationId: 'quarantine-correlation',
+    });
+    expect(result).toMatchObject({ outcome: 'APPLICATION_REJECTION', error: { code: 'COMMAND_NOT_PERMITTED' } });
+    await expect(persistence.eventStore.getEvents(makeCellId('cell-quarantined'))).resolves.toEqual([]);
+    expect(events).toContainEqual(expect.objectContaining({
+      category: 'ADMISSION', action: 'EVALUATE', outcome: 'REJECTED',
+      reason: 'PRINCIPAL_QUARANTINED', policyVersion: 'quarantine-v1',
+      admissionMode: 'ENFORCE', admissionDisposition: 'QUARANTINE',
+    }));
+  });
+
+  test('shadow quarantine observes risk without gaining power to block an authorized command', async () => {
+    const admission = new AdaptiveAdmissionController({ version: 'shadow-v1', async evaluate() {
+      return { disposition: 'QUARANTINE', reason: 'PRINCIPAL_QUARANTINED' };
+    } }, 'SHADOW');
+    const { ingress, events } = setup({ admission });
+    await expect(ingress.handle({
+      credential: 'token', command: createCommand('shadow'), correlationId: 'shadow-correlation',
+    })).resolves.toMatchObject({ outcome: 'SUCCESS' });
+    expect(events).toContainEqual(expect.objectContaining({
+      category: 'ADMISSION', outcome: 'ALLOWED', reason: 'PRINCIPAL_QUARANTINED',
+      admissionMode: 'SHADOW', admissionDisposition: 'QUARANTINE',
+    }));
+  });
+
+  test('admission policy outage fails closed in enforce mode without leaking internals', async () => {
+    const admission = new AdaptiveAdmissionController({ version: 'outage-v1', async evaluate() {
+      throw new Error('https://secret-policy.internal token=hidden');
+    } });
+    const { ingress, events } = setup({ admission });
+    await expect(ingress.handle({
+      credential: 'token', command: createCommand('policy-outage'), correlationId: 'policy-outage',
+    })).resolves.toMatchObject({ error: { code: 'COMMAND_NOT_PERMITTED' } });
+    expect(events).toContainEqual(expect.objectContaining({
+      category: 'ADMISSION', outcome: 'DEPENDENCY_FAILURE', reason: 'ADMISSION_POLICY_FAILURE',
+    }));
+    expect(JSON.stringify(events)).not.toContain('secret-policy');
+    expect(JSON.stringify(events)).not.toContain('hidden');
   });
 
   test('idempotency conflict is observed separately from command failure', async () => {

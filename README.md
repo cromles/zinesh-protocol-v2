@@ -63,6 +63,7 @@ The architecture includes:
 - JWKS caching
 - capability-aware command authorization
 - PostgreSQL-backed rate limiting
+- versioned adaptive admission with isolated `SHADOW` evaluation
 
 The application layer decides whether a command is permitted; the deterministic kernel remains responsible for valid state transitions.
 
@@ -87,6 +88,8 @@ The production security model is built around:
 Secrets are expected to be supplied through the runtime environment or mounted secret files rather than committed to the repository.
 Operational collection, alert response, containment, recovery, and drill requirements are defined in
 [the security operations contract](docs/security-operations.md).
+The learning boundary, decision semantics, and fail-safe promotion rules are defined in
+[the adaptive admission contract](docs/adaptive-admission.md).
 
 ## Frontend
 
