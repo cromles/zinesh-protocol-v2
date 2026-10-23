@@ -14,7 +14,7 @@ Schema apply remains Step 5:
 
 | Command | Role |
 |---|---|
-| `node dist/composition/migrate.js` | Apply schema to an empty or behind database, verify `{1,2,3,4,5,6,7,8,9,10}`, exit |
+| `node dist/composition/migrate.js` | Apply schema to an empty or behind database, verify `{1,2,3,4,5,6,7,8,9,10,11}`, exit |
 | `node dist/composition/main.js` | Serve. Verify schema only. Never migrate. Never dump. Never restore. |
 
 Backup and restore are **not** serving commands and **not** schema apply.
@@ -59,11 +59,12 @@ command idempotency records, and principal mappings.
 
 Authoritative:
 
-- `schema_migrations` — exact set `{1,2,3,4,5,6,7,8,9,10}` for this image
+- `schema_migrations` — exact set `{1,2,3,4,5,6,7,8,9,10,11}` for this image
 - `events` — append-only escrow source of truth
 - `command_executions` — durable idempotency; restore together with `events`
 - `principals`, `external_identities`, `principal_capabilities`
 - `principal_audit` — transactional security audit
+- `admission_quarantines`, `admission_quarantine_releases` — append-only admission memory
 - schema objects from versions 2–3 (functions and triggers)
 
 Cache (include; do not treat as source of truth):
@@ -88,13 +89,13 @@ Non-authoritative:
    `verifyExpectedVersion()` → listen.
 5. Treat the replica as ready only when `GET /ready` returns `200`.
 
-Serving never migrates. Schema equality remains exact `{1,2,3,4,5,6,7,8,9,10}`.
+Serving never migrates. Schema equality remains exact `{1,2,3,4,5,6,7,8,9,10,11}`.
 
 ## Restore verification
 
 A restore is successful only when all of the following hold:
 
-- `schema_migrations` is exactly `{1,2,3,4,5,6,7,8,9,10}`
+- `schema_migrations` is exactly `{1,2,3,4,5,6,7,8,9,10,11}`
 - fixture `events` exist and `kernel.evolve` reconstructs the pre-backup cell
   state (events are source of truth)
 - `command_executions` exist; the same `commandId` and fingerprint replay and

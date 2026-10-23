@@ -59,6 +59,8 @@ import {
 import type {
   SecurityAlertThresholds, SecurityTelemetryHeartbeat, TelemetryRetentionPolicy,
 } from '../security/security-observability';
+import { AdaptiveAdmissionController } from '../security/adaptive-admission';
+import { QuarantineAdmissionPolicy } from '../security/admission-quarantine';
 
 /** Operational shutdown bound. Not a domain rule. Not configurable. */
 export const SHUTDOWN_TIMEOUT_MS = 10_000;
@@ -484,7 +486,7 @@ export interface SecurityPorts {
   readonly fundingDestinations: FundingDestinationResolver;
   readonly negativeResolutionEvidence: NegativeResolutionEvidencePort;
   readonly prototypeFundingEvidence: PrototypeFundingPort;
-  readonly admission: import('../security/adaptive-admission').AdaptiveAdmissionController;
+  readonly admission: AdaptiveAdmissionController;
 }
 
 export function composeRuntime(
@@ -522,6 +524,9 @@ export function composeRuntime(
   const preAuthenticationRateLimiter = rateLimiting === undefined
     ? allowAllRateLimiter
     : new PostgresFixedWindowRateLimiter(persistence.rateLimitStore, 'PRE_AUTH', rateLimiting.preAuth);
+  const admission = security?.admission ?? new AdaptiveAdmissionController(
+    new QuarantineAdmissionPolicy(persistence.admissionQuarantineStore),
+  );
   const ingress = new TrustedCommandIngress(
     application,
     security?.authentication ?? failClosedAuthentication,
@@ -532,7 +537,7 @@ export function composeRuntime(
     security?.fundingDestinations,
     security?.fundingObservationEvidence,
     prototypeFundingConfig.enabled ? security?.prototypeFundingEvidence : undefined,
-    security?.admission,
+    admission,
   );
 
   const runtimePersistence: RuntimePersistence = {

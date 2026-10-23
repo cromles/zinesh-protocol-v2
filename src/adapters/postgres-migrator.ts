@@ -1,6 +1,6 @@
 import type { Pool, PoolClient } from 'pg';
 
-export const EXPECTED_SCHEMA_VERSION = 10;
+export const EXPECTED_SCHEMA_VERSION = 11;
 
 const CORE_SCHEMA = `
 CREATE TABLE IF NOT EXISTS events (
@@ -633,6 +633,35 @@ BEGIN
 END; $$ LANGUAGE plpgsql;
 `;
 
+const ADMISSION_QUARANTINE_V11_SCHEMA = `
+CREATE TABLE admission_quarantines (
+ quarantine_id TEXT PRIMARY KEY CHECK(quarantine_id ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'),
+ principal_id TEXT NOT NULL REFERENCES principals(principal_id) ON DELETE RESTRICT,
+ reason TEXT NOT NULL CHECK(reason IN ('SECURITY_INCIDENT','BEHAVIORAL_ANOMALY','CREDENTIAL_COMPROMISE','MANUAL_REVIEW')),
+ issued_at BIGINT NOT NULL CHECK(issued_at>=0),
+ expires_at BIGINT NOT NULL,
+ issued_by TEXT NOT NULL CHECK(issued_by ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'),
+ correlation_id TEXT NOT NULL UNIQUE CHECK(correlation_id ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'),
+ CHECK(expires_at>issued_at AND expires_at-issued_at<=2592000000)
+);
+CREATE INDEX admission_quarantines_active
+ ON admission_quarantines(principal_id,expires_at DESC,issued_at);
+CREATE TABLE admission_quarantine_releases (
+ quarantine_id TEXT PRIMARY KEY REFERENCES admission_quarantines(quarantine_id) ON DELETE RESTRICT,
+ released_at BIGINT NOT NULL CHECK(released_at>=0),
+ released_by TEXT NOT NULL CHECK(released_by ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'),
+ correlation_id TEXT NOT NULL UNIQUE CHECK(correlation_id ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$')
+);
+CREATE OR REPLACE FUNCTION prevent_admission_quarantine_mutation() RETURNS trigger AS $$
+BEGIN
+ RAISE EXCEPTION 'admission quarantine history is append-only' USING ERRCODE='23514';
+END; $$ LANGUAGE plpgsql;
+CREATE TRIGGER admission_quarantines_immutable BEFORE UPDATE OR DELETE ON admission_quarantines
+ FOR EACH ROW EXECUTE FUNCTION prevent_admission_quarantine_mutation();
+CREATE TRIGGER admission_quarantine_releases_immutable BEFORE UPDATE OR DELETE ON admission_quarantine_releases
+ FOR EACH ROW EXECUTE FUNCTION prevent_admission_quarantine_mutation();
+`;
+
 export class SchemaVersionError extends Error {
   constructor(message: string) { super(message); this.name = 'SchemaVersionError'; }
 }
@@ -695,6 +724,11 @@ export class PostgresMigrator {
         await client.query(FUNDING_ACCOUNT_SCOPE_V10_SCHEMA);
         await client.query('INSERT INTO schema_migrations(version,name) VALUES (10,$1)',
           ['account-scoped-funding-and-negative-dispositions']);
+      }
+      if (!applied.has(11)) {
+        await client.query(ADMISSION_QUARANTINE_V11_SCHEMA);
+        await client.query('INSERT INTO schema_migrations(version,name) VALUES (11,$1)',
+          ['append-only-admission-quarantine-memory']);
       }
       await client.query('COMMIT');
     } catch (error) {

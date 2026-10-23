@@ -30,6 +30,7 @@ import { PostgresFundingIntentStore } from './postgres-funding-intent-store';
 import { PostgresFundingDisputeStore } from './postgres-funding-dispute-store';
 import { PostgresProviderFoundationStore } from './postgres-provider-foundation-store';
 import { PostgresFundingReceiptStore } from './postgres-funding-receipt-store';
+import { PostgresAdmissionQuarantineStore } from './postgres-admission-quarantine-store';
 
 export interface PostgresConfig {
   readonly host: string;
@@ -62,6 +63,7 @@ export class PostgresPersistenceAdapter implements PersistenceAdapter {
   readonly fundingDisputeStore: PostgresFundingDisputeStore;
   readonly providerFoundationStore: PostgresProviderFoundationStore;
   readonly fundingReceiptStore: PostgresFundingReceiptStore;
+  readonly admissionQuarantineStore: PostgresAdmissionQuarantineStore;
 
   constructor(config: PostgresConfig, telemetry: SecurityTelemetry = noOpSecurityTelemetry) {
     this.pool = new Pool({
@@ -85,6 +87,7 @@ export class PostgresPersistenceAdapter implements PersistenceAdapter {
     this.fundingDisputeStore = new PostgresFundingDisputeStore(this.pool);
     this.providerFoundationStore = new PostgresProviderFoundationStore(this.pool);
     this.fundingReceiptStore = new PostgresFundingReceiptStore(this.pool);
+    this.admissionQuarantineStore = new PostgresAdmissionQuarantineStore(this.pool);
   }
 
   async connect(): Promise<void> {
