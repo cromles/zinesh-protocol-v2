@@ -1,6 +1,6 @@
 import type { Pool, PoolClient } from 'pg';
 
-export const EXPECTED_SCHEMA_VERSION = 11;
+export const EXPECTED_SCHEMA_VERSION = 12;
 
 const CORE_SCHEMA = `
 CREATE TABLE IF NOT EXISTS events (
@@ -662,6 +662,21 @@ CREATE TRIGGER admission_quarantine_releases_immutable BEFORE UPDATE OR DELETE O
  FOR EACH ROW EXECUTE FUNCTION prevent_admission_quarantine_mutation();
 `;
 
+const QUARANTINE_OPERATOR_CAPABILITY_V12_SCHEMA = `
+ALTER TABLE principal_capabilities DROP CONSTRAINT IF EXISTS principal_capabilities_capability_check;
+ALTER TABLE principal_capabilities ADD CONSTRAINT principal_capabilities_capability_check
+ CHECK(capability IN ('ACT_AS_SELF','CONFIRM_FUNDING','RESOLVE_FUNDING_NEGATIVE','MANAGE_ADMISSION_QUARANTINE'));
+CREATE OR REPLACE FUNCTION enforce_principal_capability() RETURNS trigger AS $$
+DECLARE ptype TEXT;
+BEGIN
+ SELECT principal_type INTO ptype FROM principals WHERE principal_id=NEW.principal_id;
+ IF (ptype='ACTOR' AND NEW.capability='ACT_AS_SELF') OR
+    (ptype='GATEWAY' AND NEW.capability IN ('CONFIRM_FUNDING','RESOLVE_FUNDING_NEGATIVE')) OR
+    (ptype='SYSTEM' AND NEW.capability='MANAGE_ADMISSION_QUARANTINE') THEN RETURN NEW; END IF;
+ RAISE EXCEPTION 'capability not allowed for principal type' USING ERRCODE='23514';
+END; $$ LANGUAGE plpgsql;
+`;
+
 export class SchemaVersionError extends Error {
   constructor(message: string) { super(message); this.name = 'SchemaVersionError'; }
 }
@@ -729,6 +744,11 @@ export class PostgresMigrator {
         await client.query(ADMISSION_QUARANTINE_V11_SCHEMA);
         await client.query('INSERT INTO schema_migrations(version,name) VALUES (11,$1)',
           ['append-only-admission-quarantine-memory']);
+      }
+      if (!applied.has(12)) {
+        await client.query(QUARANTINE_OPERATOR_CAPABILITY_V12_SCHEMA);
+        await client.query('INSERT INTO schema_migrations(version,name) VALUES (12,$1)',
+          ['system-quarantine-operator-capability']);
       }
       await client.query('COMMIT');
     } catch (error) {

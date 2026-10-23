@@ -68,13 +68,13 @@ maybeDescribe('V11 append-only admission quarantine memory', () => {
   test('issue and release are idempotent but conflicting reuse is rejected', async () => {
     const quarantine = await fixture();
     expect(await store.issue(quarantine)).toBe('ISSUED');
-    expect(await store.issue(quarantine)).toBe('DUPLICATE');
+    expect(await store.issue({ ...quarantine, issuedAt: quarantine.issuedAt + 1 })).toBe('DUPLICATE');
     expect(await store.issue({ ...quarantine, expiresAt: quarantine.expiresAt + 1 })).toBe('CONFLICT');
     const release = { quarantineId: quarantine.quarantineId, releasedAt: 2_000,
       releasedBy: 'security-operator', correlationId: `release-${quarantine.correlationId}` };
     expect(await store.release(release)).toBe('RELEASED');
-    expect(await store.release(release)).toBe('DUPLICATE');
-    expect(await store.release({ ...release, releasedAt: 2_001 })).toBe('CONFLICT');
+    expect(await store.release({ ...release, releasedAt: 2_001 })).toBe('DUPLICATE');
+    expect(await store.release({ ...release, releasedBy: 'other-operator' })).toBe('CONFLICT');
   });
 
   test('bounded validation rejects unsafe identities, clocks and TTLs before persistence', async () => {

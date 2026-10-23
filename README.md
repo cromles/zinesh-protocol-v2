@@ -65,6 +65,7 @@ The architecture includes:
 - PostgreSQL-backed rate limiting
 - versioned adaptive admission with isolated `SHADOW` evaluation
 - append-only, time-bounded principal quarantine memory
+- capability-gated internal quarantine lifecycle for authenticated `SYSTEM` operators
 
 The application layer decides whether a command is permitted; the deterministic kernel remains responsible for valid state transitions.
 
