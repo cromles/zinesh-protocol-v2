@@ -1,4 +1,4 @@
-FROM node:24.18.1-alpine3.23@sha256:ba63d8e0b5d4cbc6db9da12ea77ddb35a4783ad653a092ef115cc383526d4369 AS build
+FROM node:26.13.0-alpine3.23@sha256:e6c03d42b46af3b1e98207e59f06a43cfe5efd3ec4b4d3d9802bddf04f833374 AS build
 
 WORKDIR /build
 COPY package.json package-lock.json .node-version .npm-version ./
@@ -14,7 +14,7 @@ RUN npm run build \
     && cd dist \
     && find . -type f -name '*.js' -exec cp --parents '{}' /runtime-dist/ \;
 
-FROM node:24.18.1-alpine3.23@sha256:ba63d8e0b5d4cbc6db9da12ea77ddb35a4783ad653a092ef115cc383526d4369 AS production-dependencies
+FROM node:26.13.0-alpine3.23@sha256:e6c03d42b46af3b1e98207e59f06a43cfe5efd3ec4b4d3d9802bddf04f833374 AS production-dependencies
 
 WORKDIR /production
 COPY package.json package-lock.json .node-version .npm-version ./
